@@ -2,21 +2,17 @@
 set -euo pipefail
 
 # =============================================================================
-# Rete Museo - Roc Museum Audio
-# Installer unico per nodi TX e RX - v3.2
+# RETE MUSEO - AudioOverNetwork
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.0
 #
-# TX: Focusrite Scarlett 2i4 + roc-send + dashboard Web centrale.
-# RX: uscita analogica Raspberry Pi + roc-recv + heartbeat verso TX.
-#
-# Uso interattivo:
+# Uso normale:
 #   sudo ./setup_roc_museum.sh
 #
-# Uso non interattivo:
-#   sudo ./setup_roc_museum.sh --role tx --name TX
-#   sudo ./setup_roc_museum.sh --role rx --name RX1 --tx-ip 192.168.1.50
+# Gli argomenti restano disponibili solo per automazione avanzata:
+#   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="3.2"
+VERSION="4.0"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -24,42 +20,105 @@ TARGET_LATENCY="100ms"
 IO_LATENCY="20ms"
 FRAME_LEN="4ms"
 MONITOR_PORT="19090"
-HTTP_PORT="8080"
+MONITOR_HTTP_PORT="8080"
 EXPECTED_RX_COUNT="3"
-
 CONFIG_FILE="/etc/roc-museum.conf"
 RUNNER="/usr/local/sbin/roc-museum-run"
-MONITOR="/usr/local/sbin/roc-museum-monitor"
-AUDIO_UNIT="/etc/systemd/system/roc-museum.service"
-MONITOR_UNIT="/etc/systemd/system/roc-museum-monitor.service"
-
+MONITOR_TARGET="/usr/local/sbin/roc-museum-monitor"
+AUDIO_SERVICE="/etc/systemd/system/roc-museum.service"
+MONITOR_SERVICE="/etc/systemd/system/roc-museum-monitor.service"
 ROLE=""
 NODE_NAME=""
 TX_IP=""
 NETWORK_IFACE=""
 REBOOT_REQUIRED="no"
+INTERACTIVE_MODE="yes"
+TOTAL_STEPS=9
+CURRENT_STEP=0
 
-info() { printf '\n==> %s\n' "$*"; }
-warn() { printf 'ATTENZIONE: %s\n' "$*" >&2; }
-fail() { printf 'ERRORE: %s\n' "$*" >&2; exit 1; }
+if [ -t 1 ]; then
+    C_GREEN="\033[0;32m"
+    C_YELLOW="\033[1;33m"
+    C_RED="\033[0;31m"
+    C_BLUE="\033[0;34m"
+    C_BOLD="\033[1m"
+    C_RESET="\033[0m"
+else
+    C_GREEN=""
+    C_YELLOW=""
+    C_RED=""
+    C_BLUE=""
+    C_BOLD=""
+    C_RESET=""
+fi
+
+print_title() {
+    clear 2>/dev/null || true
+    echo
+    echo -e "${C_BOLD}==============================================================${C_RESET}"
+    echo -e "${C_BOLD} RETE MUSEO - AudioOverNetwork${C_RESET}"
+    echo " Setup guidato Raspberry Pi TX / RX - v${VERSION}"
+    echo -e "${C_BOLD}==============================================================${C_RESET}"
+    echo
+    echo "Il wizard configura automaticamente Roc Toolkit, audio, rete,"
+    echo "monitoraggio, dashboard e avvio automatico dei servizi."
+    echo
+}
+
+info() { echo -e "${C_BLUE}==>${C_RESET} $*"; }
+ok() { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
+warn() { echo -e "${C_YELLOW}[ATTENZIONE]${C_RESET} $*" >&2; }
+fail() { echo -e "${C_RED}[ERRORE]${C_RESET} $*" >&2; exit 1; }
+
+step() {
+    CURRENT_STEP=$((CURRENT_STEP + 1))
+    echo
+    echo -e "${C_BOLD}[${CURRENT_STEP}/${TOTAL_STEPS}] $*${C_RESET}"
+    echo "--------------------------------------------------------------"
+}
 
 require_root() {
-    [ "$(id -u)" -eq 0 ] || fail "Eseguire lo script con sudo."
+    if [ "$(id -u)" -ne 0 ]; then
+        fail "Eseguire lo script con sudo."
+    fi
 }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 validate_ipv4() {
-    local ip="$1" part
-    local IFS='.'
-    local -a octets
-    read -r -a octets <<< "$ip"
-    [ "${#octets[@]}" -eq 4 ] || return 1
-    for part in "${octets[@]}"; do
-        [[ "$part" =~ ^[0-9]+$ ]] || return 1
-        [ "$part" -ge 0 ] && [ "$part" -le 255 ] || return 1
+    local address="$1"
+    local old_ifs="$IFS"
+    local octet=""
+    local -a parts=()
+    IFS='.'
+    read -r -a parts <<< "$address"
+    IFS="$old_ifs"
+    if [ "${#parts[@]}" -ne 4 ]; then return 1; fi
+    for octet in "${parts[@]}"; do
+        if ! [[ "$octet" =~ ^[0-9]+$ ]]; then return 1; fi
+        if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then return 1; fi
     done
+    return 0
 }
 
-parse_args() {
+get_ipv4() {
+    local iface="$1"
+    ip -4 -o addr show dev "$iface" scope global 2>/dev/null | awk '{split($4,v,"/"); print v[1]; exit}'
+}
+
+detect_network_interface() {
+    if ip link show eth0 >/dev/null 2>&1; then
+        NETWORK_IFACE="eth0"
+        return
+    fi
+    NETWORK_IFACE="$(ip -o link show | awk -F': ' '$2 != "lo" {n=$2; sub(/@.*/,"",n); if(n ~ /^e/){print n; exit}}')"
+    if [ -z "$NETWORK_IFACE" ]; then
+        fail "Nessuna interfaccia Ethernet cablata rilevata."
+    fi
+}
+
+parse_arguments() {
+    if [ "$#" -gt 0 ]; then INTERACTIVE_MODE="no"; fi
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --role) [ "$#" -ge 2 ] || fail "Manca --role"; ROLE="$2"; shift 2 ;;
@@ -67,10 +126,14 @@ parse_args() {
             --tx-ip) [ "$#" -ge 2 ] || fail "Manca --tx-ip"; TX_IP="$2"; shift 2 ;;
             -h|--help)
                 cat <<'HELP'
-Uso:
+Uso consigliato:
   sudo ./setup_roc_museum.sh
-  sudo ./setup_roc_museum.sh --role tx --name TX
-  sudo ./setup_roc_museum.sh --role rx --name RX1 --tx-ip 192.168.1.50
+
+Modalità avanzata opzionale:
+  sudo ./setup_roc_museum.sh --role tx
+  sudo ./setup_roc_museum.sh --role rx --tx-ip 192.168.1.50
+
+Per l'uso ordinario non è necessario ricordare alcun argomento.
 HELP
                 exit 0
                 ;;
@@ -79,88 +142,185 @@ HELP
     done
 }
 
+load_existing_configuration() {
+    local answer=""
+    local saved_role=""
+    local saved_name=""
+    local saved_tx_ip=""
+    if [ "$INTERACTIVE_MODE" != "yes" ]; then return; fi
+    if [ ! -r "$CONFIG_FILE" ]; then return; fi
+    echo "Configurazione esistente rilevata:"
+    echo
+    grep -E '^(ROLE|NODE_NAME|TX_IP|NETWORK_IFACE)=' "$CONFIG_FILE" | sed 's/^/  /' || true
+    echo
+    read -r -p "INVIO = mantieni configurazione; R = riconfigura: " answer
+    if [ "$answer" = "R" ] || [ "$answer" = "r" ]; then return; fi
+    saved_role="$(sed -n 's/^ROLE="\([^" ]*\)"$/\1/p' "$CONFIG_FILE" | head -n1)"
+    saved_name="$(sed -n 's/^NODE_NAME="\([^"]*\)"$/\1/p' "$CONFIG_FILE" | head -n1)"
+    saved_tx_ip="$(sed -n 's/^TX_IP="\([^" ]*\)"$/\1/p' "$CONFIG_FILE" | head -n1)"
+    ROLE="$saved_role"
+    NODE_NAME="$saved_name"
+    TX_IP="$saved_tx_ip"
+    ok "Configurazione precedente caricata."
+}
+
 choose_role() {
-    if [ -z "$ROLE" ]; then
-        echo "1) TX - Scarlett 2i4, trasmissione Roc, dashboard"
-        echo "2) RX - ricezione Roc, minijack Raspberry Pi"
-        while true; do
-            read -r -p "Scelta [1/2]: " answer
-            if [ "$answer" = "1" ]; then ROLE="tx"; break; fi
-            if [ "$answer" = "2" ]; then ROLE="rx"; break; fi
-        done
-    fi
-    [ "$ROLE" = "tx" ] || [ "$ROLE" = "rx" ] || fail "Ruolo non valido: $ROLE"
+    local choice=""
+    if [ -n "$ROLE" ]; then return; fi
+    echo "Che funzione avrà questo Raspberry?"
+    echo
+    echo "  1) TX - trasmettitore principale"
+    echo "         Scarlett 2i4 + multicast + dashboard"
+    echo
+    echo "  2) RX - ricevitore per una cassa"
+    echo "         multicast + uscita minijack + telemetria"
+    echo
+    while true; do
+        read -r -p "Selezione [1/2]: " choice
+        if [ "$choice" = "1" ]; then ROLE="tx"; return; fi
+        if [ "$choice" = "2" ]; then ROLE="rx"; return; fi
+        echo "Inserire 1 oppure 2."
+    done
 }
 
-ask_values() {
-    local answer default_name
-    if [ -z "$NODE_NAME" ]; then
-        if [ "$ROLE" = "tx" ]; then default_name="TX"; else default_name="RX1"; fi
-        read -r -p "Nome nodo [${default_name}]: " answer
-        if [ -n "$answer" ]; then NODE_NAME="$answer"; else NODE_NAME="$default_name"; fi
-    fi
-
-    if [ "$ROLE" = "rx" ]; then
-        while ! validate_ipv4 "$TX_IP" 2>/dev/null; do
-            read -r -p "Indirizzo IPv4 del TX: " TX_IP
-        done
+validate_role() {
+    if [ "$ROLE" != "tx" ] && [ "$ROLE" != "rx" ]; then
+        fail "Ruolo non valido: usare tx oppure rx."
     fi
 }
 
-detect_network() {
-    if ip link show eth0 >/dev/null 2>&1; then
-        NETWORK_IFACE="eth0"
+generate_node_name() {
+    local local_ip=""
+    local suffix=""
+    if [ -n "$NODE_NAME" ]; then return; fi
+    if [ "$ROLE" = "tx" ]; then NODE_NAME="TX"; return; fi
+    local_ip="$(get_ipv4 "$NETWORK_IFACE")"
+    if [ -n "$local_ip" ]; then
+        suffix="${local_ip##*.}"
+        NODE_NAME="RX-${suffix}"
+        return
+    fi
+    suffix="$(tr -d '\n' < /etc/machine-id 2>/dev/null | cut -c1-6)"
+    if [ -z "$suffix" ]; then suffix="$(hostname | tr -cd '[:alnum:]' | tail -c 7)"; fi
+    NODE_NAME="RX-${suffix}"
+}
+
+ask_tx_ip() {
+    local answer=""
+    if [ "$ROLE" != "rx" ]; then return; fi
+    if [ -n "$TX_IP" ]; then
+        if ! validate_ipv4 "$TX_IP"; then fail "Indirizzo TX non valido: $TX_IP"; fi
+        return
+    fi
+    echo
+    echo "Per un RX serve soltanto l'indirizzo IP del Raspberry TX."
+    echo "Conviene assegnare al TX un IP stabile o una prenotazione DHCP."
+    echo
+    while true; do
+        read -r -p "IP del TX (es. 192.168.1.50): " answer
+        if validate_ipv4 "$answer"; then TX_IP="$answer"; return; fi
+        echo "Indirizzo IPv4 non valido."
+    done
+}
+
+show_configuration() {
+    local local_ip=""
+    local answer=""
+    local_ip="$(get_ipv4 "$NETWORK_IFACE")"
+    echo
+    echo "Riepilogo"
+    echo "--------------------------------------------------------------"
+    echo "Ruolo                : ${ROLE^^}"
+    echo "Nome nodo            : $NODE_NAME"
+    echo "Ethernet             : $NETWORK_IFACE"
+    echo "IPv4 locale          : ${local_ip:-non assegnato}"
+    echo "Audio multicast      : ${MULTICAST_ADDR}:${RTP_PORT}"
+    if [ "$ROLE" = "tx" ]; then
+        echo "Dashboard Web        : TCP/${MONITOR_HTTP_PORT}"
+        echo "Heartbeat RX         : UDP/${MONITOR_PORT}"
     else
-        NETWORK_IFACE="$(ip -o link show | awk -F': ' '$2 != "lo" {n=$2; sub(/@.*/,"",n); if (n ~ /^e/) {print n; exit}}')"
+        echo "TX monitoraggio      : ${TX_IP}:${MONITOR_PORT}"
     fi
-    [ -n "$NETWORK_IFACE" ] || fail "Nessuna interfaccia Ethernet rilevata."
-}
-
-get_ipv4() {
-    ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+    echo "--------------------------------------------------------------"
+    if [ "$INTERACTIVE_MODE" = "yes" ]; then
+        read -r -p "Procedere? [S/n]: " answer
+        if [ "$answer" = "n" ] || [ "$answer" = "N" ]; then
+            echo "Installazione annullata."
+            exit 0
+        fi
+    fi
 }
 
 install_packages() {
-    info "Installazione dipendenze"
+    info "Aggiornamento degli indici APT..."
     apt-get update
-    apt-cache show roc-toolkit-tools >/dev/null 2>&1 || fail "roc-toolkit-tools non disponibile. Usare Raspberry Pi OS recente basato su Debian Trixie."
-    apt-get install -y roc-toolkit-tools alsa-utils python3 iproute2 ethtool
+    ok "Indici APT aggiornati."
+    if ! apt-cache show roc-toolkit-tools >/dev/null 2>&1; then
+        fail "roc-toolkit-tools non disponibile. Usare Raspberry Pi OS recente basato su Debian Trixie."
+    fi
+    info "Installazione di Roc Toolkit e dipendenze..."
+    apt-get install -y roc-toolkit-tools alsa-utils iproute2 python3 ethtool
+    command_exists roc-send || fail "roc-send non installato."
+    command_exists roc-recv || fail "roc-recv non installato."
+    command_exists python3 || fail "python3 non installato."
+    ok "Roc Toolkit e dipendenze installati."
 }
 
-enable_analog_audio() {
-    [ "$ROLE" = "rx" ] || return 0
-    local cfg=""
-    if [ -f /boot/firmware/config.txt ]; then cfg="/boot/firmware/config.txt"; fi
-    if [ -z "$cfg" ] && [ -f /boot/config.txt ]; then cfg="/boot/config.txt"; fi
-    if [ -n "$cfg" ] && ! grep -Eq '^[[:space:]]*dtparam=audio=on([[:space:]]|$)' "$cfg"; then
-        printf '\n# Roc Museum Audio\ndtparam=audio=on\n' >> "$cfg"
+enable_pi_analog_audio() {
+    local boot_config=""
+    if [ "$ROLE" != "rx" ]; then return; fi
+    if [ -f /boot/firmware/config.txt ]; then boot_config="/boot/firmware/config.txt"; fi
+    if [ -z "$boot_config" ] && [ -f /boot/config.txt ]; then boot_config="/boot/config.txt"; fi
+    if [ -z "$boot_config" ]; then warn "config.txt non trovato; impossibile verificare l'audio analogico."; return; fi
+    if ! grep -Eq '^[[:space:]]*dtparam=audio=on([[:space:]]|$)' "$boot_config"; then
+        { echo; echo "# RETE MUSEO AudioOverNetwork"; echo "dtparam=audio=on"; } >> "$boot_config"
         REBOOT_REQUIRED="yes"
+        ok "Uscita analogica abilitata in $boot_config."
+    else
+        ok "Uscita analogica già abilitata."
     fi
 }
 
-hardware_report() {
+find_scarlett_capture_device() {
+    local card=""
+    card="$(LC_ALL=C arecord -l 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /scarlett|focusrite/{if(match($0,/card [0-9]+/)){v=substr($0,RSTART,RLENGTH);sub(/card /,"",v);print v;exit}}')"
+    [ -n "$card" ] || return 1
+    echo "plughw:${card},0"
+}
+
+find_headphones_playback_device() {
+    local card=""
+    card="$(LC_ALL=C aplay -l 2>/dev/null | awk 'BEGIN{IGNORECASE=1} /headphones|bcm2835/{if(match($0,/card [0-9]+/)){v=substr($0,RSTART,RLENGTH);sub(/card /,"",v);print v;exit}}')"
+    [ -n "$card" ] || return 1
+    echo "plughw:${card},0"
+}
+
+check_hardware() {
+    local device=""
     if [ "$ROLE" = "tx" ]; then
-        if arecord -l 2>/dev/null | grep -Eqi 'Scarlett|Focusrite'; then
-            info "Scarlett rilevata da ALSA"
-        else
-            warn "Scarlett non rilevata. Il servizio audio continuerà a ritentare tramite systemd."
-        fi
-    else
-        if aplay -l 2>/dev/null | grep -Eqi 'Headphones|bcm2835'; then
-            info "Uscita analogica Raspberry Pi rilevata"
-        else
-            warn "Uscita analogica non ancora rilevata; potrebbe essere necessario un riavvio."
-            REBOOT_REQUIRED="yes"
-        fi
+        if device="$(find_scarlett_capture_device)"; then ok "Scarlett rilevata: $device"; else warn "Scarlett non rilevata. Il servizio audio ritenterà automaticamente."; fi
+        return
     fi
+    if device="$(find_headphones_playback_device)"; then ok "Uscita analogica rilevata: $device"; else warn "Uscita analogica non ancora visibile; sarà verificata dopo il riavvio."; REBOOT_REQUIRED="yes"; fi
+}
+
+check_tx_reachability() {
+    if [ "$ROLE" != "rx" ]; then return; fi
+    info "Verifica raggiungibilità TX ${TX_IP}..."
+    if ping -c 1 -W 1 "$TX_IP" >/dev/null 2>&1; then ok "TX raggiungibile."; else warn "TX non raggiungibile al ping. Il setup prosegue comunque."; fi
+}
+
+stop_existing_services() {
+    systemctl stop roc-museum.service >/dev/null 2>&1 || true
+    systemctl stop roc-museum-monitor.service >/dev/null 2>&1 || true
 }
 
 write_config() {
-    local local_ip
+    local local_ip=""
     local_ip="$(get_ipv4 "$NETWORK_IFACE")"
     if [ "$ROLE" = "tx" ]; then TX_IP="$local_ip"; fi
-
     cat > "$CONFIG_FILE" <<EOF_CONFIG
+# RETE MUSEO - AudioOverNetwork - setup v${VERSION}
 ROLE="$ROLE"
 NODE_NAME="$NODE_NAME"
 NETWORK_IFACE="$NETWORK_IFACE"
@@ -172,7 +332,7 @@ TARGET_LATENCY="$TARGET_LATENCY"
 IO_LATENCY="$IO_LATENCY"
 FRAME_LEN="$FRAME_LEN"
 MONITOR_PORT="$MONITOR_PORT"
-MONITOR_HTTP_PORT="$HTTP_PORT"
+MONITOR_HTTP_PORT="$MONITOR_HTTP_PORT"
 EXPECTED_RX_COUNT="$EXPECTED_RX_COUNT"
 SOFTWARE_VERSION="$VERSION"
 EOF_CONFIG
@@ -183,405 +343,362 @@ write_runner() {
     cat > "$RUNNER" <<'EOF_RUNNER'
 #!/usr/bin/env bash
 set -euo pipefail
-. /etc/roc-museum.conf
-
-get_ipv4() {
-    ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
-}
-
-find_card() {
-    local mode="$1" pattern="$2" line card
-    if [ "$mode" = "capture" ]; then
-        line="$(LC_ALL=C arecord -l 2>/dev/null | grep -Ei "$pattern" | head -n1 || true)"
-    else
-        line="$(LC_ALL=C aplay -l 2>/dev/null | grep -Ei "$pattern" | head -n1 || true)"
-    fi
+CONFIG_FILE="/etc/roc-museum.conf"
+[ -r "$CONFIG_FILE" ] || { echo "Configurazione non trovata" >&2; exit 1; }
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+get_ipv4(){ ip -4 -o addr show dev "$1" scope global 2>/dev/null | awk '{split($4,v,"/");print v[1];exit}'; }
+find_card(){
+    local mode="$1" pattern="$2" line="" card=""
+    if [ "$mode" = "capture" ]; then line="$(LC_ALL=C arecord -l 2>/dev/null | grep -Ei "$pattern" | head -n1 || true)"; else line="$(LC_ALL=C aplay -l 2>/dev/null | grep -Ei "$pattern" | head -n1 || true)"; fi
     card="$(printf '%s\n' "$line" | sed -n 's/.*card \([0-9][0-9]*\).*/\1/p')"
     [ -n "$card" ] || return 1
-    printf 'plughw:%s,0\n' "$card"
+    echo "plughw:${card},0"
 }
-
 ip route replace 239.0.0.0/8 dev "$NETWORK_IFACE"
-
 if [ "$ROLE" = "tx" ]; then
-    INPUT_DEVICE="$(find_card capture 'Scarlett|Focusrite')" || { echo "Scarlett non rilevata" >&2; exit 1; }
-    exec roc-send -vv \
-        -i "alsa://${INPUT_DEVICE}" \
-        -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" \
-        --rate="$SAMPLE_RATE" \
-        --io-latency="$IO_LATENCY" \
-        --frame-len="$FRAME_LEN"
+    INPUT_DEVICE="$(find_card capture 'Scarlett|Focusrite')" || { echo "Focusrite Scarlett non rilevata" >&2; exit 1; }
+    echo "TX: ${INPUT_DEVICE} -> ${MULTICAST_ADDR}:${RTP_PORT}"
+    exec roc-send -vv -i "alsa://${INPUT_DEVICE}" -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --rate="$SAMPLE_RATE" --io-latency="$IO_LATENCY" --frame-len="$FRAME_LEN"
 fi
-
 if [ "$ROLE" = "rx" ]; then
     LOCAL_IP="$(get_ipv4 "$NETWORK_IFACE")"
-    [ -n "$LOCAL_IP" ] || { echo "IPv4 non disponibile su $NETWORK_IFACE" >&2; exit 1; }
-    OUTPUT_DEVICE="$(find_card playback 'Headphones|bcm2835')" || { echo "Uscita analogica non rilevata" >&2; exit 1; }
-    exec roc-recv -vv \
-        -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" \
-        --miface="$LOCAL_IP" \
-        -o "alsa://${OUTPUT_DEVICE}" \
-        --rate="$SAMPLE_RATE" \
-        --target-latency="$TARGET_LATENCY" \
-        --io-latency="$IO_LATENCY" \
-        --frame-len="$FRAME_LEN"
+    [ -n "$LOCAL_IP" ] || { echo "IPv4 non disponibile" >&2; exit 1; }
+    OUTPUT_DEVICE="$(find_card playback 'Headphones|bcm2835')" || { echo "Uscita analogica Raspberry Pi non rilevata" >&2; exit 1; }
+    echo "RX: ${MULTICAST_ADDR}:${RTP_PORT} -> ${OUTPUT_DEVICE}"
+    exec roc-recv -vv -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --miface="$LOCAL_IP" -o "alsa://${OUTPUT_DEVICE}" --rate="$SAMPLE_RATE" --target-latency="$TARGET_LATENCY" --io-latency="$IO_LATENCY" --frame-len="$FRAME_LEN"
 fi
-
 exit 1
 EOF_RUNNER
     chmod 0755 "$RUNNER"
 }
 
 write_monitor() {
-    cat > "$MONITOR" <<'PY_MONITOR'
+    cat > "$MONITOR_TARGET" <<'PY_MONITOR'
 #!/usr/bin/env python3
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-CONFIG = "/etc/roc-museum.conf"
-NODES = {}
-LOCK = threading.Lock()
-OFFLINE_AFTER = 15
-
+CONFIG_FILE="/etc/roc-museum.conf"
+HEARTBEAT_INTERVAL=5
+OFFLINE_AFTER=15
+REGISTRY={}
+REGISTRY_LOCK=threading.Lock()
 
 def read_config():
-    data = {}
-    with open(CONFIG, "r", encoding="utf-8") as handle:
+    config={}
+    with open(CONFIG_FILE,"r",encoding="utf-8") as handle:
         for raw in handle:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            data[key] = value.strip().strip('"')
-    return data
-
+            line=raw.strip()
+            if not line or line.startswith("#") or "=" not in line: continue
+            key,value=line.split("=",1)
+            value=value.strip()
+            if len(value)>=2 and value[0]=='"' and value[-1]=='"': value=value[1:-1]
+            config[key]=value
+    return config
 
 def run(command):
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=2, check=False)
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
+        completed=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=2,check=False)
+        return completed.returncode,completed.stdout.strip()
+    except (OSError,subprocess.TimeoutExpired):
+        return 127,""
 
 def read_text(path):
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read().strip()
-    except Exception:
-        return ""
+        with open(path,"r",encoding="utf-8") as handle: return handle.read().strip()
+    except OSError: return ""
 
-
-def local_ipv4(iface):
-    output = run(["ip", "-4", "-o", "addr", "show", "dev", iface, "scope", "global"])
+def local_ipv4(interface):
+    code,output=run(["ip","-4","-o","addr","show","dev",interface,"scope","global"])
+    if code!=0: return ""
     for line in output.splitlines():
-        fields = line.split()
-        if len(fields) > 3:
-            return fields[3].split("/")[0]
+        fields=line.split()
+        if len(fields)>=4: return fields[3].split("/")[0]
     return ""
 
-
 def service_state():
-    value = run(["systemctl", "is-active", "roc-museum.service"])
-    if value:
-        return value
+    code,output=run(["systemctl","is-active","roc-museum.service"])
+    if output: return output
+    if code==0: return "active"
     return "unknown"
 
-
 def process_state(role):
-    process = "roc-send" if role == "tx" else "roc-recv"
-    return bool(run(["pgrep", "-x", process]))
+    process_name="roc-recv"
+    if role=="tx": process_name="roc-send"
+    code,output=run(["pgrep","-x",process_name])
+    if code==0 and output: return True
+    return False
 
+def audio_device_state(role):
+    if role=="tx":
+        code,output=run(["arecord","-l"])
+        if code==0 and re.search(r"scarlett|focusrite",output,re.IGNORECASE): return True
+        return False
+    code,output=run(["aplay","-l"])
+    if code==0 and re.search(r"headphones|bcm2835",output,re.IGNORECASE): return True
+    return False
 
-def audio_state(role):
-    if role == "tx":
-        text = run(["arecord", "-l"]).lower()
-        return "scarlett" in text or "focusrite" in text
-    text = run(["aplay", "-l"]).lower()
-    return "headphones" in text or "bcm2835" in text
+def network_state(interface):
+    path=os.path.join("/sys/class/net",interface)
+    result={"interface":interface,"ipv4":local_ipv4(interface),"carrier":False,"speed_mbps":None}
+    if not os.path.isdir(path): return result
+    if read_text(os.path.join(path,"carrier"))=="1": result["carrier"]=True
+    speed=read_text(os.path.join(path,"speed"))
+    try: result["speed_mbps"]=int(speed)
+    except ValueError: result["speed_mbps"]=None
+    return result
 
+def multicast_state(role,interface,group,roc_process):
+    if role=="tx":
+        if roc_process: return "sending"
+        return "stopped"
+    code,output=run(["ip","maddr","show","dev",interface])
+    if code==0 and group in output: return "joined"
+    return "not_joined"
 
 def temperature():
-    raw = read_text("/sys/class/thermal/thermal_zone0/temp")
-    try:
-        return round(float(raw) / 1000.0, 1)
-    except Exception:
-        return None
-
+    raw=read_text("/sys/class/thermal/thermal_zone0/temp")
+    try: return round(float(raw)/1000.0,1)
+    except ValueError: return None
 
 def throttled():
-    output = run(["vcgencmd", "get_throttled"])
-    if not output:
-        return None
-    return output.split("=", 1)[-1] if "=" in output else output
+    code,output=run(["vcgencmd","get_throttled"])
+    if code!=0: return None
+    match=re.search(r"0x[0-9a-fA-F]+",output)
+    if match is None: return None
+    return match.group(0)
 
+def build_snapshot(config):
+    role=config.get("ROLE","")
+    interface=config.get("NETWORK_IFACE","eth0")
+    roc_process=process_state(role)
+    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service_state(),"roc_process":roc_process,"audio_device":audio_device_state(role),"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
+    try: snapshot["load_1m"]=round(os.getloadavg()[0],2)
+    except OSError: snapshot["load_1m"]=None
+    return snapshot
 
-def multicast_member(iface, group):
-    output = run(["ip", "maddr", "show", "dev", iface])
-    return group in output
-
-
-def node_status(cfg):
-    iface = cfg.get("NETWORK_IFACE", "eth0")
-    role = cfg.get("ROLE", "")
-    carrier = read_text("/sys/class/net/" + iface + "/carrier") == "1"
-    speed = read_text("/sys/class/net/" + iface + "/speed")
-    try:
-        speed_value = int(speed)
-    except Exception:
-        speed_value = None
-
-    try:
-        load_1m = round(os.getloadavg()[0], 2)
-    except Exception:
-        load_1m = None
-
-    data = {
-        "name": cfg.get("NODE_NAME", socket.gethostname()),
-        "hostname": socket.gethostname(),
-        "role": role,
-        "software_version": cfg.get("SOFTWARE_VERSION", ""),
-        "timestamp": time.time(),
-        "roc_service": service_state(),
-        "roc_process": process_state(role),
-        "audio_device": audio_state(role),
-        "network": {
-            "interface": iface,
-            "ipv4": local_ipv4(iface),
-            "carrier": carrier,
-            "speed_mbps": speed_value,
-        },
-        "multicast": {
-            "group": cfg.get("MULTICAST_ADDR", ""),
-            "member": multicast_member(iface, cfg.get("MULTICAST_ADDR", "")),
-        },
-        "temperature_c": temperature(),
-        "throttled": throttled(),
-        "load_1m": load_1m,
-    }
-    return data
-
-
-def send_heartbeats(cfg):
-    role = cfg.get("ROLE", "")
-    tx_ip = cfg.get("TX_IP", "")
-    port = int(cfg.get("MONITOR_PORT", "19090"))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
+def heartbeat_loop(config):
+    role=config.get("ROLE","")
+    tx_ip=config.get("TX_IP","")
+    port=int(config.get("MONITOR_PORT","19090"))
+    sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     while True:
-        status = node_status(cfg)
-        if role == "tx":
-            with LOCK:
-                NODES[status["name"]] = status
-        elif tx_ip:
-            payload = json.dumps(status, separators=(",", ":")).encode("utf-8")
-            try:
-                sock.sendto(payload, (tx_ip, port))
-            except OSError:
-                pass
-        time.sleep(5)
+        snapshot=build_snapshot(config)
+        if role=="tx":
+            snapshot["received_at"]=time.time()
+            with REGISTRY_LOCK: REGISTRY[snapshot["name"]]=snapshot
+        else:
+            payload=json.dumps(snapshot,separators=(",",":")).encode("utf-8")
+            try: sock.sendto(payload,(tx_ip,port))
+            except OSError: pass
+        time.sleep(HEARTBEAT_INTERVAL)
 
-
-def listen_heartbeats(cfg):
-    port = int(cfg.get("MONITOR_PORT", "19090"))
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("0.0.0.0", port))
+def listener_loop(config):
+    port=int(config.get("MONITOR_PORT","19090"))
+    sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    sock.bind(("0.0.0.0",port))
     while True:
-        payload, address = sock.recvfrom(65535)
-        try:
-            data = json.loads(payload.decode("utf-8"))
-            data["source_ip"] = address[0]
-            data["timestamp_received"] = time.time()
-            name = data.get("name", address[0])
-            with LOCK:
-                NODES[name] = data
-        except Exception:
-            continue
+        payload,source=sock.recvfrom(65535)
+        try: snapshot=json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError,json.JSONDecodeError): continue
+        snapshot["source_ip"]=source[0]
+        snapshot["received_at"]=time.time()
+        name=snapshot.get("name",source[0])
+        with REGISTRY_LOCK: REGISTRY[name]=snapshot
 
+def system_status(config):
+    now=time.time()
+    with REGISTRY_LOCK: nodes=[dict(item) for item in REGISTRY.values()]
+    for node in nodes:
+        received_at=node.get("received_at",node.get("timestamp",0))
+        age=max(0,now-received_at)
+        online=age<=OFFLINE_AFTER
+        problems=[]
+        if not online: problems.append("offline")
+        if node.get("roc_service")!="active": problems.append("roc_service")
+        if not node.get("roc_process"): problems.append("roc_process")
+        if not node.get("audio_device"): problems.append("audio_device")
+        if not node.get("network",{}).get("carrier"): problems.append("ethernet")
+        state="OK"
+        if problems: state="ATTENZIONE"
+        if "offline" in problems: state="OFFLINE"
+        node["age_seconds"]=round(age,1)
+        node["online"]=online
+        node["problems"]=problems
+        node["state"]=state
+    def sort_key(node):
+        priority=1
+        if node.get("role")=="tx": priority=0
+        return priority,node.get("name","")
+    nodes.sort(key=sort_key)
+    return {"system":"RETE MUSEO - AudioOverNetwork","generated_at":now,"expected_rx":int(config.get("EXPECTED_RX_COUNT","3")),"nodes":nodes}
 
-def api_payload(cfg):
-    now = time.time()
-    with LOCK:
-        snapshot = [dict(value) for value in NODES.values()]
-    for node in snapshot:
-        stamp = node.get("timestamp_received", node.get("timestamp", 0))
-        age = max(0, now - stamp)
-        node["age_seconds"] = round(age, 1)
-        node["online"] = age <= OFFLINE_AFTER
-        problems = []
-        if not node["online"]:
-            problems.append("offline")
-        if node.get("roc_service") != "active":
-            problems.append("roc_service")
-        if not node.get("roc_process"):
-            problems.append("roc_process")
-        if not node.get("audio_device"):
-            problems.append("audio_device")
-        if not node.get("network", {}).get("carrier"):
-            problems.append("ethernet")
-        node["problems"] = problems
-        node["state"] = "OK" if not problems else ("OFFLINE" if "offline" in problems else "ATTENZIONE")
-    snapshot.sort(key=lambda item: (0 if item.get("role") == "tx" else 1, item.get("name", "")))
-    return {
-        "system": "Roc Museum Audio",
-        "generated_at": now,
-        "expected_rx": int(cfg.get("EXPECTED_RX_COUNT", "3")),
-        "nodes": snapshot,
-    }
-
-
-PAGE = r'''<!doctype html>
-<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Roc Museum Audio</title>
-<style>
-body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}h1{margin:0 0 6px}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}</style></head>
-<body><main><h1>Roc Museum Audio</h1><div class="sub">Monitor centrale TX · dashboard read-only</div>
-<div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer>
-<script>
-const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function card(n){let net=n.network||{};return `<article class="card"><div class="head"><strong>${esc(n.name)} · ${esc((n.role||'').toUpperCase())}</strong><span class="badge ${esc(n.state)}">${esc(n.state)}</span></div><div class="row"><span class="label">IPv4</span><span class="value">${esc(net.ipv4||'n/d')}</span></div><div class="row"><span class="label">Ethernet</span><span class="value">${net.carrier?'OK':'KO'}${net.speed_mbps?' · '+esc(net.speed_mbps)+' Mb/s':''}</span></div><div class="row"><span class="label">Roc</span><span class="value">${esc(n.roc_service)} · processo ${n.roc_process?'OK':'KO'}</span></div><div class="row"><span class="label">Audio device</span><span class="value">${n.audio_device?'OK':'KO'}</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>${esc((n.multicast||{}).group)}</code> ${((n.multicast||{}).member)?'JOIN':'-'}</span></div><div class="row"><span class="label">Temperatura</span><span class="value">${n.temperature_c==null?'n/d':esc(n.temperature_c)+' °C'}</span></div><div class="row"><span class="label">Load 1m</span><span class="value">${esc(n.load_1m??'n/d')}</span></div><div class="row"><span class="label">Ultimo heartbeat</span><span class="value">${esc(n.age_seconds)} s</span></div></article>`}
-async function refresh(){try{let r=await fetch('/api/status',{cache:'no-store'}),d=await r.json(),ok=d.nodes.filter(n=>n.state==='OK').length,off=d.nodes.filter(n=>n.state==='OFFLINE').length;document.getElementById('summary').innerHTML=`<div class="box"><div class="label">Nodi rilevati</div><div class="num">${d.nodes.length}</div></div><div class="box"><div class="label">Nodi OK</div><div class="num">${ok}</div></div><div class="box"><div class="label">Offline</div><div class="num">${off}</div></div><div class="box"><div class="label">RX previsti</div><div class="num">${d.expected_rx}</div></div>`;document.getElementById('nodes').innerHTML=d.nodes.map(card).join('')||'<div class="box">Nessun nodo rilevato.</div>';document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(e){document.getElementById('footer').textContent='Errore dashboard: '+e}}
-refresh();setInterval(refresh,2000);
-</script></main></body></html>'''
-
+PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}h1{margin:0 0 6px}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}</style></head><body><main><h1>RETE MUSEO - AudioOverNetwork</h1><div class="sub">Monitor centrale TX · sola lettura</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function yesNo(value){if(value){return 'OK';}return 'KO';}function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+yesNo(net.carrier)+speed+'</span></div><div class="row"><span class="label">Roc</span><span class="value">'+esc(n.roc_service)+' · processo '+yesNo(n.roc_process)+'</span></div><div class="row"><span class="label">Audio</span><span class="value">'+yesNo(n.audio_device)+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multi.state)+'</span></div><div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s</span></div></article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}document.getElementById('nodes').innerHTML=html;document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}refresh();setInterval(refresh,2000);</script></main></body></html>'''
 
 class Handler(BaseHTTPRequestHandler):
-    cfg = {}
-    def log_message(self, fmt, *args):
-        return
-    def reply(self, code, content_type, payload):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+    config={}
+    def log_message(self,fmt,*args): return
+    def reply(self,code,content_type,payload):
+        self.send_response(code);self.send_header("Content-Type",content_type);self.send_header("Cache-Control","no-store");self.send_header("Content-Length",str(len(payload)));self.end_headers();self.wfile.write(payload)
     def do_GET(self):
-        if self.path in ("/", "/index.html"):
-            self.reply(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
-            return
-        if self.path == "/api/status":
-            payload = json.dumps(api_payload(self.cfg), indent=2).encode("utf-8")
-            self.reply(200, "application/json; charset=utf-8", payload)
-            return
-        if self.path == "/healthz":
-            self.reply(200, "text/plain; charset=utf-8", b"ok\n")
-            return
-        self.reply(404, "text/plain; charset=utf-8", b"Not found\n")
-
+        if self.path=="/" or self.path=="/index.html": self.reply(200,"text/html; charset=utf-8",PAGE.encode("utf-8"));return
+        if self.path=="/api/status": self.reply(200,"application/json; charset=utf-8",json.dumps(system_status(self.config),indent=2).encode("utf-8"));return
+        if self.path=="/healthz": self.reply(200,"text/plain; charset=utf-8",b"ok\n");return
+        self.reply(404,"text/plain; charset=utf-8",b"Not found\n")
 
 def main():
-    cfg = read_config()
-    threading.Thread(target=send_heartbeats, args=(cfg,), daemon=True).start()
-    if cfg.get("ROLE") == "tx":
-        threading.Thread(target=listen_heartbeats, args=(cfg,), daemon=True).start()
-        Handler.cfg = cfg
-        server = ThreadingHTTPServer(("0.0.0.0", int(cfg.get("MONITOR_HTTP_PORT", "8080"))), Handler)
-        server.serve_forever()
-    while True:
-        time.sleep(3600)
-
-
-if __name__ == "__main__":
-    main()
+    config=read_config();role=config.get("ROLE","")
+    heartbeat=threading.Thread(target=heartbeat_loop,args=(config,),daemon=True);heartbeat.start()
+    if role=="tx":
+        listener=threading.Thread(target=listener_loop,args=(config,),daemon=True);listener.start()
+        Handler.config=config
+        port=int(config.get("MONITOR_HTTP_PORT","8080"))
+        server=ThreadingHTTPServer(("0.0.0.0",port),Handler)
+        print("Dashboard in ascolto sulla porta "+str(port),flush=True)
+        server.serve_forever();return
+    while True: time.sleep(3600)
+if __name__=="__main__": main()
 PY_MONITOR
-    chmod 0755 "$MONITOR"
+    chmod 0755 "$MONITOR_TARGET"
 }
 
-write_units() {
-    cat > "$AUDIO_UNIT" <<'EOF_AUDIO_UNIT'
+write_systemd_services() {
+    cat > "$AUDIO_SERVICE" <<'EOF_AUDIO'
 [Unit]
-Description=Roc Museum Audio node
+Description=RETE MUSEO Roc Audio node
 After=network-online.target sound.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/roc-museum-run
 Restart=always
 RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
-EOF_AUDIO_UNIT
-
-    cat > "$MONITOR_UNIT" <<'EOF_MONITOR_UNIT'
+EOF_AUDIO
+    cat > "$MONITOR_SERVICE" <<'EOF_MONITOR'
 [Unit]
-Description=Roc Museum Audio monitor
+Description=RETE MUSEO Audio monitor agent
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/roc-museum-monitor
 Restart=always
 RestartSec=3
-
 [Install]
 WantedBy=multi-user.target
-EOF_MONITOR_UNIT
+EOF_MONITOR
 }
 
-start_services() {
-    info "Abilitazione e avvio automatico servizi"
+get_service_state() {
+    local service="$1"
+    local state=""
+    state="$(systemctl is-active "$service" 2>/dev/null || true)"
+    if [ -z "$state" ]; then state="unknown"; fi
+    echo "$state"
+}
+
+start_service() {
+    local service="$1"
+    systemctl enable "$service" >/dev/null
+    if ! systemctl restart "$service"; then warn "Avvio immediato non riuscito: $service"; fi
+}
+
+enable_services() {
     systemctl daemon-reload
-    systemctl enable roc-museum-monitor.service roc-museum.service >/dev/null
-    systemctl restart roc-museum-monitor.service || warn "Monitor non avviato correttamente."
-    systemctl restart roc-museum.service || warn "Audio non avviato correttamente."
+    start_service roc-museum-monitor.service
+    start_service roc-museum.service
     sleep 2
+    if [ "$(get_service_state roc-museum-monitor.service)" = "active" ]; then ok "Monitor attivo e abilitato al boot."; else warn "Monitor non attivo."; fi
+    if [ "$(get_service_state roc-museum.service)" = "active" ]; then ok "Audio Roc attivo e abilitato al boot."; else warn "Audio Roc non ancora attivo; systemd continuerà a ritentare."; fi
 }
 
-report() {
-    local ip audio_state monitor_state
-    ip="$(get_ipv4 "$NETWORK_IFACE")"
-    audio_state="$(systemctl is-active roc-museum.service 2>/dev/null || true)"
-    monitor_state="$(systemctl is-active roc-museum-monitor.service 2>/dev/null || true)"
+print_diagnostics() {
+    local local_ip=""
+    local_ip="$(get_ipv4 "$NETWORK_IFACE")"
     echo
-    echo "================ ROC MUSEUM AUDIO ================="
-    echo "Versione            : $VERSION"
-    echo "Nodo / ruolo        : $NODE_NAME / $ROLE"
-    echo "IPv4                : ${ip:-n/d}"
-    echo "Audio multicast     : $MULTICAST_ADDR:$RTP_PORT"
-    echo "roc-museum          : ${audio_state:-unknown}"
-    echo "roc-museum-monitor  : ${monitor_state:-unknown}"
+    echo -e "${C_BOLD}================ INSTALLAZIONE COMPLETATA ================${C_RESET}"
+    echo "Versione           : $VERSION"
+    echo "Nodo / ruolo       : $NODE_NAME / ${ROLE^^}"
+    echo "Ethernet           : $NETWORK_IFACE"
+    echo "IPv4               : ${local_ip:-n/d}"
+    echo "Audio multicast    : ${MULTICAST_ADDR}:${RTP_PORT}"
+    echo "Servizio audio     : $(get_service_state roc-museum.service)"
+    echo "Servizio monitor   : $(get_service_state roc-museum-monitor.service)"
     if [ "$ROLE" = "tx" ]; then
-        echo "Dashboard            : http://${ip:-IP-TX}:$HTTP_PORT/"
-        echo "API                  : http://${ip:-IP-TX}:$HTTP_PORT/api/status"
+        echo "Dashboard           : http://${local_ip:-IP-TX}:${MONITOR_HTTP_PORT}/"
+        echo "API                 : http://${local_ip:-IP-TX}:${MONITOR_HTTP_PORT}/api/status"
     else
-        echo "Monitor TX           : $TX_IP:$MONITOR_PORT UDP"
+        echo "Monitor TX          : ${TX_IP}:${MONITOR_PORT}/UDP"
     fi
-    echo "===================================================="
-    echo "Log audio:   journalctl -u roc-museum -f"
-    echo "Log monitor: journalctl -u roc-museum-monitor -f"
-    if [ "$REBOOT_REQUIRED" = "yes" ]; then
-        echo
-        warn "Riavvio consigliato/necessario per completare l'abilitazione dell'audio analogico."
-        echo "Dopo il reboot i servizi partiranno automaticamente."
+    echo "==========================================================="
+    echo
+    echo "Comandi di manutenzione:"
+    echo "  systemctl status roc-museum --no-pager"
+    echo "  systemctl status roc-museum-monitor --no-pager"
+    echo "  journalctl -u roc-museum -f"
+    echo
+    if [ "$ROLE" = "tx" ]; then echo "IMPORTANTE: mantenere stabile l'IP del TX."; echo; fi
+}
+
+ask_reboot() {
+    local answer=""
+    if [ "$REBOOT_REQUIRED" != "yes" ]; then return; fi
+    echo -e "${C_YELLOW}È necessario un riavvio per completare l'audio analogico.${C_RESET}"
+    if [ "$INTERACTIVE_MODE" != "yes" ]; then echo "Eseguire: sudo reboot"; return; fi
+    read -r -p "Riavviare ora? [S/n]: " answer
+    if [ -z "$answer" ] || [ "$answer" = "s" ] || [ "$answer" = "S" ]; then
+        echo "Riavvio in corso; la sessione SSH verrà chiusa."
+        sleep 2
+        systemctl reboot
     fi
 }
 
 main() {
     require_root
-    parse_args "$@"
+    print_title
+    parse_arguments "$@"
+    step "Rilevamento rete e configurazione precedente"
+    detect_network_interface
+    load_existing_configuration
+    ok "Ethernet: $NETWORK_IFACE - IPv4: $(get_ipv4 "$NETWORK_IFACE")"
+    step "Configurazione guidata"
     choose_role
-    ask_values
-    detect_network
+    validate_role
+    generate_node_name
+    ask_tx_ip
+    show_configuration
+    ok "Configurazione definita."
+    step "Installazione software"
     install_packages
-    enable_analog_audio
-    hardware_report
-    systemctl stop roc-museum.service roc-museum-monitor.service >/dev/null 2>&1 || true
+    step "Preparazione hardware audio"
+    stop_existing_services
+    enable_pi_analog_audio
+    check_hardware
+    check_tx_reachability
+    step "Scrittura configurazione"
     write_config
+    ok "Configurazione salvata in $CONFIG_FILE."
+    step "Installazione motore Roc"
     write_runner
+    ok "Motore audio installato."
+    step "Installazione monitor e dashboard"
     write_monitor
-    write_units
-    start_services
-    report
+    ok "Monitor installato."
+    step "Configurazione servizi automatici"
+    write_systemd_services
+    enable_services
+    step "Verifica finale"
+    print_diagnostics
+    ask_reboot
 }
 
 main "$@"
