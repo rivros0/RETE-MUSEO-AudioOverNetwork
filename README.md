@@ -1,85 +1,104 @@
-# Rete Museo
-
-Repository dedicata all'infrastruttura tecnica del progetto **Rete Museo**.
-
-## Roc Museum Audio
+# RETE MUSEO - AudioOverNetwork
 
 Sistema sperimentale di distribuzione audio su LAN basato su **Roc Toolkit** e Raspberry Pi.
 
-Architettura prevista:
+## Architettura
 
 - 1 Raspberry Pi **TX** collegato a una Focusrite Scarlett 2i4;
-- 3 Raspberry Pi **RX** con uscita analogica locale verso casse attive;
-- audio distribuito tramite RTP multicast;
-- dashboard Web centralizzata sul nodo TX;
-- heartbeat di monitoraggio inviati dagli RX direttamente all'IP del TX;
-- servizi gestiti da `systemd` e avviati automaticamente al boot.
+- 3 Raspberry Pi **RX** con uscita analogica minijack verso casse attive;
+- audio RTP multicast su LAN;
+- dashboard Web centralizzata sul TX;
+- heartbeat di monitoraggio RX → TX via UDP unicast;
+- servizi `systemd` con avvio automatico e restart automatico.
 
-## Installazione
+## Installazione consigliata via SSH
 
-Scaricare sul Raspberry il file:
+La manutenzione ordinaria è pensata per essere completamente guidata. Non è necessario ricordare argomenti o parametri.
 
-```text
-setup_roc_museum.sh
-```
-
-Rendere eseguibile lo script:
+Sul Raspberry:
 
 ```bash
 chmod +x setup_roc_museum.sh
-```
-
-Avviare il setup interattivo:
-
-```bash
 sudo ./setup_roc_museum.sh
 ```
 
-Lo script permette di scegliere se configurare il Raspberry come **TX** oppure **RX**.
+Il wizard:
 
-### Installazione TX
+1. rileva automaticamente l'interfaccia Ethernet e l'IPv4 locale;
+2. verifica se esiste già una configurazione precedente e propone di riutilizzarla;
+3. chiede solo se il nodo deve essere **TX** o **RX**;
+4. se il nodo è RX, chiede soltanto l'**IP del TX**;
+5. genera automaticamente il nome del nodo;
+6. mostra un riepilogo prima di procedere;
+7. visualizza l'avanzamento in 9 fasi con feedback `[OK]`, `[ATTENZIONE]` ed `[ERRORE]`;
+8. installa Roc Toolkit e le dipendenze;
+9. verifica l'hardware audio previsto;
+10. crea configurazione, monitor e servizi;
+11. abilita e avvia automaticamente tutti i servizi;
+12. mostra stato finale, dashboard e comandi di diagnostica;
+13. se necessario, propone direttamente il riavvio del Raspberry.
 
-Esempio non interattivo:
+### TX
 
-```bash
-sudo ./setup_roc_museum.sh --role tx --name TX
-```
+Per il TX il wizard rileva automaticamente:
 
-Il TX installa:
+- Ethernet;
+- IPv4 locale;
+- Focusrite Scarlett/Scarlett 2i4 tramite ALSA.
 
-- `roc-send`;
-- rilevamento della Scarlett/Focusrite tramite ALSA;
-- trasmissione RTP multicast;
-- dashboard Web centrale;
-- API JSON di stato;
-- ricezione degli heartbeat dagli RX.
+Il nome predefinito del nodo è `TX`.
 
-La dashboard viene esposta sulla porta `8080`:
+Dashboard:
 
 ```text
 http://IP_TX:8080/
 ```
 
-API:
+API JSON:
 
 ```text
 http://IP_TX:8080/api/status
 ```
 
-### Installazione RX
+È importante mantenere stabile l'indirizzo IP del TX, preferibilmente tramite prenotazione DHCP.
 
-Esempio:
+### RX
 
-```bash
-sudo ./setup_roc_museum.sh \
-    --role rx \
-    --name RX1 \
-    --tx-ip 192.168.1.50
+Per un RX l'unico dato richiesto è l'indirizzo IPv4 del TX.
+
+Il nome del ricevitore viene generato automaticamente, ad esempio:
+
+```text
+RX-51
 ```
 
-L'IP del TX serve al nodo RX per inviare direttamente la telemetria di monitoraggio.
+se il Raspberry ha indirizzo `192.168.1.51`.
 
-L'audio continua invece a utilizzare multicast.
+L'uscita analogica integrata viene abilitata automaticamente quando necessario. Se la modifica richiede un reboot, il wizard propone il riavvio e i servizi ripartono automaticamente.
+
+## Aggiornamento / reinstallazione
+
+Se il setup viene rilanciato su un Raspberry già configurato, rileva `/etc/roc-museum.conf` e mostra la configurazione precedente.
+
+È sufficiente premere **Invio** per mantenerla e procedere con la reinstallazione/aggiornamento.
+
+Per riconfigurare completamente il nodo si può scegliere `R`.
+
+## Modalità avanzata
+
+Gli argomenti restano disponibili esclusivamente per automazioni o interventi avanzati:
+
+```bash
+sudo ./setup_roc_museum.sh --role tx
+```
+
+oppure:
+
+```bash
+sudo ./setup_roc_museum.sh --role rx --tx-ip 192.168.1.50
+```
+
+Nell'uso ordinario è preferibile utilizzare sempre il wizard senza argomenti.
 
 ## Parametri iniziali
 
@@ -94,24 +113,24 @@ L'audio continua invece a utilizzare multicast.
 | Heartbeat RX → TX | UDP `19090` |
 | Dashboard TX | TCP `8080` |
 
-Questi valori sono volutamente prudenti per la prima fase di test.
+I valori sono volutamente prudenti per la fase di test iniziale.
 
 ## Servizi
 
-Lo script configura e avvia automaticamente:
+Il setup crea, abilita e avvia automaticamente:
 
 ```text
 roc-museum.service
 roc-museum-monitor.service
 ```
 
-Entrambi vengono abilitati al boot e configurati con riavvio automatico in caso di arresto.
+Entrambi usano `Restart=always`.
 
-Verifica stato:
+Stato:
 
 ```bash
-systemctl status roc-museum
-systemctl status roc-museum-monitor
+systemctl status roc-museum --no-pager
+systemctl status roc-museum-monitor --no-pager
 ```
 
 Log audio:
@@ -132,15 +151,14 @@ La dashboard TX visualizza per ciascun nodo:
 
 - online/offline;
 - stato del servizio Roc;
-- presenza del processo `roc-send` / `roc-recv`;
-- stato Ethernet;
-- velocità del link;
+- processo `roc-send` / `roc-recv`;
+- Ethernet e velocità link;
 - IPv4;
-- presenza del dispositivo audio;
-- appartenenza al gruppo multicast;
+- presenza dispositivo audio;
+- stato multicast;
 - temperatura CPU;
 - load medio;
-- ultimo heartbeat ricevuto.
+- ultimo heartbeat.
 
 Un RX che non invia heartbeat per 15 secondi viene considerato offline.
 
@@ -156,16 +174,6 @@ Un RX che non invia heartbeat per 15 secondi viene considerato offline.
 
 - Raspberry Pi 3;
 - uscita minijack analogica integrata;
-- collegamento corto verso una cassa attiva.
+- collegamento corto verso la cassa attiva.
 
-L'uscita minijack viene utilizzata nella fase di prototipo. In seguito potrà essere sostituita da un DAC dedicato, se necessario.
-
-## Note operative
-
-È consigliabile assegnare al TX un indirizzo IP stabile, preferibilmente tramite prenotazione DHCP.
-
-Per gli RX, se l'uscita analogica integrata viene abilitata per la prima volta, può essere necessario un riavvio. I servizi sono già configurati per partire automaticamente dopo il reboot.
-
-## Riferimento del progetto
-
-[Conversazione di riferimento su ChatGPT](https://chatgpt.com/g/g-p-6a06197922d48191a69bbc0ae62503c7-rete-museo/c/6a93efa0-fe4c-83eb-83e3-cb23d4aa54cc)
+L'uscita minijack è adeguata per il prototipo; potrà essere sostituita in seguito da un DAC dedicato se necessario.
