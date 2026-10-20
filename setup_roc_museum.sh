@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.0
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.1
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,12 +12,11 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.0"
+VERSION="4.1"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
 TARGET_LATENCY="100ms"
-IO_LATENCY="20ms"
 FRAME_LEN="4ms"
 MONITOR_PORT="19090"
 MONITOR_HTTP_PORT="8080"
@@ -329,7 +328,6 @@ MULTICAST_ADDR="$MULTICAST_ADDR"
 RTP_PORT="$RTP_PORT"
 SAMPLE_RATE="$SAMPLE_RATE"
 TARGET_LATENCY="$TARGET_LATENCY"
-IO_LATENCY="$IO_LATENCY"
 FRAME_LEN="$FRAME_LEN"
 MONITOR_PORT="$MONITOR_PORT"
 MONITOR_HTTP_PORT="$MONITOR_HTTP_PORT"
@@ -359,7 +357,7 @@ ip route replace 239.0.0.0/8 dev "$NETWORK_IFACE"
 if [ "$ROLE" = "tx" ]; then
     INPUT_DEVICE="$(find_card capture 'Scarlett|Focusrite')" || { echo "Focusrite Scarlett non rilevata" >&2; exit 1; }
     echo "TX: ${INPUT_DEVICE} -> ${MULTICAST_ADDR}:${RTP_PORT}"
-    exec roc-send -vv -i "alsa://${INPUT_DEVICE}" -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --rate="$SAMPLE_RATE" --io-latency="$IO_LATENCY" --frame-len="$FRAME_LEN"
+    exec roc-send -vv -i "alsa://${INPUT_DEVICE}" -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --rate="$SAMPLE_RATE" --frame-len="$FRAME_LEN"
 fi
 if [ "$ROLE" = "rx" ]; then
     LOCAL_IP="$(get_ipv4 "$NETWORK_IFACE")"
