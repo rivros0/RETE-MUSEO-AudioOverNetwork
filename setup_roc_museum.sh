@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.3
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.4
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.3"
+VERSION="4.4"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -388,6 +388,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
+VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
 REGISTRY={}
@@ -472,6 +473,43 @@ def audio_device_state(role):
     if code==0 and re.search(r"headphones|bcm2835",output,re.IGNORECASE): return True
     return False
 
+def get_volume_percent():
+    code,output=run(["amixer","-c","0","get","PCM"])
+    if code!=0:
+        return None
+    match=re.search(r"\[(\d{1,3})%\]",output)
+    if match is None:
+        return None
+    try:
+        return max(0,min(100,int(match.group(1))))
+    except ValueError:
+        return None
+
+def set_volume_percent(value,persist=True):
+    try:
+        value=max(0,min(100,int(value)))
+    except (TypeError,ValueError):
+        return False
+    code,output=run(["amixer","-c","0","sset","PCM",str(value)+"%"])
+    if code!=0:
+        return False
+    if persist:
+        try:
+            os.makedirs(os.path.dirname(VOLUME_STATE_FILE),exist_ok=True)
+            with open(VOLUME_STATE_FILE,"w",encoding="utf-8") as handle:
+                handle.write(str(value)+"\n")
+        except OSError:
+            pass
+    return True
+
+def restore_saved_volume():
+    try:
+        with open(VOLUME_STATE_FILE,"r",encoding="utf-8") as handle:
+            value=int(handle.read().strip())
+    except (OSError,ValueError):
+        return
+    set_volume_percent(value,persist=False)
+
 def network_state(interface):
     path=os.path.join("/sys/class/net",interface)
     result={"interface":interface,"ipv4":local_ipv4(interface),"carrier":False,"speed_mbps":None}
@@ -507,7 +545,7 @@ def build_snapshot(config):
     interface=config.get("NETWORK_IFACE","eth0")
     roc_process=process_state(role)
     service=service_details()
-    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service.get("active","unknown"),"roc_service_sub":service.get("sub","unknown"),"roc_result":service.get("result",""),"roc_restarts":service.get("restarts",0),"roc_process":roc_process,"roc_last_error":last_roc_error(),"audio_device":audio_device_state(role),"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
+    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service.get("active","unknown"),"roc_service_sub":service.get("sub","unknown"),"roc_result":service.get("result",""),"roc_restarts":service.get("restarts",0),"roc_process":roc_process,"roc_last_error":last_roc_error(),"audio_device":audio_device_state(role),"volume_percent":get_volume_percent() if role=="rx" else None,"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
     try: snapshot["load_1m"]=round(os.getloadavg()[0],2)
     except OSError: snapshot["load_1m"]=None
     return snapshot
@@ -541,6 +579,47 @@ def listener_loop(config):
         snapshot["received_at"]=time.time()
         name=snapshot.get("name",source[0])
         with REGISTRY_LOCK: REGISTRY[name]=snapshot
+
+def command_listener_loop(config):
+    port=int(config.get("CONTROL_PORT","19091"))
+    tx_ip=config.get("TX_IP","")
+    sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    sock.bind(("0.0.0.0",port))
+    while True:
+        payload,source=sock.recvfrom(4096)
+        if tx_ip and source[0]!=tx_ip:
+            continue
+        try:
+            message=json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError,json.JSONDecodeError):
+            continue
+        if message.get("command")=="set_volume":
+            set_volume_percent(message.get("value"),persist=True)
+
+def send_control(config,node_name,command,value=None):
+    port=int(config.get("CONTROL_PORT","19091"))
+    with REGISTRY_LOCK:
+        node=dict(REGISTRY.get(node_name,{}) or {})
+    if not node or node.get("role")!="rx":
+        return False,"RX non trovato"
+    source_ip=node.get("source_ip") or node.get("network",{}).get("ipv4")
+    if not source_ip:
+        return False,"IP RX non disponibile"
+    received_at=node.get("received_at",node.get("timestamp",0))
+    if time.time()-received_at>OFFLINE_AFTER:
+        return False,"RX offline"
+    message={"command":command}
+    if value is not None:
+        message["value"]=value
+    sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    try:
+        sock.sendto(json.dumps(message,separators=(",",":")).encode("utf-8"),(source_ip,port))
+    except OSError as exc:
+        return False,str(exc)
+    finally:
+        sock.close()
+    return True,"comando inviato"
 
 def system_status(config):
     now=time.time()
@@ -581,9 +660,30 @@ class Handler(BaseHTTPRequestHandler):
         if self.path=="/api/status": self.reply(200,"application/json; charset=utf-8",json.dumps(system_status(self.config),indent=2).encode("utf-8"));return
         if self.path=="/healthz": self.reply(200,"text/plain; charset=utf-8",b"ok\n");return
         self.reply(404,"text/plain; charset=utf-8",b"Not found\n")
+    def do_POST(self):
+        if self.path!="/api/control":
+            self.reply(404,"application/json; charset=utf-8",b'{"ok":false,"message":"Not found"}');return
+        try:
+            length=min(int(self.headers.get("Content-Length","0")),4096)
+            data=json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError,UnicodeDecodeError,json.JSONDecodeError):
+            self.reply(400,"application/json; charset=utf-8",b'{"ok":false,"message":"Richiesta non valida"}');return
+        node=str(data.get("node",""))
+        command=str(data.get("command",""))
+        if command!="set_volume":
+            self.reply(400,"application/json; charset=utf-8",b'{"ok":false,"message":"Comando non supportato"}');return
+        try:
+            value=max(0,min(100,int(data.get("value"))))
+        except (TypeError,ValueError):
+            self.reply(400,"application/json; charset=utf-8",b'{"ok":false,"message":"Volume non valido"}');return
+        ok,message=send_control(self.config,node,command,value)
+        payload=json.dumps({"ok":ok,"message":message,"node":node,"value":value}).encode("utf-8")
+        self.reply(200 if ok else 409,"application/json; charset=utf-8",payload)
 
 def main():
     config=read_config();role=config.get("ROLE","")
+    if role=="rx":
+        restore_saved_volume()
     heartbeat=threading.Thread(target=heartbeat_loop,args=(config,),daemon=True);heartbeat.start()
     if role=="tx":
         listener=threading.Thread(target=listener_loop,args=(config,),daemon=True);listener.start()
@@ -592,6 +692,7 @@ def main():
         server=ThreadingHTTPServer(("0.0.0.0",port),Handler)
         print("Dashboard in ascolto sulla porta "+str(port),flush=True)
         server.serve_forever();return
+    commands=threading.Thread(target=command_listener_loop,args=(config,),daemon=True);commands.start()
     while True: time.sleep(3600)
 if __name__=="__main__": main()
 PY_MONITOR
