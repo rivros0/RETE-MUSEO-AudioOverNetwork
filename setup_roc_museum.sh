@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.1
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.2
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.1"
+VERSION="4.2"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -364,7 +364,7 @@ if [ "$ROLE" = "rx" ]; then
     [ -n "$LOCAL_IP" ] || { echo "IPv4 non disponibile" >&2; exit 1; }
     OUTPUT_DEVICE="$(find_card playback 'Headphones|bcm2835')" || { echo "Uscita analogica Raspberry Pi non rilevata" >&2; exit 1; }
     echo "RX: ${MULTICAST_ADDR}:${RTP_PORT} -> ${OUTPUT_DEVICE}"
-    exec roc-recv -vv -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --miface="$LOCAL_IP" -o "alsa://${OUTPUT_DEVICE}" --rate="$SAMPLE_RATE" --target-latency="$TARGET_LATENCY" --io-latency="$IO_LATENCY" --frame-len="$FRAME_LEN"
+    exec roc-recv -vv -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --miface="$LOCAL_IP" -o "alsa://${OUTPUT_DEVICE}" --rate="$SAMPLE_RATE" --target-latency="$TARGET_LATENCY" --frame-len="$FRAME_LEN"
 fi
 exit 1
 EOF_RUNNER
@@ -420,11 +420,36 @@ def local_ipv4(interface):
         if len(fields)>=4: return fields[3].split("/")[0]
     return ""
 
-def service_state():
-    code,output=run(["systemctl","is-active","roc-museum.service"])
-    if output: return output
-    if code==0: return "active"
-    return "unknown"
+def service_details():
+    code,output=run(["systemctl","show","roc-museum.service","--property=ActiveState,SubState,Result,NRestarts","--no-pager"])
+    details={"active":"unknown","sub":"unknown","result":"","restarts":0}
+    if output:
+        for line in output.splitlines():
+            if "=" not in line:
+                continue
+            key,value=line.split("=",1)
+            if key=="ActiveState": details["active"]=value or "unknown"
+            elif key=="SubState": details["sub"]=value or "unknown"
+            elif key=="Result": details["result"]=value
+            elif key=="NRestarts":
+                try: details["restarts"]=int(value)
+                except ValueError: details["restarts"]=0
+    return details
+
+def last_roc_error():
+    code,output=run(["journalctl","-u","roc-museum.service","-n","20","--no-pager","-o","cat"])
+    if not output:
+        return ""
+    lines=[line.strip() for line in output.splitlines() if line.strip()]
+    preferred=[]
+    for line in lines:
+        low=line.lower()
+        if "[err]" in low or "error" in low or "failed" in low or "can't " in low or "cannot " in low or "unbound variable" in low or "non rilevata" in low:
+            preferred.append(line)
+    source=preferred if preferred else lines
+    if not source:
+        return ""
+    return source[-1][-240:]
 
 def process_state(role):
     process_name="roc-recv"
@@ -476,7 +501,8 @@ def build_snapshot(config):
     role=config.get("ROLE","")
     interface=config.get("NETWORK_IFACE","eth0")
     roc_process=process_state(role)
-    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service_state(),"roc_process":roc_process,"audio_device":audio_device_state(role),"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
+    service=service_details()
+    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service.get("active","unknown"),"roc_service_sub":service.get("sub","unknown"),"roc_result":service.get("result",""),"roc_restarts":service.get("restarts",0),"roc_process":roc_process,"roc_last_error":last_roc_error(),"audio_device":audio_device_state(role),"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
     try: snapshot["load_1m"]=round(os.getloadavg()[0],2)
     except OSError: snapshot["load_1m"]=None
     return snapshot
@@ -538,7 +564,7 @@ def system_status(config):
     nodes.sort(key=sort_key)
     return {"system":"RETE MUSEO - AudioOverNetwork","generated_at":now,"expected_rx":int(config.get("EXPECTED_RX_COUNT","3")),"nodes":nodes}
 
-PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}h1{margin:0 0 6px}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}</style></head><body><main><h1>RETE MUSEO - AudioOverNetwork</h1><div class="sub">Monitor centrale TX · sola lettura</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function yesNo(value){if(value){return 'OK';}return 'KO';}function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+yesNo(net.carrier)+speed+'</span></div><div class="row"><span class="label">Roc</span><span class="value">'+esc(n.roc_service)+' · processo '+yesNo(n.roc_process)+'</span></div><div class="row"><span class="label">Audio</span><span class="value">'+yesNo(n.audio_device)+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multi.state)+'</span></div><div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s</span></div></article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}document.getElementById('nodes').innerHTML=html;document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}refresh();setInterval(refresh,2000);</script></main></body></html>'''
+PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}h1{margin:0 0 6px}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}</style></head><body><main><h1>RETE MUSEO - AudioOverNetwork</h1><div class="sub">Monitor centrale TX · sola lettura</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}var service=esc(n.roc_service||'n/d');if(n.roc_service_sub){service+=' / '+esc(n.roc_service_sub);}var err='';if(n.roc_last_error){err='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+boolLabel(net.carrier,'collegata','non collegata')+speed+'</span></div><div class="row"><span class="label">Servizio Roc</span><span class="value">'+service+'</span></div><div class="row"><span class="label">Processo Roc</span><span class="value">'+boolLabel(n.roc_process,'in esecuzione','non in esecuzione')+'</span></div><div class="row"><span class="label">Riavvii Roc</span><span class="value">'+esc(n.roc_restarts||0)+'</span></div><div class="row"><span class="label">Dispositivo audio</span><span class="value">'+boolLabel(n.audio_device,'rilevato','non rilevato')+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multicastLabel(multi.state))+'</span></div>'+err+'<div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s fa</span></div></article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}document.getElementById('nodes').innerHTML=html;document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}refresh();setInterval(refresh,2000);</script></main></body></html>'''
 
 class Handler(BaseHTTPRequestHandler):
     config={}
@@ -616,7 +642,14 @@ enable_services() {
     start_service roc-museum.service
     sleep 2
     if [ "$(get_service_state roc-museum-monitor.service)" = "active" ]; then ok "Monitor attivo e abilitato al boot."; else warn "Monitor non attivo."; fi
-    if [ "$(get_service_state roc-museum.service)" = "active" ]; then ok "Audio Roc attivo e abilitato al boot."; else warn "Audio Roc non ancora attivo; systemd continuerà a ritentare."; fi
+    if [ "$(get_service_state roc-museum.service)" = "active" ]; then
+        ok "Audio Roc attivo e abilitato al boot."
+    else
+        warn "Audio Roc non ancora attivo; systemd continuerà a ritentare."
+        echo
+        echo "Ultime righe del log Roc:"
+        journalctl -u roc-museum.service -n 8 --no-pager -o cat 2>/dev/null | sed 's/^/  /' || true
+    fi
 }
 
 print_diagnostics() {
