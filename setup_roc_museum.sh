@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.2
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.3
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,13 +12,14 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.2"
+VERSION="4.3"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
 TARGET_LATENCY="100ms"
 FRAME_LEN="4ms"
 MONITOR_PORT="19090"
+CONTROL_PORT="19091"
 MONITOR_HTTP_PORT="8080"
 EXPECTED_RX_COUNT="3"
 CONFIG_FILE="/etc/roc-museum.conf"
@@ -330,6 +331,7 @@ SAMPLE_RATE="$SAMPLE_RATE"
 TARGET_LATENCY="$TARGET_LATENCY"
 FRAME_LEN="$FRAME_LEN"
 MONITOR_PORT="$MONITOR_PORT"
+CONTROL_PORT="$CONTROL_PORT"
 MONITOR_HTTP_PORT="$MONITOR_HTTP_PORT"
 EXPECTED_RX_COUNT="$EXPECTED_RX_COUNT"
 SOFTWARE_VERSION="$VERSION"
@@ -355,7 +357,10 @@ find_card(){
 }
 ip route replace 239.0.0.0/8 dev "$NETWORK_IFACE"
 if [ "$ROLE" = "tx" ]; then
-    INPUT_DEVICE="$(find_card capture 'Scarlett|Focusrite')" || { echo "Focusrite Scarlett non rilevata" >&2; exit 1; }
+    while ! INPUT_DEVICE="$(find_card capture 'Scarlett|Focusrite')"; do
+        echo "TX: Focusrite Scarlett non rilevata; attesa collegamento USB..."
+        sleep 5
+    done
     echo "TX: ${INPUT_DEVICE} -> ${MULTICAST_ADDR}:${RTP_PORT}"
     exec roc-send -vv -i "alsa://${INPUT_DEVICE}" -s "rtp://${MULTICAST_ADDR}:${RTP_PORT}" --rate="$SAMPLE_RATE" --frame-len="$FRAME_LEN"
 fi
