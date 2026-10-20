@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.4
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.5
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.4"
+VERSION="4.5"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -442,20 +442,45 @@ def service_details():
                 except ValueError: details["restarts"]=0
     return details
 
-def last_roc_error():
-    code,output=run(["journalctl","-u","roc-museum.service","-n","20","--no-pager","-o","cat"])
+def recent_roc_messages():
+    code,output=run(["journalctl","-u","roc-museum.service","--since=-5min","-n","80","--no-pager","-o","cat"])
     if not output:
-        return ""
-    lines=[line.strip() for line in output.splitlines() if line.strip()]
-    preferred=[]
-    for line in lines:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+def last_roc_error():
+    matches=[]
+    for line in recent_roc_messages():
         low=line.lower()
-        if "[err]" in low or "error" in low or "failed" in low or "can't " in low or "cannot " in low or "unbound variable" in low or "non rilevata" in low:
-            preferred.append(line)
-    source=preferred if preferred else lines
-    if not source:
+        if "[err]" in low or " error" in low or "failed" in low or "can't " in low or "cannot " in low or "unbound variable" in low:
+            matches.append(line)
+    if not matches:
         return ""
-    return source[-1][-240:]
+    return matches[-1][-240:]
+
+def last_roc_warning():
+    matches=[]
+    for line in recent_roc_messages():
+        low=line.lower()
+        if "[wrn]" in low or "underrun" in low or "overrun" in low or "xrun" in low:
+            matches.append(line)
+    if not matches:
+        return ""
+    return matches[-1][-240:]
+
+def network_rtt_ms(target):
+    if not target:
+        return None
+    code,output=run(["ping","-c","1","-W","1",target])
+    if code!=0:
+        return None
+    match=re.search(r"time[=<]([0-9.]+)",output)
+    if match is None:
+        return None
+    try:
+        return round(float(match.group(1)),2)
+    except ValueError:
+        return None
 
 def process_state(role):
     process_name="roc-recv"
@@ -545,7 +570,7 @@ def build_snapshot(config):
     interface=config.get("NETWORK_IFACE","eth0")
     roc_process=process_state(role)
     service=service_details()
-    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service.get("active","unknown"),"roc_service_sub":service.get("sub","unknown"),"roc_result":service.get("result",""),"roc_restarts":service.get("restarts",0),"roc_process":roc_process,"roc_last_error":last_roc_error(),"audio_device":audio_device_state(role),"volume_percent":get_volume_percent() if role=="rx" else None,"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
+    snapshot={"name":config.get("NODE_NAME",socket.gethostname()),"hostname":socket.gethostname(),"role":role,"software_version":config.get("SOFTWARE_VERSION",""),"timestamp":time.time(),"roc_service":service.get("active","unknown"),"roc_service_sub":service.get("sub","unknown"),"roc_result":service.get("result",""),"roc_restarts":service.get("restarts",0),"roc_process":roc_process,"roc_last_error":last_roc_error(),"roc_last_warning":last_roc_warning(),"audio_device":audio_device_state(role),"volume_percent":get_volume_percent() if role=="rx" else None,"target_latency":config.get("TARGET_LATENCY",""),"network_rtt_ms":network_rtt_ms(config.get("TX_IP","")) if role=="rx" else 0.0,"network":network_state(interface),"multicast":{"group":config.get("MULTICAST_ADDR",""),"state":multicast_state(role,interface,config.get("MULTICAST_ADDR",""),roc_process)},"temperature_c":temperature(),"throttled":throttled()}
     try: snapshot["load_1m"]=round(os.getloadavg()[0],2)
     except OSError: snapshot["load_1m"]=None
     return snapshot
@@ -629,14 +654,18 @@ def system_status(config):
         age=max(0,now-received_at)
         online=age<=OFFLINE_AFTER
         problems=[]
+        waiting_audio=(node.get("role")=="tx" and online and node.get("roc_service")=="active" and not node.get("audio_device") and not node.get("roc_process") and node.get("network",{}).get("carrier"))
         if not online: problems.append("offline")
         if node.get("roc_service")!="active": problems.append("roc_service")
-        if not node.get("roc_process"): problems.append("roc_process")
-        if not node.get("audio_device"): problems.append("audio_device")
+        if not node.get("roc_process") and not waiting_audio: problems.append("roc_process")
+        if not node.get("audio_device") and not waiting_audio: problems.append("audio_device")
         if not node.get("network",{}).get("carrier"): problems.append("ethernet")
         state="OK"
-        if problems: state="ATTENZIONE"
+        if waiting_audio: state="ATTESA_AUDIO"
+        elif problems: state="ATTENZIONE"
         if "offline" in problems: state="OFFLINE"
+        if waiting_audio:
+            node["roc_last_error"]=""
         node["age_seconds"]=round(age,1)
         node["online"]=online
         node["problems"]=problems
