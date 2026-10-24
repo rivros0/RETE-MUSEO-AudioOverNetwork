@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.6
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.7
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.6"
+VERSION="4.7"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -380,6 +380,7 @@ write_monitor() {
     cat > "$MONITOR_TARGET" <<'PY_MONITOR'
 #!/usr/bin/env python3
 import json
+import uuid
 import math
 import struct
 from collections import deque
@@ -394,6 +395,9 @@ CONFIG_FILE="/etc/roc-museum.conf"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
+CONTROL_RESULTS={}
+MUTED=False
+RESUME_VOLUME=None
 REGISTRY={}
 REGISTRY_LOCK=threading.Lock()
 
@@ -707,6 +711,8 @@ def build_snapshot(config):
     meter=METER.snapshot()
     if role=="rx" and meter["available"]:
         meter=post_fader_meter(meter,output_mixer())
+    snapshot["muted"]=MUTED if role=="rx" else False
+    if role=="rx" and MUTED: snapshot["volume_percent"]=RESUME_VOLUME
     snapshot["audio_meter"]=meter
     return snapshot
 
@@ -735,27 +741,58 @@ def listener_loop(config):
         payload,source=sock.recvfrom(65535)
         try: snapshot=json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError,json.JSONDecodeError): continue
+        if not isinstance(snapshot,dict): continue
+        if snapshot.get("type")=="control_ack":
+            with REGISTRY_LOCK:
+                pending=CONTROL_RESULTS.get(str(snapshot.get("id")))
+                if pending and pending["ip"]==source[0]:
+                    pending.update(state="confirmed" if snapshot.get("ok") is True else "failed",
+                                   muted=snapshot.get("muted"),volume_percent=snapshot.get("volume_percent"))
+            continue
         snapshot["source_ip"]=source[0]
         snapshot["received_at"]=time.time()
         name=snapshot.get("name",source[0])
         with REGISTRY_LOCK: REGISTRY[name]=snapshot
 
+def apply_control(command,value):
+    global MUTED,RESUME_VOLUME
+    if command=="set_mute" and isinstance(value,bool):
+        if value==MUTED: return True
+        if value:
+            previous=get_volume_percent()
+            if previous is None or not set_volume_percent(0,persist=False): return False
+            if get_volume_percent()!=0: return False
+            RESUME_VOLUME=previous
+            MUTED=True
+        else:
+            if RESUME_VOLUME is None or not set_volume_percent(RESUME_VOLUME): return False
+            if get_volume_percent()!=RESUME_VOLUME: return False
+            MUTED=False
+        return True
+    if command=="set_volume" and type(value)==int and 0<=value<=100:
+        if MUTED:
+            # Change the recall level without making a muted receiver audible.
+            RESUME_VOLUME=value
+            return True
+        return set_volume_percent(value) and get_volume_percent()==value
+    return False
+
 def command_listener_loop(config):
     port=int(config.get("CONTROL_PORT","19091"))
     tx_ip=config.get("TX_IP","")
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
     sock.bind(("0.0.0.0",port))
     while True:
         payload,source=sock.recvfrom(4096)
-        if tx_ip and source[0]!=tx_ip:
-            continue
-        try:
-            message=json.loads(payload.decode("utf-8"))
-        except (UnicodeDecodeError,json.JSONDecodeError):
-            continue
-        if message.get("command")=="set_volume":
-            set_volume_percent(message.get("value"),persist=True)
+        if source[0]!=tx_ip: continue
+        try: message=json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError,json.JSONDecodeError): continue
+        if not isinstance(message,dict): continue
+        ok=apply_control(message.get("command"),message.get("value"))
+        ack={"type":"control_ack","id":message.get("id"),"ok":ok,
+             "muted":MUTED,"volume_percent":RESUME_VOLUME if MUTED else get_volume_percent()}
+        try: sock.sendto(json.dumps(ack).encode(),(tx_ip,int(config.get("MONITOR_PORT","19090"))))
+        except OSError: pass
 
 def send_control(config,node_name,command,value=None):
     port=int(config.get("CONTROL_PORT","19091"))
@@ -769,7 +806,12 @@ def send_control(config,node_name,command,value=None):
     received_at=node.get("received_at",node.get("timestamp",0))
     if time.time()-received_at>OFFLINE_AFTER:
         return False,"RX offline"
-    message={"command":command}
+    command_id=uuid.uuid4().hex
+    with REGISTRY_LOCK:
+        for key in list(CONTROL_RESULTS):
+            if time.time()-CONTROL_RESULTS[key]["created"]>60: del CONTROL_RESULTS[key]
+        CONTROL_RESULTS[command_id]={"ip":source_ip,"created":time.time(),"state":"sent"}
+    message={"command":command,"id":command_id}
     if value is not None:
         message["value"]=value
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
@@ -779,7 +821,7 @@ def send_control(config,node_name,command,value=None):
         return False,str(exc)
     finally:
         sock.close()
-    return True,"comando inviato"
+    return True,command_id
 
 def system_status(config):
     now=time.time()
@@ -812,7 +854,10 @@ def system_status(config):
     nodes.sort(key=sort_key)
     return {"system":"RETE MUSEO - AudioOverNetwork","generated_at":now,"expected_rx":int(config.get("EXPECTED_RX_COUNT","3")),"nodes":nodes}
 
-PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}h1{margin:0 0 6px}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volume input[type=range]{width:100%}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}</style></head><body><main><h1>RETE MUSEO - AudioOverNetwork</h1><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}function volumeBlock(n){if(n.role!=='rx'){return '';}var value=(n.volume_percent==null)?0:Math.max(0,Math.min(100,Number(n.volume_percent)));return '<div class="volume"><div class="volumeHead"><span class="label">Volume uscita</span><strong id="vol-label-'+esc(n.name)+'">'+esc(value)+' %</strong></div><input class="volumeRange" type="range" min="0" max="100" step="1" value="'+esc(value)+'" data-node="'+esc(n.name)+'" aria-label="Volume '+esc(n.name)+'"><div class="volumeMsg" id="vol-msg-'+esc(n.name)+'"></div></div>';}function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function diagnosticsBlock(n){var body='';if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
+PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}h1{margin:0 0 6px}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}</style></head><body><main><h1>RETE MUSEO - AudioOverNetwork</h1><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
+function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
+return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
+function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function diagnosticsBlock(n){var body='';if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
 var m=n.audio_meter;var rx=n.role==='rx';var title=rx?'Uscita RX · post-fader stimato':'Ingresso TX · dopo ADC';
 if(!n.online||!m||!m.available){return '<section class="meter"><strong>'+title+'</strong><small>'+esc(!n.online?'Nodo offline':m?m.error:'Aggiornare il monitor del nodo')+'</small></section>';}
 var age=rx?m.input_clip_age_seconds:m.clip_age_seconds;var clipped=age!=null&&age<30;
@@ -824,7 +869,18 @@ if(rx){html+='<small>Guadagno ALSA '+esc(c.gain_db)+' dB'+(c.muted?' · MUTE':''
 else{html+='<small>Fondo scala: '+esc(c.full_scale_samples)+' campioni / 5 s</small>';}});
 html+='<small>'+(clipped?(rx?'FONDO SCALA a monte del fader':'FONDO SCALA rilevato')+' · '+esc(age)+' s fa':hot?'Attenzione: margine inferiore a 3 dB':'Nessun fondo scala recente')+' · scala −60…0 dBFS</small>';
 html+='<small>'+(rx?'Stima: livello RTP degli ultimi 5 s + guadagno ALSA attuale. Abbassare il fader non elimina il clipping a monte.':'Picco/RMS degli ultimi 5 s.')+' Non misura distorsione analogica.</small></section>';return html;}
-function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}var service=esc(n.roc_service||'n/d');if(n.roc_service_sub){service+=' / '+esc(n.roc_service_sub);}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+boolLabel(net.carrier,'collegata','non collegata')+speed+'</span></div><div class="row"><span class="label">Servizio Roc</span><span class="value">'+service+'</span></div><div class="row"><span class="label">Processo Roc</span><span class="value">'+boolLabel(n.roc_process,'in esecuzione','non in esecuzione')+'</span></div><div class="row"><span class="label">Riavvii Roc</span><span class="value">'+esc(n.roc_restarts||0)+'</span></div><div class="row"><span class="label">Dispositivo audio</span><span class="value">'+boolLabel(n.audio_device,'rilevato','non rilevato')+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multicastLabel(multi.state))+'</span></div>'+meterBlock(n)+latencyBlock(n)+volumeBlock(n)+'<div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s fa</span></div>'+diagnosticsBlock(n)+'</article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}document.getElementById('nodes').innerHTML=html;bindVolumeControls();document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}async function sendVolume(node,value){var msg=document.getElementById('vol-msg-'+node);if(msg){msg.textContent='Invio '+value+' %...';}try{var response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({node:node,command:'set_volume',value:Number(value)})});var result=await response.json();if(!response.ok||!result.ok){throw new Error(result.message||'comando non riuscito');}if(msg){msg.textContent='Comando inviato';}}catch(error){if(msg){msg.textContent='Errore: '+error.message;}}}function bindVolumeControls(){var controls=document.querySelectorAll('.volumeRange');for(var i=0;i<controls.length;i++){(function(control){var node=control.getAttribute('data-node');control.addEventListener('input',function(){var label=document.getElementById('vol-label-'+node);if(label){label.textContent=control.value+' %';}});control.addEventListener('change',function(){sendVolume(node,control.value);});})(controls[i]);}}refresh();setInterval(refresh,2000);</script></main></body></html>'''
+function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}var service=esc(n.roc_service||'n/d');if(n.roc_service_sub){service+=' / '+esc(n.roc_service_sub);}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+boolLabel(net.carrier,'collegata','non collegata')+speed+'</span></div><div class="row"><span class="label">Servizio Roc</span><span class="value">'+service+'</span></div><div class="row"><span class="label">Processo Roc</span><span class="value">'+boolLabel(n.roc_process,'in esecuzione','non in esecuzione')+'</span></div><div class="row"><span class="label">Riavvii Roc</span><span class="value">'+esc(n.roc_restarts||0)+'</span></div><div class="row"><span class="label">Dispositivo audio</span><span class="value">'+boolLabel(n.audio_device,'rilevato','non rilevato')+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multicastLabel(multi.state))+'</span></div>'+meterBlock(n)+latencyBlock(n)+volumeBlock(n)+'<div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s fa</span></div>'+diagnosticsBlock(n)+'</article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}var active=document.activeElement;var focusedNode=active&&active.classList.contains('volumeNumber')?active.closest('form').dataset.node:null;document.getElementById('nodes').innerHTML=html;bindVolumeControls();if(focusedNode){document.querySelectorAll('.volumeForm').forEach(function(f){if(f.dataset.node===focusedNode)f.querySelector('input').focus();});}document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}function showFeedback(node,text){feedback[node]=text;var el=document.getElementById('vol-msg-'+node);if(el)el.innerHTML=text;}
+async function sendCommand(node,command,value){if(pending[node])return;pending[node]=true;showFeedback(node,'Invio…');
+try{var response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({node:node,command:command,value:value})});var result=await response.json();if(!response.ok||!result.ok)throw new Error(result.message||'Invio fallito');
+showFeedback(node,'<span style="color:#9ca3af">✓ Inviato</span>');
+for(var attempt=0;attempt<18;attempt++){await new Promise(function(resolve){setTimeout(resolve,500);});var ackResponse=await fetch('/api/control/'+encodeURIComponent(result.id),{cache:'no-store'});if(!ackResponse.ok)throw new Error('Verifica fallita');var ack=await ackResponse.json();
+if(ack.state==='confirmed'){confirmed[node]={muted:ack.muted,volume_percent:ack.volume_percent,until:Date.now()+15000};knownMute[node]=ack.muted;showFeedback(node,'<span style="color:#60a5fa">✓ Confermato RX</span>');delete drafts[node];return;}
+if(ack.state==='failed')throw new Error('RX: applicazione non confermata');if(ack.state==='timeout')break;}
+throw new Error('Inviato, conferma RX non ricevuta');
+}catch(error){showFeedback(node,'<span style="color:#fca5a5">'+esc(error.message)+'</span>');}
+finally{delete pending[node];var completedFeedback=feedback[node];setTimeout(function(){if(!pending[node]&&feedback[node]===completedFeedback)showFeedback(node,'');},5000);}}
+function bindVolumeControls(){document.querySelectorAll('.volumeForm').forEach(function(form){var node=form.dataset.node;var input=form.querySelector('input');input.addEventListener('input',function(){drafts[node]=input.value;});form.addEventListener('submit',function(event){event.preventDefault();if(form.reportValidity())sendCommand(node,'set_volume',Number(input.value));});form.querySelector('.muteButton').addEventListener('click',function(){sendCommand(node,'set_mute',!knownMute[node]);});});}
+refresh();setInterval(refresh,2000);</script></main></body></html>'''
 
 class Handler(BaseHTTPRequestHandler):
     config={}
@@ -834,6 +890,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path=="/" or self.path=="/index.html": self.reply(200,"text/html; charset=utf-8",PAGE.encode("utf-8"));return
         if self.path=="/api/status": self.reply(200,"application/json; charset=utf-8",json.dumps(system_status(self.config),indent=2).encode("utf-8"));return
+        if self.path.startswith("/api/control/"):
+            with REGISTRY_LOCK: result=dict(CONTROL_RESULTS.get(self.path.rsplit("/",1)[-1],{}))
+            if result.get("state")=="sent" and time.time()-result["created"]>8: result["state"]="timeout"
+            result.pop("ip",None)
+            self.reply(200,"application/json",json.dumps(result).encode());return
         if self.path=="/healthz": self.reply(200,"text/plain; charset=utf-8",b"ok\n");return
         self.reply(404,"text/plain; charset=utf-8",b"Not found\n")
     def do_POST(self):
@@ -844,16 +905,18 @@ class Handler(BaseHTTPRequestHandler):
             data=json.loads(self.rfile.read(length).decode("utf-8"))
         except (ValueError,UnicodeDecodeError,json.JSONDecodeError):
             self.reply(400,"application/json; charset=utf-8",b'{"ok":false,"message":"Richiesta non valida"}');return
+        if not isinstance(data,dict):
+            self.reply(400,"application/json",b'{"ok":false}');return
         node=str(data.get("node",""))
         command=str(data.get("command",""))
-        if command!="set_volume":
+        if command not in ("set_volume","set_mute"):
             self.reply(400,"application/json; charset=utf-8",b'{"ok":false,"message":"Comando non supportato"}');return
-        try:
-            value=max(0,min(100,int(data.get("value"))))
-        except (TypeError,ValueError):
-            self.reply(400,"application/json; charset=utf-8",b'{"ok":false,"message":"Volume non valido"}');return
+        value=data.get("value")
+        valid=(command=="set_mute" and isinstance(value,bool)) or (command=="set_volume" and type(value)==int and 0<=value<=100)
+        if not valid:
+            self.reply(400,"application/json",b'{"ok":false,"message":"Valore non valido"}');return
         ok,message=send_control(self.config,node,command,value)
-        payload=json.dumps({"ok":ok,"message":message,"node":node,"value":value}).encode("utf-8")
+        payload=json.dumps({"ok":ok,"message":"Comando inviato" if ok else message,"id":message if ok else None}).encode()
         self.reply(200 if ok else 409,"application/json; charset=utf-8",payload)
 
 def main():

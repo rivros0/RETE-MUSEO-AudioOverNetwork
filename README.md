@@ -220,3 +220,24 @@ python3 -m unittest discover -s tests -v
 ```
 
 Il formato RTP è descritto nel [riferimento Roc](https://roc-streaming.org/toolkit/doxygen/namespaceroc_1_1rtp.html).
+
+## Controlli RX (v4.7)
+
+Il volume si imposta esclusivamente dalla casella numerica **0–100%**, premendo
+**Invio** oppure **Applica**. Il refresh mantiene il valore che si sta scrivendo.
+
+- **✓ grigia — Inviato:** il TX ha inviato il comando UDP.
+- **✓ blu — Confermato RX:** il ricevitore ha applicato il comando e restituito
+  una conferma con identificativo univoco, dopo la lettura di verifica ALSA.
+- Se manca la conferma entro circa 9 secondi, compare un errore; il comando
+  potrebbe comunque essere stato applicato (UDP non garantisce la consegna).
+- I messaggi scompaiono dopo 5 secondi dal risultato.
+
+**Mute** porta temporaneamente il volume a zero; **Riattiva audio** ripristina
+il valore precedente. Durante il mute la casella modifica il volume da
+ripristinare senza riattivare l'audio. Il mute è temporaneo: al riavvio del
+monitor/nodo viene ripristinato il volume salvato su disco.
+
+Aggiornare **sia TX sia RX**: i ricevitori precedenti non supportano mute e
+conferme, quindi il solo invio non produrrà una spunta blu. Le conferme tornano
+sulla porta heartbeat UDP 19090; non sono necessarie nuove porte.
