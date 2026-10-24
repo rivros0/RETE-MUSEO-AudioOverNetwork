@@ -32,7 +32,7 @@ class AccessTests(unittest.TestCase):
     def test_public_status_private_controls(self):
         with patch.object(monitor,'system_status',return_value={'nodes':[]}):
             self.assertEqual(self.request('/api/status',method='GET')[0],200)
-        for path in ('/api/control','/api/upload','/api/player','/api/calendar/save','/api/calendar/delete','/api/usb/browse','/api/usb/import','/api/usb/eject'):
+        for path in ('/api/control','/api/upload','/api/media/delete','/api/player','/api/calendar/save','/api/calendar/delete','/api/usb/browse','/api/usb/import','/api/usb/eject'):
             self.assertEqual(self.request(path)[0],401)
         for path in ('/api/media','/api/studio','/api/usb'):
             self.assertEqual(self.request(path,method='GET')[0],401)
@@ -63,5 +63,14 @@ class AccessTests(unittest.TestCase):
     def test_expired_session(self):
         monitor.SESSIONS['test']['expires']=0
         self.assertEqual(self.request('/api/media',headers=self.headers(),method='GET')[0],401)
+
+    def test_delete_route_protected_and_delegates(self):
+        from unittest.mock import Mock
+        engine=Mock();engine.delete_media.return_value={'ok':True,'message':'Traccia eliminata'}
+        body=json.dumps({'name':'test.wav'}).encode()
+        with patch.object(monitor.Handler,'studio',engine):
+            self.assertEqual(self.request('/api/media/delete',body,{'Cookie':'regia=test','Content-Length':str(len(body))})[0],403)
+            self.assertEqual(self.request('/api/media/delete',body,self.headers(**{'Content-Length':str(len(body))}))[0],200)
+            engine.delete_media.assert_called_once_with('test.wav')
 
 if __name__=='__main__': unittest.main()

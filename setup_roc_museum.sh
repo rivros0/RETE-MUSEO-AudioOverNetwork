@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.8
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.9
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.8"
+VERSION="4.9"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -357,6 +357,15 @@ find_card(){
 }
 ip route replace 239.0.0.0/8 dev "$NETWORK_IFACE"
 if [ "$ROLE" = "tx" ]; then
+    # While the monitor owns the continuous mic/music bus, keep this unit
+    # active without opening ALSA a second time. Recover after a monitor crash.
+    while [ -r /run/roc-museum-bus ]; do
+        read -r BUS_PID < /run/roc-museum-bus || break
+        case "$BUS_PID" in ''|*[!0-9]*) break ;; esac
+        kill -0 "$BUS_PID" 2>/dev/null || break
+        sleep 1
+    done
+    if [ -e /run/roc-museum-bus ]; then rm -f /run/roc-museum-bus; fi
     while ! INPUT_DEVICE="$(find_card capture 'Scarlett|Focusrite')"; do
         echo "TX: Focusrite Scarlett non rilevata; attesa collegamento USB..."
         sleep 5
@@ -845,9 +854,11 @@ def system_status(config):
         if node.get("role")=="tx" and STUDIO is not None:
             player=STUDIO.snapshot()
             node["studio_source"]=player["status"]
-            source_owned=player["status"] in ("playing","paused")
+            source_owned=bool(player.get("audio_bus",{} ) and player["audio_bus"]["active"])
             if source_owned:
-                node["roc_service_sub"]="ingresso sospeso per player"
+                node["roc_service_sub"]="bus microfono + musica"
+                node["microphone_online"]=player["audio_bus"]["microphone_online"]
+                if not node["microphone_online"]: problems.append("microphone")
                 node["roc_process"]=player["sender_running"]
                 node["roc_last_error"]=player["error"]
         waiting_audio=(node.get("role")=="tx" and online and node.get("roc_service")=="active" and not node.get("audio_device") and not node.get("roc_process") and node.get("network",{}).get("carrier"))
@@ -877,7 +888,7 @@ PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="
 function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
 return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
 function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function diagnosticsBlock(n){var body='';if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
-var m=n.audio_meter;var rx=n.role==='rx';var title=rx?'Uscita RX':'Trasmissione TX';
+var m=n.audio_meter;var rx=n.role==='rx';var title=rx?'Uscita RX':'Trasmissione TX · microfono + musica';
 if(!n.online||!m||!m.available){return '<section class="meter"><strong>'+title+'</strong><small>'+esc(!n.online?'Nodo offline':m?m.error:'Aggiornare il monitor del nodo')+'</small></section>';}
 var age=rx?m.input_clip_age_seconds:m.clip_age_seconds;var clipped=age!=null&&age<30;
 var hot=m.channels.some(function(c){return c.peak_dbfs>=-3;});
@@ -945,6 +956,15 @@ PAGE=PAGE.replace('<div id="summary"',REGIA_UI+'<div id="summary"')
 PAGE=PAGE.replace('session();\n</script>','window.addEventListener("DOMContentLoaded",session);\n</script>')
 PAGE=PAGE.replace("if(n.role!=='rx')return '';", "if(n.role!=='rx')return '';if(!authorized)return '<div class=volume>Accedi alla regia per modificare volume e mute.</div>';")
 PAGE=PAGE.replace("headers:{'Content-Type':'application/json'},body:JSON.stringify({node:","headers:{'Content-Type':'application/json','X-CSRF-Token':csrf},body:JSON.stringify({node:")
+
+PAGE=PAGE.replace('<div class="sub">','<p id="systemClock" role="timer">Ora TX: in attesa…</p><div class="sub">')
+CLOCK_JS=r'''var txClock=null,txClockSample=0;
+function syncTxClock(timestamp){txClock=timestamp*1000;txClockSample=performance.now();renderTxClock();}
+function renderTxClock(){var el=document.getElementById('systemClock');if(el&&txClock!==null)el.textContent='Ora TX: '+new Date(txClock+performance.now()-txClockSample).toLocaleString('it-IT',{timeZone:'Europe/Rome'})+' · Europe/Rome';}
+setInterval(renderTxClock,1000);
+'''
+PAGE=PAGE.replace('<script>function esc','<script>'+CLOCK_JS+'function esc',1)
+PAGE=PAGE.replace("var data=await response.json();var okCount", "var data=await response.json();syncTxClock(data.generated_at);var okCount",1)
 
 class Handler(BaseHTTPRequestHandler):
     config={}
@@ -1044,7 +1064,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json_reply(200,{"ok":True});return
         if self.path=="/api/upload":
             self.upload();return
-        if self.path in ("/api/player","/api/calendar/save","/api/calendar/delete","/api/usb/browse","/api/usb/import","/api/usb/eject"):
+        if self.path in ("/api/media/delete","/api/player","/api/calendar/save","/api/calendar/delete","/api/usb/browse","/api/usb/import","/api/usb/eject"):
             try:
                 length=int(self.headers.get("Content-Length","0"))
                 if not 0<length<=16384 or self.headers.get("Transfer-Encoding"): raise ValueError()
@@ -1053,6 +1073,7 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError,UnicodeDecodeError):
                 self.json_reply(400,{"message":"Richiesta JSON non valida"});return
             def action():
+                if self.path=="/api/media/delete": return self.studio.delete_media(data.get("name"))
                 if self.path=="/api/player": return self.studio.command(data)
                 if self.path=="/api/calendar/save": return self.studio.save_event(data)
                 if self.path=="/api/calendar/delete":
@@ -1155,6 +1176,7 @@ PY_MONITOR
 #!/usr/bin/env python3
 """TX studio: one Roc sender, durable schedule, constrained USB explorer."""
 import datetime as dt
+import importlib.util
 import json
 import math
 import os
@@ -1205,7 +1227,7 @@ def confined_open(root, relative='', directory=False):
 
 
 class Studio:
-    def __init__(self,config,media='/var/lib/roc-museum/media',state='/var/lib/roc-museum/studio',usb_root='/run/roc-museum-usb',copy_lock=None):
+    def __init__(self,config,media='/var/lib/roc-museum/media',state='/var/lib/roc-museum/studio',usb_root='/run/roc-museum-usb',copy_lock=None,audio_factory=None,bus_marker="/run/roc-museum-bus"):
         self.config=config
         self.media=Path(media);self.state=Path(state);self.usb_root=Path(usb_root)
         self.media.mkdir(parents=True,exist_ok=True,mode=0o750)
@@ -1221,17 +1243,47 @@ class Studio:
         self.track=None;self.duration=0;self.position=0;self.started=0;self.status='live';self.loop=False
         self.origin='mixer';self.error='';self.queue=[];self.manual_hold=False
         self.shutdown=threading.Event();self.metadata={};self.thread=None
+        self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
 
     def start(self):
-        # Recover the physical input after an interrupted previous monitor process.
-        self._live()
+        try: self._ensure_audio()
+        except Exception as error:
+            self.error=str(error);self._live()
         self.thread=threading.Thread(target=self._worker,daemon=True);self.thread.start()
 
     def close(self):
         self.shutdown.set()
         if self.thread: self.thread.join(timeout=5)
         with self.lock:
-            self._terminate();self.db.close()
+            self._terminate()
+            if self.bus: self.bus.close();self.bus=None
+            self.bus_marker.unlink(missing_ok=True)
+            self.sender=None;self.db.close()
+
+    def ducking(self):
+        return self._setting('ducking','{"enabled":true,"threshold_db":-36,"reduction_db":-18}')
+
+    def _ensure_audio(self):
+        if self.bus and self.bus.snapshot()['active']: return
+        if self.bus: self.bus.close();self.bus=None
+        run(['systemctl','stop','roc-museum.service'])
+        try:
+            if self.audio_factory is None:
+                spec=importlib.util.spec_from_file_location('museum_audio_bus',Path(__file__).with_name('audio_bus.py'))
+                module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+                factory=module.AudioBus
+            else: factory=self.audio_factory
+            # The audio unit stays active as a coordinator; on monitor death it
+            # automatically resumes the original ALSA microphone path.
+            fd=os.open(self.bus_marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'w') as marker: marker.write(str(os.getpid())+'\n')
+            bus=factory(self.config);bus.configure(self.ducking());bus.start()
+            self.bus=bus;self.sender=bus.sender
+            run(['systemctl','start','roc-museum.service'])
+        except Exception:
+            if self.bus: self.bus.close();self.bus=None
+            self.sender=None;self.bus_marker.unlink(missing_ok=True)
+            run(['systemctl','start','roc-museum.service']);raise
 
     def _setting(self,key,default='false'):
         row=self.db.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
@@ -1241,19 +1293,38 @@ class Studio:
         self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,json.dumps(value)));self.db.commit()
 
     def _terminate(self):
-        processes=[p for p in (self.encoder,self.sender) if p]
-        for p in processes:
-            if p.poll() is None: p.terminate()
-        for p in processes:
-            try: p.wait(timeout=3)
-            except subprocess.TimeoutExpired: p.kill();p.wait(timeout=3)
-        self.encoder=None;self.sender=None
+        if self.bus: self.bus.detach()
+        if self.encoder:
+            if self.encoder.poll() is None: self.encoder.terminate()
+            try: self.encoder.wait(timeout=3)
+            except subprocess.TimeoutExpired: self.encoder.kill();self.encoder.wait(timeout=3)
+            if self.encoder.stdout: self.encoder.stdout.close()
+        self.encoder=None
         if self.error_log: self.error_log.close();self.error_log=None
 
     def _live(self):
-        self._terminate()
-        run(['systemctl','start','roc-museum.service'])
+        self._terminate();self.plan=None
+        if not self.bus or not self.bus.snapshot()['active']:
+            if self.bus: self.bus.close();self.bus=None
+            self.sender=None;self.bus_marker.unlink(missing_ok=True)
+            run(['systemctl','start','roc-museum.service'])
         self.status='live';self.origin='mixer';self.position=0;self.track=None;self.duration=0
+
+    def delete_media(self,name):
+        name=audio_name(name)
+        if not self.copy_lock.acquire(blocking=False): raise ValueError('Attendere il completamento della copia')
+        try:
+            with self.lock:
+                if name==self.track or self.plan and name in self.plan['tracks']:
+                    raise ValueError('Traccia in uso: fermare prima il player')
+                for event in self.events():
+                    if name in event.get('tracks',[event['track']]):
+                        raise ValueError('Traccia utilizzata dall’evento: '+event['name']+'. Modificare o eliminare prima l’evento.')
+                fd=confined_open(self.media,name);os.close(fd)
+                (self.media/name).unlink()
+                self.metadata={k:v for k,v in self.metadata.items() if k[0]!=name}
+                return {'ok':True,'message':'Traccia eliminata','name':name}
+        finally: self.copy_lock.release()
 
     def info(self,name):
         name=audio_name(name);path=self.media/name
@@ -1275,64 +1346,83 @@ class Studio:
                 result.append({'name':p.name,'size':p.stat().st_size})
         return result
 
-    def _play(self,name,position=0,origin='manual',loop=False):
+    def _play(self,name,position=0,origin='manual',loop=False,deadline=None):
         info=self.info(name)
         if not isinstance(position,(int,float)) or isinstance(position,bool) or not math.isfinite(position) or not 0<=position<info['duration']:
             raise ValueError('Posizione fuori dalla durata del brano')
-        self._terminate()
+        self._ensure_audio();self._terminate()
         try:
-            # Stop the live sender first: never send two different sources together.
-            run(['systemctl','stop','roc-museum.service'])
             self.error_log=tempfile.TemporaryFile()
-            self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-re','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','wav','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log)
-            self.sender=subprocess.Popen(['roc-send','-i','file:-','--input-format','wav','-s','rtp://'+self.config.get('MULTICAST_ADDR','239.30.0.1')+':'+self.config.get('RTP_PORT','10001'),'--frame-len='+self.config.get('FRAME_LEN','4ms')],stdin=self.encoder.stdout,stdout=subprocess.DEVNULL,stderr=self.error_log)
-            self.encoder.stdout.close()
+            self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','s16le','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log,bufsize=0)
+            self.bus.attach(self.encoder.stdout,position,deadline)
         except Exception:
             self._live();raise
         self.track=name;self.duration=info['duration'];self.position=position;self.started=time.monotonic()
         self.status='playing';self.origin=origin;self.loop=loop;self.error=''
 
     def _position(self):
-        return min(self.duration,self.position+(time.monotonic()-self.started if self.status=='playing' else 0))
+        if self.bus and self.status in ('playing','paused'): return min(self.duration,self.bus.snapshot()['position'])
+        return self.position
+
+    def _cancel_plan(self,state='interrupted'):
+        if self.plan:
+            self._record(self.plan['event'],self.plan['occurrence'],state)
+            if self.bus: self.bus.set_deadline(None)
+            self.plan=None
 
     def command(self,data):
         with self.lock:
             command=data.get('command')
-            if command=='automation':
+            if command=='ducking':
+                settings={k:data.get(k,v) for k,v in self.ducking().items()}
+                if type(settings['enabled']) is not bool: raise ValueError('Ducking non valido')
+                for key,low,high in (('threshold_db',-60,-6),('reduction_db',-40,0)):
+                    value=settings[key]
+                    if type(value) not in (int,float) or not math.isfinite(value) or not low<=value<=high: raise ValueError('Parametro ducking non valido')
+                self._store_setting('ducking',settings)
+                if self.bus: self.bus.configure(settings)
+            elif command=='automation':
                 enabled=data.get('enabled')
                 if type(enabled) is not bool: raise ValueError('Stato calendario non valido')
                 if enabled and self.manual_hold: self._live()
                 self._store_setting('enabled',enabled);self.manual_hold=False
                 if not enabled:
                     self.queue=[]
-                    if self.origin.startswith('calendar:'): self._live()
+                    if self.plan or self.origin.startswith('calendar:'):
+                        self._cancel_plan('suspended');self._live()
             elif command=='play':
+                # Validate before interrupting an existing programme.
+                self.info(data.get('name'))
+                self._cancel_plan('suspended')
                 self._play(data.get('name'),origin='manual',loop=data.get('loop') is True);self.manual_hold=True
             elif command=='pause':
                 if self.status!='playing': raise ValueError('Nessuna traccia in riproduzione')
-                self.position=min(self._position(),max(0,self.duration-0.01));self._terminate();self.status='paused';self.manual_hold=True
+                self.position=self._position();self.bus.pause(True);self.status='paused';self.manual_hold=True
+                self._cancel_plan('suspended');self.origin='manual'
             elif command=='resume':
                 if self.status!='paused': raise ValueError('Nessuna traccia in pausa')
-                self._play(self.track,self.position,'manual',self.loop);self.manual_hold=True
+                self.bus.pause(False);self.status='playing';self.origin='manual';self.manual_hold=True
             elif command=='seek':
                 if self.status not in ('playing','paused'): raise ValueError('Nessuna traccia selezionata')
                 value=data.get('position');was_paused=self.status=='paused'
+                # _play validates position before changing the decoder.
                 self._play(self.track,value,'manual',self.loop);self.manual_hold=True
-                if was_paused:
-                    self.position=float(value);self._terminate();self.status='paused'
+                self._cancel_plan('suspended')
+                if was_paused: self.bus.pause(True);self.status='paused'
             elif command=='loop':
                 if type(data.get('enabled')) is not bool: raise ValueError('Loop non valido')
                 self.loop=data['enabled']
-                if self.status in ('playing','paused'): self.manual_hold=True
+                if self.status in ('playing','paused'):
+                    self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
             elif command=='stop':
-                self._live();self.manual_hold=True
+                self._cancel_plan('suspended');self._live();self.manual_hold=True
             else: raise ValueError('Comando player non valido')
             return self.snapshot()
 
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -1363,7 +1453,22 @@ class Studio:
             if not isinstance(data,dict): raise ValueError('Evento non valido')
             name=data.get('name','')
             if not isinstance(name,str) or not 1<=len(name.strip())<=100: raise ValueError('Titolo evento obbligatorio (max 100 caratteri)')
-            track=audio_name(data.get('track'));self.info(track)
+            tracks=data.get('tracks',[data.get('track')])
+            if not isinstance(tracks,list) or not 1<=len(tracks)<=100: raise ValueError('Scegliere da 1 a 100 tracce nel gruppo')
+            tracks=[audio_name(track) for track in tracks]
+            for track in tracks: self.info(track)
+            track=tracks[0]
+            end_time=data.get('end_time','')
+            if not isinstance(end_time,str): raise ValueError('Orario di fine non valido')
+            if end_time:
+                try:
+                    end=dt.time.fromisoformat(end_time)
+                    if end.tzinfo or end.second or end.microsecond or len(end_time)!=5: raise ValueError()
+                except (ValueError,TypeError): raise ValueError('Orario di fine non valido')
+            repetitions=data.get('repetitions',1);interval=data.get('interval_seconds',0)
+            if type(repetitions) is not int or not 0<=repetitions<=10000: raise ValueError('Passaggi gruppo: da 0 a 10000')
+            if repetitions==0 and not end_time: raise ValueError('La ripetizione continua richiede un orario di fine')
+            if type(interval) is not int or not 0<=interval<=86400: raise ValueError('Intervallo non valido (0–86400 secondi)')
             try:
                 start=dt.datetime.fromisoformat(data.get('start',''))
                 if start.tzinfo or start.second or start.microsecond: raise ValueError()
@@ -1378,71 +1483,128 @@ class Studio:
             if not isinstance(event_id,str) or not re_id(event_id): raise ValueError('Identificativo evento non valido')
             if data.get('id') and not self.db.execute('SELECT 1 FROM schedules WHERE id=?',(event_id,)).fetchone(): raise ValueError('Evento non trovato')
             if not data.get('id') and self.db.execute('SELECT count(*) FROM schedules').fetchone()[0]>=200: raise ValueError('Massimo 200 eventi')
-            event={'id':event_id,'name':name.strip(),'track':track,'start':start.isoformat(timespec='minutes'),'recurrence':recurrence,'weekdays':sorted(set(weekdays)),'policy':policy,'enabled':enabled}
+            event={'id':event_id,'name':name.strip(),'track':track,'start':start.isoformat(timespec='minutes'),'recurrence':recurrence,'weekdays':sorted(set(weekdays)),'policy':policy,'enabled':enabled,'tracks':tracks,'end_time':end_time,'repetitions':repetitions,'interval_seconds':interval}
             self.db.execute('INSERT OR REPLACE INTO schedules VALUES(?,?)',(event_id,json.dumps(event)));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
+            if self.plan and self.plan['event']['id']==event_id:
+                self._cancel_plan('interrupted');self._live()
             return event
 
     def delete_event(self,event_id):
         if not isinstance(event_id,str) or not re_id(event_id): raise ValueError('Identificativo evento non valido')
         with self.lock:
+            if self.plan and self.plan['event']['id']==event_id:
+                self._cancel_plan('cancelled');self._live()
             self.db.execute('DELETE FROM schedules WHERE id=?',(event_id,));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
 
     @staticmethod
+    def window(event,now):
+        if not event.get('end_time'): return None
+        zone=ZoneInfo('Europe/Rome');local=now.astimezone(zone);start=dt.datetime.fromisoformat(event['start'])
+        for date in (local.date(),local.date()-dt.timedelta(days=1)):
+            if date<start.date(): continue
+            if event['recurrence']=='once' and date!=start.date(): continue
+            if event['recurrence']=='weekly' and date.weekday() not in event['weekdays']: continue
+            begin=dt.datetime.combine(date,start.time(),zone)
+            if begin.astimezone(dt.timezone.utc).astimezone(zone).replace(tzinfo=None)!=begin.replace(tzinfo=None): continue
+            end=dt.datetime.combine(date,dt.time.fromisoformat(event['end_time']),zone)
+            if end<=begin: end+=dt.timedelta(days=1)
+            if begin.timestamp()<=now.timestamp()<end.timestamp(): return begin,end
+        return None
+
+    @staticmethod
     def occurrence(event,now):
-        local=now.astimezone(ZoneInfo('Europe/Rome'))
-        start=dt.datetime.fromisoformat(event['start'])
+        if event.get('end_time'):
+            window=Studio.window(event,now)
+            return window[0].strftime('%Y-%m-%dT%H:%M') if window else None
+        local=now.astimezone(ZoneInfo('Europe/Rome'));start=dt.datetime.fromisoformat(event['start'])
         if local.date()<start.date(): return None
         if event['recurrence']=='once' and local.date()!=start.date(): return None
         if event['recurrence']=='weekly' and local.weekday() not in event['weekdays']: return None
         if (local.hour,local.minute)!=(start.hour,start.minute): return None
-        # Local occurrence identity intentionally ignores fold: once at fall DST.
         return local.strftime('%Y-%m-%dT%H:%M')
 
     def _record(self,event,occurrence,state,message=''):
         self.db.execute('INSERT OR REPLACE INTO runs VALUES(?,?,?,?,?)',(event['id'],occurrence,time.time(),state,message));self.db.commit()
 
-    def _fire(self,event,occurrence):
+    def _fire(self,event,occurrence,now=None):
+        now=now or dt.datetime.now(dt.timezone.utc)
+        window=self.window(event,now)
+        if event.get('end_time') and not window:
+            self._record(event,occurrence,'skipped','Fascia terminata');return
+        self._cancel_plan()
+        plan={'event':event,'event_id':event['id'],'occurrence':occurrence,'tracks':event.get('tracks',[event['track']]),'index':0,'cycle':1,'repetitions':event.get('repetitions',1),'interval_seconds':event.get('interval_seconds',0),'next_at':None,'end_at':window[1].timestamp() if window else None}
         try:
-            self._play(event['track'],origin='calendar:'+event['id'])
+            self._play(plan['tracks'][0],origin='calendar:'+event['id'],deadline=plan['end_at'])
+            self.plan=plan
+            self.queue=[e for e in self.queue if e['id']!=event['id']]
             self._record(event,occurrence,'started')
         except Exception as error:
-            self.error=str(error);self._record(event,occurrence,'failed',str(error))
+            self.error=str(error);self.plan=None;self._record(event,occurrence,'failed',str(error))
+
+    def _next_track(self,now):
+        plan=self.plan
+        plan['index']+=1
+        if plan['index']>=len(plan['tracks']):
+            if plan['repetitions'] and plan['cycle']>=plan['repetitions']:
+                self._record(plan['event'],plan['occurrence'],'completed');self._live();return
+            plan['index']=0;plan['cycle']+=1
+            if plan['interval_seconds']:
+                self._terminate();self.status='live';self.track=None;self.duration=0;self.position=0
+                plan['next_at']=now.timestamp()+plan['interval_seconds'];return
+        self._play(plan['tracks'][plan['index']],origin='calendar:'+plan['event_id'],deadline=plan['end_at'])
 
     def tick(self,now=None):
         with self.lock:
             now=now or dt.datetime.now(dt.timezone.utc)
-            if self.status=='playing' and self.sender and self.sender.poll() is not None:
-                good=self.sender.returncode==0 and self.encoder.wait(timeout=3)==0
-                track=self.track;loop=self.loop;origin=self.origin
-                if not good:
-                    if self.error_log:
-                        self.error_log.seek(0,2);length=self.error_log.tell();self.error_log.seek(max(0,length-2000));self.error=self.error_log.read().decode(errors='replace')
-                    self._live()
-                elif loop: self._play(track,origin=origin,loop=True)
+            if self.bus and not self.bus.snapshot()['active']:
+                self.error=self.bus.snapshot()['error'] or 'Bus audio non disponibile'
+                self._cancel_plan('failed');self._live()
+            if self.plan and self.plan['end_at'] is not None and now.timestamp()>=self.plan['end_at']:
+                self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live()
+            if self.plan and self.plan['next_at'] is not None and now.timestamp()>=self.plan['next_at']:
+                self.plan['next_at']=None
+                try: self._play(self.plan['tracks'][self.plan['index']],origin='calendar:'+self.plan['event_id'],deadline=self.plan['end_at'])
+                except (OSError,ValueError,subprocess.SubprocessError) as error:
+                    self.error=str(error);self._cancel_plan('failed');self._live()
+            if self.status=='playing' and self.bus and self.bus.snapshot()['music_eof'] and self.encoder and self.encoder.poll() is not None:
+                if self.encoder.returncode!=0:
+                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live()
+                elif self.plan:
+                    try: self._next_track(now)
+                    except (OSError,ValueError,subprocess.SubprocessError) as error:
+                        self.error=str(error);self._cancel_plan('failed');self._live()
+                elif self.loop: self._play(self.track,origin=self.origin,loop=True)
                 else: self._live()
             if not self._setting('enabled'): return
             for event in sorted(self.events(),key=lambda e:(e['start'],e['id'])):
                 if not event['enabled']: continue
                 occurrence=self.occurrence(event,now)
                 if occurrence is None: continue
+                row=self.db.execute('SELECT state FROM runs WHERE event=? AND occurrence=?',(event['id'],occurrence)).fetchone()
+                busy=self.status in ('playing','paused') or self.plan is not None
+                if row:
+                    # An active background window can restart after a monitor restart or manual override.
+                    if event.get('end_time') and row[0] in ('started','interrupted','suspended') and not busy and not self.manual_hold:
+                        self._fire(event,occurrence,now)
+                    continue
+                if self.manual_hold and event.get('end_time'): continue
                 with self.db:
                     cursor=self.db.execute('INSERT OR IGNORE INTO runs VALUES(?,?,?,?,?)',(event['id'],occurrence,time.time(),'claimed',''))
                 if not cursor.rowcount: continue
                 if self.manual_hold:
                     self._record(event,occurrence,'skipped','Regia manuale attiva');continue
-                busy=self.status in ('playing','paused')
                 if busy and event['policy']=='skip': self._record(event,occurrence,'skipped','Player occupato')
                 elif busy and event['policy']=='wait':
-                    event=dict(event,occurrence=occurrence,queued_at=now.timestamp());self.queue.append(event);self._record(event,occurrence,'waiting')
-                else: self._fire(event,occurrence)
+                    self.queue.append(dict(event,occurrence=occurrence,queued_at=now.timestamp()));self._record(event,occurrence,'waiting')
+                else: self._fire(event,occurrence,now)
             for event in list(self.queue):
-                if now.timestamp()-event['queued_at']>900:
-                    self._record(event,event['occurrence'],'skipped','Attesa oltre 15 minuti');self.queue.remove(event)
-            if not self.manual_hold and self.status=='live' and self.queue:
-                event=self.queue.pop(0);self._fire(event,event['occurrence'])
-            # Bound persistent history; old scheduled days cannot be replayed.
+                expired=now.timestamp()-event['queued_at']>900 or event.get('end_time') and not self.window(event,now)
+                if expired:
+                    self._record(event,event['occurrence'],'skipped','Attesa scaduta o fascia terminata');self.queue.remove(event)
+            if not self.manual_hold and self.status=='live' and not self.plan and self.queue:
+                event=self.queue.pop(0);self._fire(event,event['occurrence'],now)
             with self.db: self.db.execute('DELETE FROM runs WHERE time<?',(time.time()-90*86400,))
 
     def _worker(self):
@@ -1450,7 +1612,7 @@ class Studio:
             try: self.tick()
             except Exception as error:
                 with self.lock: self.error=str(error)
-            self.shutdown.wait(1)
+            self.shutdown.wait(.1)
 
     def devices(self):
         tree=json.loads(run(['lsblk','--json','--paths','--output','NAME,PATH,TYPE,TRAN,RM,FSTYPE,LABEL,MOUNTPOINTS']).stdout)
@@ -1541,62 +1703,345 @@ class Studio:
 def re_id(value):
     return len(value)==32 and all(c in '0123456789abcdef' for c in value)
 PY_STUDIO
+    cat > /usr/local/lib/roc-museum/audio_bus.py <<'PY_AUDIO_BUS'
+#!/usr/bin/env python3
+"""Continuous stereo PCM bus: microphone always on, music-only ducking, one RTP sender."""
+from array import array
+from collections import deque
+import math
+import os
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+def pcm_samples(data):
+    samples=array('h');samples.frombytes(data)
+    if sys.byteorder!='little': samples.byteswap()
+    return samples
+
+
+class Ducker:
+    def __init__(self,rate=44100):
+        self.rate=rate;self.gain=1.;self.limiter=1.;self.hold=0.
+        self.enabled=True;self.threshold_db=-36.;self.reduction_db=-18.
+        self.input_db=-96.;self.active=False
+
+    def mix(self,music,microphone):
+        mic=pcm_samples(microphone);song=pcm_samples(music)
+        duration=len(mic)/(2*self.rate)
+        rms=math.sqrt(sum(x*x for x in mic)/max(1,len(mic)))/32768
+        self.input_db=max(-96.,20*math.log10(max(rms,1e-12)))
+        if self.enabled and self.input_db>=self.threshold_db: self.hold=.5
+        else: self.hold=max(0.,self.hold-duration)
+        self.active=self.enabled and self.hold>0
+        target=10**(self.reduction_db/20) if self.active else 1.
+        previous=self.gain
+        tau=.03 if target<previous else .8
+        self.gain=target+(previous-target)*math.exp(-duration/tau)
+        # Gain ramp avoids discontinuities; the mic is never multiplied by the duck gain.
+        raw=[int(m+(song[i] if i<len(song) else 0)*(previous+(self.gain-previous)*i/max(1,len(mic)-1))) for i,m in enumerate(mic)]
+        peak=max((abs(v) for v in raw),default=0)
+        limit=min(1.,32760/max(1,peak))
+        self.limiter=min(limit,self.limiter+(1-self.limiter)*duration/.2)
+        out=array('h',(max(-32768,min(32767,int(v*self.limiter))) for v in raw))
+        if sys.byteorder!='little': out.byteswap()
+        return out.tobytes()
+
+
+class AudioBus:
+    def __init__(self,config,capture_enabled=True):
+        self.config=config;self.rate=int(config.get('SAMPLE_RATE','44100'))
+        self.frames=max(1,self.rate//100);self.block_bytes=self.frames*4
+        self.lock=threading.RLock();self.stop=threading.Event();self.threads=[]
+        self.sender=None;self.capture=None;self.log=None;self.error=''
+        self.mic_error='Ingresso microfono in attesa';self.mic_online=False
+        self.mic_queue=deque(maxlen=10);self.ducker=Ducker(self.rate)
+        self.music=None;self.music_buffer=b'';self.music_eof=False;self.paused=False
+        self.position=0.;self.deadline=None;self.deadline_hit=False
+        self.capture_enabled=capture_enabled
+
+    def configure(self,settings):
+        with self.lock:
+            self.ducker.enabled=settings['enabled'];self.ducker.threshold_db=settings['threshold_db'];self.ducker.reduction_db=settings['reduction_db']
+
+    def start(self):
+        self.log=tempfile.TemporaryFile()
+        try:
+            self.sender=subprocess.Popen(['roc-send','-i','file:-','--input-format','wav','-s','rtp://'+self.config.get('MULTICAST_ADDR','239.30.0.1')+':'+self.config.get('RTP_PORT','10001'),'--frame-len='+self.config.get('FRAME_LEN','4ms')],stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=self.log,bufsize=0)
+            # Unbounded streaming WAV, PCM S16LE stereo. Roc clocks the RTP output.
+            self.sender.stdin.write(struct.pack('<4sI4s4sIHHIIHH4sI',b'RIFF',0xffffffff,b'WAVE',b'fmt ',16,1,2,self.rate,self.rate*4,4,16,b'data',0xffffffff))
+            os.set_blocking(self.sender.stdin.fileno(),False)
+            self.threads=[threading.Thread(target=self._pump,daemon=True)]
+            if self.capture_enabled: self.threads.append(threading.Thread(target=self._capture,daemon=True))
+            for thread in self.threads: thread.start()
+        except BaseException:
+            self.close();raise
+
+    @staticmethod
+    def kill(process):
+        if process is None: return
+        if process.poll() is None: process.terminate()
+        try: process.wait(timeout=2)
+        except subprocess.TimeoutExpired: process.kill();process.wait(timeout=2)
+        for pipe in (process.stdin,process.stdout):
+            if pipe:
+                try: pipe.close()
+                except OSError: pass
+
+    def close(self):
+        self.stop.set()
+        self.kill(self.capture);self.kill(self.sender)
+        for thread in self.threads:
+            if thread is not threading.current_thread(): thread.join(timeout=4)
+        self.capture=None;self.sender=None
+        if self.log: self.log.close();self.log=None
+
+    def attach(self,stream,position=0,deadline=None):
+        with self.lock:
+            os.set_blocking(stream.fileno(),False)
+            self.music=stream;self.music_buffer=b'';self.music_eof=False;self.paused=False
+            self.position=position;self.deadline=deadline;self.deadline_hit=False
+
+    def detach(self):
+        with self.lock:
+            self.music=None;self.music_buffer=b'';self.music_eof=False;self.paused=False;self.deadline=None;self.deadline_hit=False
+
+    def set_deadline(self,value):
+        with self.lock: self.deadline=value;self.deadline_hit=False
+
+    def pause(self,value):
+        with self.lock: self.paused=value
+
+    def snapshot(self):
+        with self.lock:
+            return {'active':bool(self.sender and self.sender.poll() is None and not self.error),'microphone_online':self.mic_online,'microphone_error':self.mic_error,'microphone_dbfs':round(self.ducker.input_db,1),'ducking_active':self.ducker.active,'music_gain_db':round(20*math.log10(max(self.ducker.gain,1e-12)),1),'position':self.position,'music_eof':self.music_eof,'deadline_hit':self.deadline_hit,'error':self.error}
+
+    def _music_block(self):
+        if self.music is None or self.paused: return bytes(self.block_bytes)
+        if self.deadline is not None and time.time()>=self.deadline:
+            self.deadline_hit=True;return bytes(self.block_bytes)
+        while len(self.music_buffer)<self.block_bytes and not self.music_eof:
+            try: data=os.read(self.music.fileno(),self.block_bytes-len(self.music_buffer))
+            except BlockingIOError: break
+            if not data: self.music_eof=True;break
+            self.music_buffer+=data
+        size=min(len(self.music_buffer),self.block_bytes)//4*4
+        data=self.music_buffer[:size];self.music_buffer=self.music_buffer[size:]
+        self.position+=size/(4*self.rate)
+        return data+bytes(self.block_bytes-size)
+
+    def _pump(self):
+        pending=b'';blocked_since=None;next_block=time.monotonic()
+        try:
+            while not self.stop.is_set():
+                if self.sender.poll() is not None: raise OSError('Il trasmettitore Roc si è fermato')
+                if not pending:
+                    with self.lock:
+                        mic=self.mic_queue.popleft() if self.mic_queue else bytes(self.block_bytes)
+                        pending=self.ducker.mix(self._music_block(),mic)
+                try:
+                    count=os.write(self.sender.stdin.fileno(),pending)
+                    pending=pending[count:];blocked_since=None
+                except BlockingIOError:
+                    blocked_since=blocked_since or time.monotonic()
+                    if time.monotonic()-blocked_since>1: raise OSError('Trasmissione audio bloccata')
+                    self.stop.wait(.002);continue
+                if pending: continue
+                next_block+=self.frames/self.rate
+                if next_block<time.monotonic()-.1: next_block=time.monotonic()
+                self.stop.wait(max(0,next_block-time.monotonic()))
+        except (OSError,ValueError) as error:
+            if not self.stop.is_set(): self.error=str(error)
+
+    def _capture(self):
+        while not self.stop.is_set():
+            process=None
+            try:
+                listing=subprocess.run(['arecord','-l'],check=True,capture_output=True,text=True,timeout=4,env={**os.environ,'LC_ALL':'C'}).stdout
+                card=next((re.search(r'card (\d+):\s*([^\s\[]+)',line) for line in listing.splitlines() if re.search('scarlett|focusrite',line,re.I)),None)
+                if not card: raise OSError('Scarlett non rilevata; riconnessione automatica')
+                device='plughw:CARD='+card.group(2)+',DEV=0'
+                with tempfile.TemporaryFile() as log:
+                    process=subprocess.Popen(['arecord','-q','-D',device,'-t','raw','-f','S16_LE','-r',str(self.rate),'-c','2','--period-time=10000','--buffer-time=80000'],stdout=subprocess.PIPE,stderr=log,bufsize=0)
+                    self.capture=process;buffer=b''
+                    while not self.stop.is_set():
+                        data=process.stdout.read(self.block_bytes-len(buffer))
+                        if not data: raise OSError('Ingresso microfono interrotto; riconnessione automatica')
+                        buffer+=data
+                        if len(buffer)==self.block_bytes:
+                            with self.lock:
+                                self.mic_queue.append(buffer);self.mic_online=True;self.mic_error=''
+                            buffer=b''
+            except (OSError,subprocess.SubprocessError) as error:
+                with self.lock:
+                    self.mic_online=False;self.mic_error=str(error);self.mic_queue.clear()
+            finally:
+                self.kill(process)
+                if self.capture is process: self.capture=None
+            self.stop.wait(2)
+PY_AUDIO_BUS
     cat > /usr/local/share/roc-museum/studio.html <<'HTML_STUDIO'
 <section id="studioTools" class="box" hidden style="margin:18px 0">
-<style>.box button,.box input,.box select{font:inherit;color:#e5e7eb;background:#111827;border:1px solid #6b7280;border-radius:6px;padding:8px;margin:4px;max-width:100%;box-sizing:border-box}.box button{cursor:pointer}.box button:hover{border-color:#60a5fa}.box button:disabled{opacity:.5;cursor:wait}#studioTools h3{margin-top:28px}#studioTools button,#studioTools input,#studioTools select{font:inherit;padding:7px;margin:4px;max-width:100%;box-sizing:border-box}#studioTools button{cursor:pointer}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul{padding-left:20px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}</style>
-<h2>Regia audio TX</h2><p class="hint">Un solo programma per tutti gli RX. Chiudere il browser non interrompe la riproduzione.</p>
+<style>
+.box button,.box input,.box select{font:inherit;color:#e5e7eb;background:#111827;border:1px solid #6b7280;border-radius:6px;padding:8px;margin:4px;max-width:100%;box-sizing:border-box}.box button{cursor:pointer}.box button:hover{border-color:#60a5fa}.box button:disabled{opacity:.5;cursor:wait}
+#studioTools h3{margin-top:28px}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
+</style>
+<h2>Regia audio TX</h2>
+<p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
 <h3>Player</h3><p id="playerState" aria-live="polite">Caricamento…</p>
 <label>Traccia <select id="trackSelect" aria-label="Traccia dalla libreria"></select></label>
-<button data-player="play">▶ Riproduci selezione</button><button data-player="pause">Pausa</button><button data-player="resume">Riprendi traccia</button><button data-player="stop">Stop / ingresso mixer</button>
+<button data-player="play">▶ Riproduci selezione</button><button data-player="pause">Pausa musica</button><button data-player="resume">Riprendi traccia</button><button data-player="stop">Stop musica / solo microfono</button>
 <label><input type="checkbox" id="playerLoop"> Ripeti traccia</label>
-<progress id="playerProgress" max="1" value="0" style="width:100%" aria-label="Avanzamento traccia"></progress><form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form>
-<p class="hint">In pausa il flusso del player si ferma e gli RX restano in silenzio. Stop e fine traccia tornano all’ingresso mixer. Cambio sorgente e ricerca possono produrre una breve interruzione.</p>
+<progress id="playerProgress" max="1" value="0" style="width:100%" aria-label="Avanzamento traccia"></progress>
+<form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form>
+<p id="groupState"></p>
+<h3>Annunci dal microfono · ducking</h3>
+<p id="microphoneState" role="status"></p>
+<form id="duckingForm"><label><input name="enabled" type="checkbox" checked> Abbassa automaticamente la musica durante gli annunci</label>
+<label>Soglia voce (dBFS) <input name="threshold_db" type="number" min="-60" max="-6" step="1" value="-36" required></label>
+<label>Attenuazione musica (dB) <input name="reduction_db" type="number" min="-40" max="0" step="1" value="-18" required></label><button>Applica ducking</button></form>
+<p class="hint">Il microfono non viene attenuato dal ducking. Se il rumore di fondo fa abbassare la musica, alza la soglia (per esempio da −36 a −30 dBFS). Il volume della musica torna gradualmente normale dopo l’annuncio.</p>
 <h3>Calendario · Europe/Rome</h3><p id="automationState"></p>
 <button id="enableAuto">Abilita / riprendi programma</button><button id="disableAuto">Disabilita programma</button>
-<p class="hint">I comandi manuali sospendono il calendario fino a “Riprendi programma”, che torna al mixer e riabilita gli eventi futuri. Nessun recupero degli eventi persi. Gli eventi nella stessa ora vengono elaborati per data iniziale e identificativo.</p>
+<p class="hint">I comandi manuali sospendono il calendario fino a “Riprendi programma”. Una fascia ancora attiva riparte dall’inizio del gruppo. Il microfono resta sempre disponibile.</p>
 <p id="nextEvents"></p>
 <form id="eventForm"><input type="hidden" name="id"><fieldset><legend id="eventLegend">Nuovo evento</legend>
-<label>Titolo <input name="name" required maxlength="100"></label><label>Traccia <select name="track" id="eventTrack" required></select></label>
+<label>Titolo <input name="name" required maxlength="100"></label>
+<div><label>Traccia <select name="track" id="eventTrack" required></select></label><button type="button" id="addEventTrack">Aggiungi al gruppo</button></div>
+<p class="hint">Per un solo brano basta selezionarlo. Per un gruppo, aggiungi le tracce e scegli l’ordine qui sotto.</p>
+<ol id="eventPlaylist"></ol>
 <label>Data e ora iniziale <input name="start" type="datetime-local" required step="60"></label>
-<label>Ripeti <select name="recurrence"><option value="once">Una volta</option><option value="daily">Ogni giorno</option><option value="weekly">Ogni settimana</option></select></label>
+<label>Ora fine fascia (facoltativa) <input name="end_time" type="time" step="60"></label>
+<p class="hint">Se la fine è uguale o precedente all’inizio, la fascia termina il giorno successivo. Alla fine della fascia la musica si ferma, anche a metà brano.</p>
+<label>Passaggi del gruppo <input name="repetitions" type="number" min="0" max="10000" step="1" value="1" required></label>
+<label>Intervallo tra passaggi (secondi) <input name="interval_seconds" type="number" min="0" max="86400" step="1" value="0" required></label>
+<p class="hint">1 = una volta; 2 = due passaggi completi; 0 = ripeti fino a fine fascia (richiede l’ora di fine). L’intervallo si applica dopo tutto il gruppo.</p>
+<label>Ricorrenza <select name="recurrence"><option value="once">Una volta</option><option value="daily">Ogni giorno</option><option value="weekly">Ogni settimana</option></select></label>
 <div id="weekdays">Giorni settimanali:
 <label><input type="checkbox" value="0">Lun</label><label><input type="checkbox" value="1">Mar</label><label><input type="checkbox" value="2">Mer</label><label><input type="checkbox" value="3">Gio</label><label><input type="checkbox" value="4">Ven</label><label><input type="checkbox" value="5">Sab</label><label><input type="checkbox" value="6">Dom</label></div>
-<label>Se il player è occupato <select name="policy"><option value="skip">Salta</option><option value="wait">Attendi fine traccia (max 15 minuti)</option><option value="interrupt">Interrompi e riproduci</option></select></label>
+<label>Se il player è occupato <select name="policy"><option value="skip">Salta</option><option value="wait">Attendi fine programma (max 15 minuti)</option><option value="interrupt">Interrompi e riproduci</option></select></label>
 <label><input name="enabled" type="checkbox" checked> Evento abilitato</label><button>Salva evento</button><button type="button" id="cancelEvent">Annulla modifica</button></fieldset></form>
-<div class="scroll"><table><thead><tr><th>Evento</th><th>Data / ricorrenza</th><th>Traccia / priorità</th><th>Azioni</th></tr></thead><tbody id="eventRows"></tbody></table></div>
+<div class="scroll"><table><thead><tr><th>Evento</th><th>Fascia / ricorrenza</th><th>Tracce / ripetizioni</th><th>Azioni</th></tr></thead><tbody id="eventRows"></tbody></table></div>
 <details><summary>Registro eventi (ultimi 30)</summary><ul id="eventHistory"></ul></details>
 <h3>Explorer USB</h3><button id="scanUSB">Rileva pennette</button><label>Dispositivo <select id="usbDevice"></select></label><button id="openUSB">Apri</button><button id="ejectUSB">Espelli</button>
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
-<p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle. Sono mostrati file audio e cartelle, fino a 2.000 elementi per cartella.</p>
+<p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
 <p id="studioMessage" role="status" aria-live="polite"></p>
 </section>
 <script>
 (function(){
 'use strict';
-var currentEvents=[],usbPath='',usbOpened='',inFlight=false;
+var currentEvents=[],eventTracks=[],usbPath='',usbOpened='',inFlight=false,duckInitialized=false;
 function el(id){return document.getElementById(id);}
 function message(text){el('studioMessage').textContent=text;}
-async function api(path,data){var options={cache:'no-store'};if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}var r=await fetch(path,options);var d=await r.json();if(!r.ok){if(r.status===401){authorized=false;el('studioTools').hidden=true;await session();}throw new Error(d.message||'Operazione fallita');}return d;}
+async function api(path,data){
+  var options={cache:'no-store'};
+  if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
+  var r=await fetch(path,options),d=await r.json();
+  if(!r.ok){if(r.status===401){authorized=false;el('studioTools').hidden=true;await session();}throw new Error(d.message||'Operazione fallita');}
+  return d;
+}
 async function perform(action){try{await action();}catch(error){message(error.message);}}
 function option(select,value,label){var o=document.createElement('option');o.value=value;o.textContent=label;select.appendChild(o);}
-// The upload widget calls this same function after a completed upload.
-library=async function(){var data=await api('/api/media');var old=el('trackSelect').value,eventOld=el('eventTrack').value;el('library').replaceChildren();el('trackSelect').replaceChildren();el('eventTrack').replaceChildren();data.files.forEach(function(f){var li=document.createElement('li');li.textContent=f.name+' ('+(f.size/1048576).toFixed(1)+' MB) ';var b=document.createElement('button');b.textContent='Seleziona';b.onclick=function(){el('trackSelect').value=f.name;};li.appendChild(b);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);});if(data.files.some(function(f){return f.name===old;}))el('trackSelect').value=old;if(data.files.some(function(f){return f.name===eventOld;}))el('eventTrack').value=eventOld;};
-async function update(){el('studioTools').hidden=!authorized;if(!authorized||inFlight)return;inFlight=true;try{var s=await api('/api/studio');el('playerState').textContent=({live:'Ingresso mixer',playing:'In riproduzione',paused:'In pausa'}[s.status]||s.status)+(s.track?' · '+s.track:'')+' · origine: '+(s.origin==='manual'?'regia':s.origin.startsWith('calendar:')?'calendario':'mixer')+(s.error?' · Errore: '+s.error:'');el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);el('playerProgress').max=s.duration||1;el('playerProgress').value=s.position;if(s.status!=='live')el('playerLoop').checked=s.loop;el('automationState').textContent=(s.automation_enabled?'Calendario abilitato':'Calendario disabilitato')+(s.manual_hold?' · sospeso dalla regia manuale':'')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');el('nextEvents').textContent='Prossimi eventi: '+(s.next_events||[]).map(function(e){return e.name+' · '+new Date(e.at).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}).join(' | ');currentEvents=s.events;renderEvents();el('eventHistory').replaceChildren();s.history.forEach(function(e){var li=document.createElement('li');var event=s.events.find(function(v){return v.id===e.event;});li.textContent=(event?event.name:e.event)+' · '+e.occurrence+' · '+e.state+(e.message?' · '+e.message:'');el('eventHistory').appendChild(li);});}catch(error){message(error.message);}finally{inFlight=false;}}
-function renderEvents(){el('eventRows').replaceChildren();currentEvents.forEach(function(e){var tr=document.createElement('tr');[e.name+(e.enabled?'':' (disabilitato)'),e.start+' · '+({once:'una volta',daily:'ogni giorno',weekly:'settimanale: '+e.weekdays.map(function(d){return ['Lun','Mar','Mer','Gio','Ven','Sab','Dom'][d];}).join(', ')}[e.recurrence]),e.track+' · '+({skip:'salta',wait:'attendi',interrupt:'interrompi'}[e.policy])].forEach(function(text){var td=document.createElement('td');td.textContent=text;tr.appendChild(td);});var actions=document.createElement('td');var edit=document.createElement('button');edit.textContent='Modifica';edit.onclick=function(){var form=el('eventForm');['id','name','track','start','recurrence','policy'].forEach(function(k){form.elements.namedItem(k).value=e[k];});form.elements.namedItem('enabled').checked=e.enabled;document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';form.scrollIntoView({behavior:'smooth'});};var remove=document.createElement('button');remove.textContent='Elimina';remove.onclick=function(){if(confirm('Eliminare l’evento '+e.name+'?'))perform(async function(){await api('/api/calendar/delete',{id:e.id});await update();});};actions.append(edit,remove);tr.appendChild(actions);el('eventRows').appendChild(tr);});}
-document.querySelectorAll('[data-player]').forEach(function(button){button.onclick=function(){perform(async function(){var data={command:button.dataset.player};if(data.command==='play'){data.name=el('trackSelect').value;data.loop=el('playerLoop').checked;}await api('/api/player',data);await update();});};});
+function button(label,action){var b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=action;return b;}
+library=async function(){
+  var data=await api('/api/media'),old=el('trackSelect').value,eventOld=el('eventTrack').value;
+  el('library').replaceChildren();el('trackSelect').replaceChildren();el('eventTrack').replaceChildren();
+  data.files.forEach(function(f){
+    var li=document.createElement('li');li.textContent=f.name+' ('+(f.size/1048576).toFixed(1)+' MB) ';
+    li.appendChild(button('Seleziona',function(){el('trackSelect').value=f.name;}));
+    var remove=button('Elimina traccia',function(){
+      if(!confirm('Eliminare definitivamente '+f.name+' dalla libreria del TX?'))return;
+      perform(async function(){remove.disabled=true;try{var d=await api('/api/media/delete',{name:f.name});await library();message(d.message);}finally{remove.disabled=false;}});
+    });remove.className='danger';li.appendChild(remove);el('library').appendChild(li);
+    option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
+  });
+  if(data.files.some(function(f){return f.name===old;}))el('trackSelect').value=old;
+  if(data.files.some(function(f){return f.name===eventOld;}))el('eventTrack').value=eventOld;
+};
+function renderPlaylist(){
+  el('eventPlaylist').replaceChildren();
+  eventTracks.forEach(function(name,index){
+    var li=document.createElement('li');li.className='playlist-row';li.textContent=name+' ';
+    var up=button('↑',function(){[eventTracks[index-1],eventTracks[index]]=[eventTracks[index],eventTracks[index-1]];renderPlaylist();});up.disabled=index===0;up.setAttribute('aria-label','Sposta su '+name);
+    var down=button('↓',function(){[eventTracks[index+1],eventTracks[index]]=[eventTracks[index],eventTracks[index+1]];renderPlaylist();});down.disabled=index===eventTracks.length-1;down.setAttribute('aria-label','Sposta giù '+name);
+    li.append(up,down,button('Rimuovi dal gruppo',function(){eventTracks.splice(index,1);renderPlaylist();}));el('eventPlaylist').appendChild(li);
+  });
+}
+async function update(){
+  el('studioTools').hidden=!authorized;if(!authorized||inFlight)return;inFlight=true;
+  try{
+    var s=await api('/api/studio'),bus=s.audio_bus;
+    el('playerState').textContent=({live:'Solo microfono / ingresso mixer',playing:'In riproduzione',paused:'Musica in pausa'}[s.status]||s.status)+(s.track?' · '+s.track:'')+' · origine: '+(s.origin==='manual'?'regia':s.origin.startsWith('calendar:')?'calendario':'ingresso')+(s.error?' · Errore: '+s.error:'');
+    el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);el('playerProgress').max=s.duration||1;el('playerProgress').value=s.position;
+    if(s.status!=='live')el('playerLoop').checked=s.loop;
+    el('groupState').textContent=s.plan?'Gruppo: traccia '+(s.plan.index+1)+'/'+s.plan.tracks.length+' · passaggio '+s.plan.cycle+'/'+(s.plan.repetitions||'fino a fine fascia')+(s.plan.next_at?' · prossimo passaggio '+new Date(s.plan.next_at*1000).toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'}):''):'';
+    el('microphoneState').textContent=bus?(bus.microphone_online?'Microfono collegato':'ATTENZIONE: '+bus.microphone_error)+' · ingresso '+bus.microphone_dbfs+' dBFS · musica '+bus.music_gain_db+' dB'+(bus.ducking_active?' · DUCKING ATTIVO':''):'Ingresso diretto: il bus annunci si avvia con la regia.';
+    if(!duckInitialized){var duck=el('duckingForm');duck.elements.namedItem('enabled').checked=s.ducking.enabled;duck.elements.namedItem('threshold_db').value=s.ducking.threshold_db;duck.elements.namedItem('reduction_db').value=s.ducking.reduction_db;duckInitialized=true;}
+    el('automationState').textContent=(s.automation_enabled?'Calendario abilitato':'Calendario disabilitato')+(s.manual_hold?' · sospeso dalla regia manuale':'')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');
+    el('nextEvents').textContent='Prossimi eventi: '+(s.next_events||[]).map(function(e){return e.name+' · '+new Date(e.at).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}).join(' | ');
+    currentEvents=s.events;renderEvents();el('eventHistory').replaceChildren();
+    var states={started:'avviato',completed:'completato',skipped:'saltato',waiting:'in attesa',interrupted:'interrotto',suspended:'sospeso',failed:'errore',cancelled:'annullato'};
+    s.history.forEach(function(e){var li=document.createElement('li'),event=s.events.find(function(v){return v.id===e.event;});li.textContent=(event?event.name:e.event)+' · '+e.occurrence+' · '+(states[e.state]||e.state)+(e.message?' · '+e.message:'');el('eventHistory').appendChild(li);});
+  }catch(error){message(error.message);}finally{inFlight=false;}
+}
+function renderEvents(){
+  el('eventRows').replaceChildren();
+  currentEvents.forEach(function(e){
+    var tr=document.createElement('tr'),tracks=e.tracks||[e.track],repetitions=e.repetitions===undefined?1:e.repetitions;
+    var recurrence={once:'una volta',daily:'ogni giorno',weekly:'settimanale: '+e.weekdays.map(function(d){return ['Lun','Mar','Mer','Gio','Ven','Sab','Dom'][d];}).join(', ')}[e.recurrence];
+    [e.name+(e.enabled?'':' (disabilitato)'),e.start+(e.end_time?' → '+e.end_time:'')+' · '+recurrence,tracks.join(' → ')+' · '+(repetitions?repetitions+' passaggi':'fino a fine fascia')+' · intervallo '+(e.interval_seconds||0)+' s · '+({skip:'salta',wait:'attendi',interrupt:'interrompi'}[e.policy])].forEach(function(text){var td=document.createElement('td');td.textContent=text;tr.appendChild(td);});
+    var actions=document.createElement('td');
+    actions.appendChild(button('Modifica',function(){
+      var form=el('eventForm');['id','name','start','recurrence','policy'].forEach(function(k){form.elements.namedItem(k).value=e[k];});
+      form.elements.namedItem('track').value=tracks[0];form.elements.namedItem('end_time').value=e.end_time||'';form.elements.namedItem('repetitions').value=repetitions;form.elements.namedItem('interval_seconds').value=e.interval_seconds||0;
+      form.elements.namedItem('enabled').checked=e.enabled;eventTracks=tracks.slice();renderPlaylist();
+      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';form.scrollIntoView({behavior:'smooth'});
+    }));
+    actions.appendChild(button('Elimina evento',function(){if(confirm('Eliminare l’evento '+e.name+'?'))perform(async function(){await api('/api/calendar/delete',{id:e.id});await update();});}));
+    tr.appendChild(actions);el('eventRows').appendChild(tr);
+  });
+}
+document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(async function(){var data={command:b.dataset.player};if(data.command==='play'){data.name=el('trackSelect').value;data.loop=el('playerLoop').checked;}await api('/api/player',data);await update();});};});
 el('playerLoop').onchange=function(){perform(async function(){await api('/api/player',{command:'loop',enabled:el('playerLoop').checked});await update();});};
 el('seekForm').onsubmit=function(e){e.preventDefault();perform(async function(){await api('/api/player',{command:'seek',position:Number(el('seekPosition').value)});await update();});};
-el('enableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:true});await update();});};el('disableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:false});await update();});};
-el('cancelEvent').onclick=function(){el('eventForm').reset();el('eventForm').elements.namedItem('id').value='';el('eventLegend').textContent='Nuovo evento';};
-el('eventForm').onsubmit=function(e){e.preventDefault();var form=e.target,data=Object.fromEntries(new FormData(form));data.enabled=form.elements.namedItem('enabled').checked;data.weekdays=Array.from(document.querySelectorAll('#weekdays input:checked')).map(function(c){return Number(c.value);});if(!data.weekdays.length){if(data.recurrence==='weekly'){message('Selezionare almeno un giorno della settimana');return;}delete data.weekdays;}if(!data.id)delete data.id;perform(async function(){await api('/api/calendar/save',data);el('cancelEvent').click();message('Evento salvato. Abilitare il programma per eseguirlo.');await update();});};
+el('duckingForm').onsubmit=function(e){e.preventDefault();var f=e.target;perform(async function(){await api('/api/player',{command:'ducking',enabled:f.elements.namedItem('enabled').checked,threshold_db:Number(f.elements.namedItem('threshold_db').value),reduction_db:Number(f.elements.namedItem('reduction_db').value)});message('Impostazioni ducking salvate');await update();});};
+el('enableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:true});await update();});};
+el('disableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:false});await update();});};
+el('addEventTrack').onclick=function(){var name=el('eventTrack').value;if(!name)return;if(eventTracks.length>=100){message('Massimo 100 tracce per gruppo');return;}eventTracks.push(name);renderPlaylist();};
+el('cancelEvent').onclick=function(){el('eventForm').reset();el('eventForm').elements.namedItem('id').value='';eventTracks=[];renderPlaylist();el('eventLegend').textContent='Nuovo evento';};
+el('eventForm').onsubmit=function(e){
+  e.preventDefault();var form=e.target,data=Object.fromEntries(new FormData(form));
+  data.enabled=form.elements.namedItem('enabled').checked;data.tracks=eventTracks.length?eventTracks.slice():[el('eventTrack').value];data.repetitions=Number(data.repetitions);data.interval_seconds=Number(data.interval_seconds);
+  if(data.repetitions===0&&!data.end_time){message('Indicare l’ora di fine per ripetere fino a fine fascia');return;}
+  data.weekdays=Array.from(document.querySelectorAll('#weekdays input:checked')).map(function(c){return Number(c.value);});
+  if(!data.weekdays.length){if(data.recurrence==='weekly'){message('Selezionare almeno un giorno della settimana');return;}delete data.weekdays;}
+  if(!data.id)delete data.id;
+  perform(async function(){await api('/api/calendar/save',data);el('cancelEvent').click();message('Evento salvato. Abilitare il programma per eseguirlo.');await update();});
+};
 async function scan(){var d=await api('/api/usb');el('usbDevice').replaceChildren();d.devices.forEach(function(device){option(el('usbDevice'),device.id,device.label+' · '+device.filesystem);});message(d.devices.length?'Pennette rilevate':'Nessuna pennetta USB disponibile');}
-async function browse(path){var device=el('usbDevice').value;if(!device)throw new Error('Selezionare una pennetta');var data=await api('/api/usb/browse',{device:device,path:path});usbPath=data.path;usbOpened=device;el('usbPath').textContent=device+': /'+usbPath;el('usbEntries').replaceChildren();data.entries.forEach(function(entry){var li=document.createElement('li');var b=document.createElement('button');b.textContent=(entry.directory?'📁 ':'Importa: ')+entry.name;b.onclick=function(){perform(async function(){if(el('usbDevice').value!==usbOpened)throw new Error('Aprire la pennetta selezionata');var relative=(usbPath?usbPath+'/':'')+entry.name;if(entry.directory)await browse(relative);else{b.disabled=true;message('Importazione in corso…');try{await api('/api/usb/import',{device:device,path:relative});await library();message('File importato: '+entry.name);}finally{b.disabled=false;}}});};li.appendChild(b);el('usbEntries').appendChild(li);});}
-el('scanUSB').onclick=function(){perform(scan);};el('openUSB').onclick=function(){perform(function(){return browse('');});};el('usbParent').onclick=function(){perform(function(){return browse(usbPath.split('/').slice(0,-1).join('/'));});};el('ejectUSB').onclick=function(){perform(async function(){await api('/api/usb/eject',{device:el('usbDevice').value});usbPath='';usbOpened='';el('usbEntries').replaceChildren();el('usbPath').textContent='Pennetta espulsa';message('È possibile scollegare la pennetta');await scan();});};
+async function browse(path){
+  var device=el('usbDevice').value;if(!device)throw new Error('Selezionare una pennetta');
+  var data=await api('/api/usb/browse',{device:device,path:path});usbPath=data.path;usbOpened=device;el('usbPath').textContent=device+': /'+usbPath;el('usbEntries').replaceChildren();
+  data.entries.forEach(function(entry){var li=document.createElement('li'),b=button((entry.directory?'📁 ':'Importa: ')+entry.name,function(){perform(async function(){
+    if(el('usbDevice').value!==usbOpened)throw new Error('Aprire la pennetta selezionata');
+    var relative=(usbPath?usbPath+'/':'')+entry.name;
+    if(entry.directory)await browse(relative);else{b.disabled=true;message('Importazione in corso…');try{await api('/api/usb/import',{device:device,path:relative});await library();message('File importato: '+entry.name);}finally{b.disabled=false;}}
+  });});li.appendChild(b);el('usbEntries').appendChild(li);});
+}
+el('scanUSB').onclick=function(){perform(scan);};el('openUSB').onclick=function(){perform(function(){return browse('');});};
+el('usbParent').onclick=function(){perform(function(){return browse(usbPath.split('/').slice(0,-1).join('/'));});};
+el('ejectUSB').onclick=function(){perform(async function(){await api('/api/usb/eject',{device:el('usbDevice').value});usbPath='';usbOpened='';el('usbEntries').replaceChildren();el('usbPath').textContent='Pennetta espulsa';message('È possibile scollegare la pennetta');await scan();});};
 window.addEventListener('DOMContentLoaded',function(){update();setInterval(update,2000);});
 })();
 </script>
 HTML_STUDIO
-    chmod 0644 /usr/local/lib/roc-museum/studio.py /usr/local/share/roc-museum/studio.html
+    chmod 0644 /usr/local/lib/roc-museum/studio.py /usr/local/lib/roc-museum/audio_bus.py /usr/local/share/roc-museum/studio.html
 }
 
 write_systemd_services() {

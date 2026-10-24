@@ -333,7 +333,7 @@ riproduzione. Player, calendario ed explorer USB sono descritti qui sotto.
 Test dedicati: `python3 -m unittest discover -s tests -p test_auth_upload.py -v`.
 
 
-## Regia TX · v4.8
+## Regia TX · v4.9
 
 Dopo il login compaiono player, calendario ed explorer USB. Il monitor dei nodi
 rimane consultabile senza login; tutte le nuove API di regia richiedono sessione,
@@ -349,60 +349,100 @@ ripetizione della singola traccia. Tutti gli RX ricevono lo stesso segnale.
 Il browser è soltanto il telecomando: il servizio sul TX continua a funzionare
 anche chiudendo la pagina, e più browser osservano lo stesso stato.
 
-FFmpeg decodifica il file come PCM stereo al sample rate configurato e lo passa
-via WAV su standard input a Roc. Il TX ferma prima il servizio Roc dell'ingresso
-mixer, così non trasmette due sorgenti contemporaneamente. Alla fine di una
-traccia non ripetuta, o premendo **Stop / ingresso mixer**, riavvia l'ingresso
-Scarlett. In pausa il sender del player è fermo: gli RX restano senza segnale.
-La posizione visualizzata è una stima del tempo trascorso sul TX, non una misura
-dell'istante di uscita analogica degli RX.
+FFmpeg decodifica la musica in PCM stereo. Un bus Python mantiene aperta
+l'acquisizione `arecord` della Scarlett e un solo sender Roc, miscelando microfono
+e musica. Il microfono rimane udibile durante play, pausa, stop, ricerca, cambio
+traccia e intervalli del calendario. La scheda esterna deve ricevere soltanto
+il segnale degli annunci, senza rimandare la stessa musica del player al TX.
+La posizione del player conta i campioni letti, non misura la latenza analogica RX.
 
-Cambio sorgente, ricerca, ripresa e ripetizione possono avere una breve pausa:
-questa versione non implementa dissolvenze, transizioni senza interruzioni,
-playlist o sovrapposizione di annuncio e sottofondo. Un errore di avvio del player
-ripristina l'ingresso mixer. Il riavvio o arresto del monitor ripristina il mixer;
-le tracce interrotte non ripartono da sole. Senza Scarlett il servizio ingresso
-rimane in attesa del dispositivo, mentre il player può usare i file locali.
+Il bus è avviato dal monitor TX; `roc-museum.service` rimane attivo come
+coordinatore senza aprire una seconda acquisizione ALSA. Il file runtime
+`/run/roc-museum-bus` identifica il processo proprietario. Se il monitor termina,
+il runner ripristina automaticamente il percorso originale Scarlett → Roc.
+Se il bus fallisce, il monitor lo chiude e rilascia la scheda prima di tornare
+all'ingresso diretto. Se manca la Scarlett, la musica può continuare; la pagina
+segnala la mancanza del microfono e l'acquisizione tenta la riconnessione.
+Il riavvio/aggiornamento dei servizi può comunque provocare una breve interruzione.
+
+### Annunci e ducking
+
+Il ducking agisce **soltanto sulla musica**, non sul segnale del microfono.
+La pagina mostra stato dell'ingresso, livello RMS in dBFS e attenuazione musicale.
+I parametri sono salvati sul TX e si applicano subito senza riavviare il flusso:
+
+- Abilitazione (attiva inizialmente).
+- Soglia RMS voce: −36 dBFS iniziali, regolabile da −60 a −6 dBFS.
+- Attenuazione musica: −18 dB iniziali, regolabile da −40 a 0 dB.
+
+L'attacco è circa 30 ms; il mantenimento dopo voce è 500 ms, con ritorno graduale
+al livello normale (costante di rilascio 800 ms). Un limitatore digitale evita
+l'overflow quando si sommano le sorgenti. Non elimina clipping già presente nella
+Scarlett: regolare correttamente il gain analogico. Per evitare attivazioni sul
+rumore di fondo, alzare la soglia nella regia. Verificare sull'impianto reale la
+soglia, l'intelligibilità degli annunci, il margine audio, il carico del Pi 3 e la
+latenza introdotta dall'acquisizione/miscelazione prima dell'uso al pubblico.
+
+### Libreria e cancellazione
+
+Ogni file caricato ha un pulsante **Elimina traccia**, con conferma prima della
+cancellazione definitiva. Sono protette le tracce attive/in pausa, quelle del
+gruppo in corso e quelle referenziate da qualsiasi evento, anche disabilitato.
+Prima di cancellarle occorre fermare il player e modificare/eliminare gli eventi
+che le usano. La cancellazione condivide il blocco di upload/import USB, quindi
+non opera mentre una copia è in corso. Non elimina file dalla pennetta.
+
+### Ora del sistema
+
+La pagina pubblica mostra **Ora TX**, ottenuta dal timestamp del Raspberry via
+`/api/status`, anche senza login. Il browser la aggiorna ogni secondo e la
+risincronizza con il server ogni due secondi: non usa il proprio orologio come
+riferimento per la programmazione. Visualizzazione e calendario usano Europe/Rome.
 
 ### Calendario
 
-Gli eventi persistono in `/var/lib/roc-museum/studio/calendar.sqlite` e possono
-essere creati, modificati, disabilitati o eliminati dalla pagina. Ogni evento
-indica una traccia, una data/ora iniziale nell'ora italiana (`Europe/Rome`) e una
-ricorrenza: una volta, giornaliera oppure settimanale nei giorni selezionati.
-Il calendario generale è **disabilitato per impostazione iniziale** e va attivato
-con **Abilita / riprendi programma**. La sua abilitazione persiste al riavvio.
+Gli eventi persistono in `/var/lib/roc-museum/studio/calendar.sqlite`. I vecchi
+eventi restano compatibili e sono interpretati come una singola traccia eseguita
+una volta. Ogni evento può contenere una traccia oppure un **gruppo ordinato**
+di massimo 100 tracce; i pulsanti ↑/↓ cambiano l'ordine. La stessa traccia può
+comparire più volte. La ricorrenza può essere singola, giornaliera o settimanale.
 
-I comandi manuali di riproduzione, pausa, ricerca, stop o loop durante una traccia
-sospendono l'esecuzione degli eventi. **Abilita / riprendi programma** conclude
-l'eventuale traccia manuale, torna al mixer e libera l'automazione. La sospensione
-manuale è temporanea e non persiste dopo un riavvio del monitor.
+Oltre alla data/ora iniziale è possibile indicare **ora fine fascia**:
 
-Quando il player è occupato, la priorità dell'evento può essere:
+- La fine uguale o precedente all'inizio indica il giorno successivo.
+- A fine fascia la musica si ferma anche se il brano non è terminato; il microfono
+  continua a funzionare.
+- **Passaggi del gruppo**: 1 esegue una volta, 2 due volte, 0 ripete fino alla fine
+  della fascia. Il valore 0 richiede un'ora di fine.
+- **Intervallo tra passaggi**: pausa in secondi dopo tutto il gruppo, non fra le
+  singole tracce; anche durante la pausa il microfono rimane udibile.
 
-- **Salta**: registra l'evento come saltato.
-- **Attendi**: mette l'evento in coda fino a fine traccia, per massimo 15 minuti.
-- **Interrompi**: interrompe la traccia attuale e avvia quella programmata.
+Esempio: inizio 09:00, fine 18:00, gruppo A → B → C, passaggi 0, intervallo 15 s:
+riproduce A/B/C, attende 15 secondi e ricomincia fino alle 18:00.
+Un numero di passaggi finito può terminare prima della fine fascia.
 
-Il mixer è considerato sorgente disponibile, non player occupato. Le tracce
-interrotte non vengono riprese automaticamente e una traccia programmata torna
-al mixer al termine. Gli eventi nello stesso minuto vengono ordinati per data
-iniziale e identificativo. Un loop occupa il player fino al comando manuale o a
-un evento interrompente. Disabilitare il calendario ferma una traccia avviata dal
-calendario e cancella la coda; non ferma una traccia manuale.
+Il calendario generale è disabilitato inizialmente. **Abilita / riprendi programma**
+attiva gli eventi. L'abilitazione persiste dopo il riavvio. I comandi manuali
+sospendono il calendario fino a quel pulsante: la fascia ancora attiva riparte
+dall'inizio del gruppo. La sospensione manuale è temporanea, non persiste dopo
+un riavvio. Le fasce attive ripartono dall'inizio anche al riavvio del monitor;
+gli eventi istantanei dei minuti precedenti non vengono recuperati.
 
-Il servizio controlla gli eventi ogni secondo. Un evento può partire durante
-il minuto indicato (ritardo massimo normale inferiore a un secondo, se il TX è
-libero); al riavvio non recupera minuti già passati né la coda precedente.
-Un registro persistente impedisce di eseguire due volte la stessa occorrenza,
-anche dopo un riavvio o al ritorno dall'ora legale. Nell'ora primaverile inesistente
-l'evento viene saltato. Il registro mostra gli ultimi 30 eventi e conserva 90
-giorni di storico. Non è una garanzia di esecuzione in caso di blackout: il
-registro viene salvato prima dell'avvio per evitare duplicazioni.
+Se un altro programma è attivo si può scegliere **Salta**, **Attendi** (massimo
+15 minuti e comunque non oltre fine fascia) o **Interrompi**. Il solo microfono
+non occupa il player. Un programma in attesa fra due passaggi mantiene occupata
+la fascia. Dopo un annuncio musicale interrompente, una fascia di sottofondo
+ancora attiva può ripartire dall'inizio. Un annuncio dal microfono non interrompe
+il gruppo: abbassa la musica con il ducking e la riproduzione continua.
 
-L'orologio del Raspberry deve essere corretto. Verificare la sincronizzazione
-NTP; per installazioni isolate dalla rete valutare un RTC. Nessun collegamento
-a Internet è richiesto per riprodurre brani o leggere il calendario locale.
+Il motore controlla gli eventi ogni 100 ms. Il bus audio applica il limite di fine
+fascia anche fra due controlli del calendario. Il registro persistente evita di
+rieseguire un evento istantaneo dopo riavvio o cambio dell'ora. Le fasce notturne
+usano il giorno d'inizio per la ricorrenza settimanale; gli orari di inizio
+inesistenti al passaggio primaverile vengono saltati. La pagina mostra le ultime
+30 occorrenze e conserva 90 giorni di storico. Non c'è garanzia di esecuzione in
+caso di blackout. L'orologio del Raspberry deve essere sincronizzato (NTP o RTC
+per installazioni isolate). Internet non è richiesto per l'esecuzione locale.
 
 ### Explorer USB
 
@@ -424,7 +464,7 @@ non lasciano un brano parziale visibile nella libreria.
 
 ### Sviluppo e verifica
 
-`studio.py` e `studio.html` sono i sorgenti della regia. Dopo una modifica,
+`studio.py`, `audio_bus.py` e `studio.html` sono i sorgenti della regia. Dopo una modifica,
 rigenerare la copia incorporata nell'installer autonomo:
 
 ```bash
@@ -433,15 +473,17 @@ bash -n setup_roc_museum.sh
 python3 -m unittest discover -s tests -v
 ```
 
-La suite verifica login, CSRF, upload, priorità, persistenza, ora legale,
-confinamento USB, copia e ripristino del mixer. Se disponibile un eseguibile Roc,
-attivare anche il test di integrazione reale su UDP localhost:
+La suite verifica login, CSRF, upload, cancellazione protetta, gruppi, fasce,
+ripetizioni, persistenza, ora legale, confinamento USB, ducking e continuità del
+microfono durante i comandi musicali. Se disponibile un eseguibile Roc, attivare
+anche il test reale su UDP localhost:
 
 ```bash
 ROC_SEND_BINARY=/usr/bin/roc-send python3 -m unittest discover -s tests -p test_studio.py -v
 ```
 
-Il test reale usa FFmpeg e verifica la ricezione di pacchetti RTP L16; non usa
-ALSA, non cambia servizi reali e non contatta i Raspberry. Rimane da collaudare
-sull'hardware il passaggio Scarlett/player, il comportamento degli RX durante
-le pause e il montaggio/espulsione delle pennette effettivamente in uso.
+Il test usa il vero decoder FFmpeg e il vero sender Roc, verifica i pacchetti RTP
+L16 e un segnale microfono simulato durante la pausa, senza toccare ALSA o servizi
+reali. Rimangono necessari il collaudo Scarlett/Pi 3, una prova prolungata e la
+taratura del ducking sull'impianto. Il setup resta unico per TX e RX, incluse le
+dipendenze, come concordato.

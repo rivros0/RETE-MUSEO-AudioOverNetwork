@@ -4,7 +4,7 @@ from pathlib import Path
 root=Path(__file__).resolve().parents[1]
 path=root/'setup_roc_museum.sh'
 text=path.read_text()
-for marker,name in (('PY_STUDIO','studio.py'),('HTML_STUDIO','studio.html')):
+for marker,name in (('PY_STUDIO','studio.py'),('HTML_STUDIO','studio.html'),('PY_AUDIO_BUS','audio_bus.py')):
     opening="<<'"+marker+"'\n"
     start=text.index(opening)+len(opening)
     end=text.index('\n'+marker+'\n',start)

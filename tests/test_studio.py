@@ -24,11 +24,33 @@ def wav(path,seconds=1):
         out.writeframes(struct.pack('<hh',8000,-8000)*int(44100*seconds))
 
 
+class FakeBus:
+    def __init__(self,config):
+        self.sender=Mock();self.sender.poll.return_value=None
+        self.eof=False;self.position=0;self.paused=False;self.closed=False;self.attached=None
+    def configure(self,settings): self.settings=settings
+    def start(self): pass
+    def close(self): self.closed=True
+    def attach(self,stream,position=0,deadline=None): self.attached=stream;self.position=position;self.eof=False;self.paused=False
+    def detach(self): self.attached=None;self.eof=False;self.paused=False
+    def set_deadline(self,value): self.deadline=value
+    def pause(self,value): self.paused=value
+    def snapshot(self):
+        return {'active':not self.closed,'music_eof':self.eof,'position':self.position,'error':'','microphone_online':True,'microphone_error':'','microphone_dbfs':-60,'ducking_active':False,'music_gain_db':0,'deadline_hit':False}
+
+
 class StudioCase(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.base=Path(self.temp.name)
-        self.engine=studio.Studio({},media=self.base/'media',state=self.base/'state',usb_root=self.base/'usb')
+        # Never touch services in unit tests, including failure paths.
+        real_run=studio.run
+        def safe_run(args,**kwargs):
+            if args[0]=='systemctl': return Mock()
+            return real_run(args,**kwargs)
+        self.service_patch=patch.object(studio,'run',side_effect=safe_run)
+        self.service_patch.start();self.addCleanup(self.service_patch.stop)
+        self.engine=studio.Studio({},media=self.base/'media',state=self.base/'state',usb_root=self.base/'usb',audio_factory=FakeBus,bus_marker=self.base/"bus.marker")
         self.addCleanup(self.engine.close)
         wav(self.engine.media/'test.wav')
 
@@ -51,7 +73,7 @@ class CalendarTests(StudioCase):
         self.event();self.enable()
         with patch.object(self.engine,'_play') as play:
             self.engine.tick(self.now());self.engine.tick(self.now());self.assertEqual(play.call_count,1)
-        other=studio.Studio({},self.engine.media,self.engine.state,self.engine.usb_root)
+        other=studio.Studio({},self.engine.media,self.engine.state,self.engine.usb_root,bus_marker=self.base/'other.marker')
         try:
             with patch.object(other,'_play') as play: other.tick(self.now());play.assert_not_called()
             self.assertTrue(other.snapshot()['automation_enabled'])
@@ -165,27 +187,26 @@ class PlayerTests(StudioCase):
         p=Mock();p.poll.return_value=returncode;p.returncode=returncode;p.wait.return_value=0
         return p
 
-    def test_exclusive_sender_pause_resume_stop(self):
-        encoder=self.process();sender=self.process()
-        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio,'run') as run,patch.object(studio.subprocess,'Popen',side_effect=[encoder,sender]) as popen:
+    def test_continuous_microphone_during_pause_resume_stop(self):
+        encoder=self.process()
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio,'run') as run,patch.object(studio.subprocess,'Popen',return_value=encoder) as popen:
             self.engine.command({'command':'play','name':'test.wav'})
-            self.assertEqual(run.call_args.args[0],['systemctl','stop','roc-museum.service'])
-            self.assertEqual(popen.call_args_list[1].args[0][0],'roc-send')
-            self.assertIs(popen.call_args_list[1].kwargs['stdin'],encoder.stdout)
-            self.engine.command({'command':'pause'});encoder.terminate.assert_called();sender.terminate.assert_called()
-            self.assertEqual(self.engine.status,'paused');self.assertTrue(self.engine.manual_hold)
-        with patch.object(self.engine,'_play') as play:
-            self.engine.command({'command':'resume'});play.assert_called_once()
-        with patch.object(studio,'run') as run:
-            self.engine.command({'command':'stop'})
-            self.assertEqual(run.call_args.args[0],['systemctl','start','roc-museum.service'])
-            self.assertEqual(self.engine.status,'live')
+            sender=self.engine.sender
+            self.assertEqual(run.call_args_list[0].args[0],['systemctl','stop','roc-museum.service'])
+            self.assertEqual(popen.call_args.args[0][0],'ffmpeg')
+            self.engine.command({'command':'pause'})
+            encoder.terminate.assert_not_called();self.assertTrue(self.engine.bus.paused)
+            self.assertTrue(self.engine.snapshot()['audio_bus']['microphone_online'])
+            self.engine.command({'command':'resume'});self.assertFalse(self.engine.bus.paused)
+            self.engine.command({'command':'stop'});encoder.terminate.assert_called()
+            self.assertEqual(self.engine.status,'live');self.assertIs(self.engine.sender,sender)
+            self.assertTrue(self.engine.bus.snapshot()['active'])
+            self.assertEqual(run.call_count,2)  # initial takeover only; audio unit remains active
 
-    def test_failed_spawn_restores_mixer(self):
-        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio,'run') as run,patch.object(studio.subprocess,'Popen',side_effect=OSError('missing executable')):
+    def test_failed_decoder_keeps_microphone(self):
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio.subprocess,'Popen',side_effect=OSError('missing executable')):
             with self.assertRaises(OSError): self.engine.command({'command':'play','name':'test.wav'})
-            self.assertEqual(run.call_args.args[0],['systemctl','start','roc-museum.service'])
-            self.assertEqual(self.engine.status,'live')
+        self.assertTrue(self.engine.bus.snapshot()['active']);self.assertEqual(self.engine.status,'live')
 
     def test_invalid_seek_keeps_playing(self):
         self.engine.status='playing';self.engine.track='test.wav'
@@ -193,11 +214,11 @@ class PlayerTests(StudioCase):
             with patch.object(self.engine,'info',return_value={'duration':20}),self.assertRaises(ValueError): self.engine.command({'command':'seek','position':value})
         self.assertEqual(self.engine.status,'playing')
 
-    def test_finish_restores_mixer_and_loop_restarts(self):
-        self.engine.status='playing';self.engine.track='test.wav';self.engine.sender=self.process(0);self.engine.encoder=self.process(0)
-        with patch.object(studio,'run'): self.engine.tick()
-        self.assertEqual(self.engine.status,'live')
-        self.engine.status='playing';self.engine.track='test.wav';self.engine.loop=True;self.engine.sender=self.process(0);self.engine.encoder=self.process(0)
+    def test_finish_keeps_bus_and_loop_restarts(self):
+        self.engine._ensure_audio();sender=self.engine.sender
+        self.engine.status='playing';self.engine.track='test.wav';self.engine.encoder=self.process(0);self.engine.bus.eof=True
+        self.engine.tick();self.assertEqual(self.engine.status,'live');self.assertIs(self.engine.sender,sender)
+        self.engine.status='playing';self.engine.track='test.wav';self.engine.loop=True;self.engine.encoder=self.process(0);self.engine.bus.eof=True
         with patch.object(self.engine,'_play') as play: self.engine.tick();play.assert_called_once_with('test.wav',origin='mixer',loop=True)
 
     def test_resume_program_releases_manual_source(self):
@@ -215,34 +236,46 @@ class PlayerTests(StudioCase):
 class PackagingTests(unittest.TestCase):
     def test_embedded_sources_match(self):
         setup=(ROOT/'setup_roc_museum.sh').read_text()
-        for marker,name in (('PY_STUDIO','studio.py'),('HTML_STUDIO','studio.html')):
+        for marker,name in (('PY_STUDIO','studio.py'),('HTML_STUDIO','studio.html'),('PY_AUDIO_BUS','audio_bus.py')):
             embedded=setup.split("<<'"+marker+"'\n",1)[1].split('\n'+marker,1)[0]
             self.assertEqual(embedded.rstrip(),(ROOT/name).read_text().rstrip())
 
 
 @unittest.skipUnless(os.environ.get('ROC_SEND_BINARY') and shutil.which('ffmpeg'),'set ROC_SEND_BINARY for real Roc integration')
 class RocIntegration(StudioCase):
-    def test_real_ffmpeg_to_roc_produces_l16_packets(self):
+    def test_real_pcm_bus_to_roc_and_continuity(self):
         receiver=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);self.addCleanup(receiver.close)
         receiver.bind(('127.0.0.1',0));receiver.settimeout(5)
         self.engine.config={'MULTICAST_ADDR':'127.0.0.1','RTP_PORT':str(receiver.getsockname()[1])}
-        real_popen=studio.subprocess.Popen;real_run=studio.run
+        spec=importlib.util.spec_from_file_location('real_audio',ROOT/'audio_bus.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        self.engine.audio_factory=lambda config:module.AudioBus(config,capture_enabled=False)
+        real_popen=studio.subprocess.Popen
         def popen(args,**kwargs):
             if args[0]=='roc-send': args=[os.environ['ROC_SEND_BINARY'],*args[1:]]
             return real_popen(args,**kwargs)
-        def run(args,**kwargs):
-            if args[0]=='systemctl': return Mock()
-            return real_run(args,**kwargs)
-        with patch.object(studio,'run',side_effect=run),patch.object(studio.subprocess,'Popen',side_effect=popen):
+        with patch.object(studio.subprocess,'Popen',side_effect=popen):
             self.engine.command({'command':'play','name':'test.wav'})
-            try: packet,_=receiver.recvfrom(65535)
-            except TimeoutError:
-                self.engine.error_log.seek(0)
-                self.fail(self.engine.error_log.read().decode(errors='replace'))
-            self.assertEqual(packet[0]>>6,2);self.assertEqual(packet[1]&127,10)
-            self.assertGreater(len(packet),12)
-            self.assertTrue(any(packet[12:]))
-            self.engine.sender.wait(timeout=10)
-            self.engine.tick();self.assertEqual(self.engine.status,'live')
+            sender=self.engine.sender;deadline=time.monotonic()+5;heard=False
+            while time.monotonic()<deadline:
+                packet,_=receiver.recvfrom(65535)
+                self.assertEqual(packet[0]>>6,2);self.assertEqual(packet[1]&127,10)
+                if any(packet[12:]): heard=True;break
+            self.assertTrue(heard,'Music PCM did not reach RTP output')
+            self.engine.command({'command':'pause'})
+            self.assertTrue(self.engine.bus.snapshot()['active']);self.assertIs(self.engine.sender,sender)
+            # Inject a known microphone block: it must still reach RX while music is paused.
+            microphone=struct.pack('<hh',12000,-12000)*self.engine.bus.frames
+            with self.engine.bus.lock:
+                self.engine.bus.mic_queue.clear()
+                self.engine.bus.mic_queue.extend([microphone]*10)
+            heard_mic=False
+            for _ in range(250):
+                packet,_=receiver.recvfrom(65535)
+                samples=struct.unpack('!%dh'%((len(packet)-12)//2),packet[12:])
+                if max((abs(x) for x in samples),default=0)>10000: heard_mic=True;break
+            self.assertTrue(heard_mic,'Microphone must remain audible during music pause')
+            self.engine.command({'command':'stop'})
+            self.assertIs(self.engine.sender,sender);self.assertTrue(self.engine.bus.snapshot()['active'])
+
 
 if __name__=='__main__': unittest.main()

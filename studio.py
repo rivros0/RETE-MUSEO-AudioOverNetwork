@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """TX studio: one Roc sender, durable schedule, constrained USB explorer."""
 import datetime as dt
+import importlib.util
 import json
 import math
 import os
@@ -51,7 +52,7 @@ def confined_open(root, relative='', directory=False):
 
 
 class Studio:
-    def __init__(self,config,media='/var/lib/roc-museum/media',state='/var/lib/roc-museum/studio',usb_root='/run/roc-museum-usb',copy_lock=None):
+    def __init__(self,config,media='/var/lib/roc-museum/media',state='/var/lib/roc-museum/studio',usb_root='/run/roc-museum-usb',copy_lock=None,audio_factory=None,bus_marker="/run/roc-museum-bus"):
         self.config=config
         self.media=Path(media);self.state=Path(state);self.usb_root=Path(usb_root)
         self.media.mkdir(parents=True,exist_ok=True,mode=0o750)
@@ -67,17 +68,47 @@ class Studio:
         self.track=None;self.duration=0;self.position=0;self.started=0;self.status='live';self.loop=False
         self.origin='mixer';self.error='';self.queue=[];self.manual_hold=False
         self.shutdown=threading.Event();self.metadata={};self.thread=None
+        self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
 
     def start(self):
-        # Recover the physical input after an interrupted previous monitor process.
-        self._live()
+        try: self._ensure_audio()
+        except Exception as error:
+            self.error=str(error);self._live()
         self.thread=threading.Thread(target=self._worker,daemon=True);self.thread.start()
 
     def close(self):
         self.shutdown.set()
         if self.thread: self.thread.join(timeout=5)
         with self.lock:
-            self._terminate();self.db.close()
+            self._terminate()
+            if self.bus: self.bus.close();self.bus=None
+            self.bus_marker.unlink(missing_ok=True)
+            self.sender=None;self.db.close()
+
+    def ducking(self):
+        return self._setting('ducking','{"enabled":true,"threshold_db":-36,"reduction_db":-18}')
+
+    def _ensure_audio(self):
+        if self.bus and self.bus.snapshot()['active']: return
+        if self.bus: self.bus.close();self.bus=None
+        run(['systemctl','stop','roc-museum.service'])
+        try:
+            if self.audio_factory is None:
+                spec=importlib.util.spec_from_file_location('museum_audio_bus',Path(__file__).with_name('audio_bus.py'))
+                module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+                factory=module.AudioBus
+            else: factory=self.audio_factory
+            # The audio unit stays active as a coordinator; on monitor death it
+            # automatically resumes the original ALSA microphone path.
+            fd=os.open(self.bus_marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
+            with os.fdopen(fd,'w') as marker: marker.write(str(os.getpid())+'\n')
+            bus=factory(self.config);bus.configure(self.ducking());bus.start()
+            self.bus=bus;self.sender=bus.sender
+            run(['systemctl','start','roc-museum.service'])
+        except Exception:
+            if self.bus: self.bus.close();self.bus=None
+            self.sender=None;self.bus_marker.unlink(missing_ok=True)
+            run(['systemctl','start','roc-museum.service']);raise
 
     def _setting(self,key,default='false'):
         row=self.db.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
@@ -87,19 +118,38 @@ class Studio:
         self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,json.dumps(value)));self.db.commit()
 
     def _terminate(self):
-        processes=[p for p in (self.encoder,self.sender) if p]
-        for p in processes:
-            if p.poll() is None: p.terminate()
-        for p in processes:
-            try: p.wait(timeout=3)
-            except subprocess.TimeoutExpired: p.kill();p.wait(timeout=3)
-        self.encoder=None;self.sender=None
+        if self.bus: self.bus.detach()
+        if self.encoder:
+            if self.encoder.poll() is None: self.encoder.terminate()
+            try: self.encoder.wait(timeout=3)
+            except subprocess.TimeoutExpired: self.encoder.kill();self.encoder.wait(timeout=3)
+            if self.encoder.stdout: self.encoder.stdout.close()
+        self.encoder=None
         if self.error_log: self.error_log.close();self.error_log=None
 
     def _live(self):
-        self._terminate()
-        run(['systemctl','start','roc-museum.service'])
+        self._terminate();self.plan=None
+        if not self.bus or not self.bus.snapshot()['active']:
+            if self.bus: self.bus.close();self.bus=None
+            self.sender=None;self.bus_marker.unlink(missing_ok=True)
+            run(['systemctl','start','roc-museum.service'])
         self.status='live';self.origin='mixer';self.position=0;self.track=None;self.duration=0
+
+    def delete_media(self,name):
+        name=audio_name(name)
+        if not self.copy_lock.acquire(blocking=False): raise ValueError('Attendere il completamento della copia')
+        try:
+            with self.lock:
+                if name==self.track or self.plan and name in self.plan['tracks']:
+                    raise ValueError('Traccia in uso: fermare prima il player')
+                for event in self.events():
+                    if name in event.get('tracks',[event['track']]):
+                        raise ValueError('Traccia utilizzata dall’evento: '+event['name']+'. Modificare o eliminare prima l’evento.')
+                fd=confined_open(self.media,name);os.close(fd)
+                (self.media/name).unlink()
+                self.metadata={k:v for k,v in self.metadata.items() if k[0]!=name}
+                return {'ok':True,'message':'Traccia eliminata','name':name}
+        finally: self.copy_lock.release()
 
     def info(self,name):
         name=audio_name(name);path=self.media/name
@@ -121,64 +171,83 @@ class Studio:
                 result.append({'name':p.name,'size':p.stat().st_size})
         return result
 
-    def _play(self,name,position=0,origin='manual',loop=False):
+    def _play(self,name,position=0,origin='manual',loop=False,deadline=None):
         info=self.info(name)
         if not isinstance(position,(int,float)) or isinstance(position,bool) or not math.isfinite(position) or not 0<=position<info['duration']:
             raise ValueError('Posizione fuori dalla durata del brano')
-        self._terminate()
+        self._ensure_audio();self._terminate()
         try:
-            # Stop the live sender first: never send two different sources together.
-            run(['systemctl','stop','roc-museum.service'])
             self.error_log=tempfile.TemporaryFile()
-            self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-re','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','wav','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log)
-            self.sender=subprocess.Popen(['roc-send','-i','file:-','--input-format','wav','-s','rtp://'+self.config.get('MULTICAST_ADDR','239.30.0.1')+':'+self.config.get('RTP_PORT','10001'),'--frame-len='+self.config.get('FRAME_LEN','4ms')],stdin=self.encoder.stdout,stdout=subprocess.DEVNULL,stderr=self.error_log)
-            self.encoder.stdout.close()
+            self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','s16le','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log,bufsize=0)
+            self.bus.attach(self.encoder.stdout,position,deadline)
         except Exception:
             self._live();raise
         self.track=name;self.duration=info['duration'];self.position=position;self.started=time.monotonic()
         self.status='playing';self.origin=origin;self.loop=loop;self.error=''
 
     def _position(self):
-        return min(self.duration,self.position+(time.monotonic()-self.started if self.status=='playing' else 0))
+        if self.bus and self.status in ('playing','paused'): return min(self.duration,self.bus.snapshot()['position'])
+        return self.position
+
+    def _cancel_plan(self,state='interrupted'):
+        if self.plan:
+            self._record(self.plan['event'],self.plan['occurrence'],state)
+            if self.bus: self.bus.set_deadline(None)
+            self.plan=None
 
     def command(self,data):
         with self.lock:
             command=data.get('command')
-            if command=='automation':
+            if command=='ducking':
+                settings={k:data.get(k,v) for k,v in self.ducking().items()}
+                if type(settings['enabled']) is not bool: raise ValueError('Ducking non valido')
+                for key,low,high in (('threshold_db',-60,-6),('reduction_db',-40,0)):
+                    value=settings[key]
+                    if type(value) not in (int,float) or not math.isfinite(value) or not low<=value<=high: raise ValueError('Parametro ducking non valido')
+                self._store_setting('ducking',settings)
+                if self.bus: self.bus.configure(settings)
+            elif command=='automation':
                 enabled=data.get('enabled')
                 if type(enabled) is not bool: raise ValueError('Stato calendario non valido')
                 if enabled and self.manual_hold: self._live()
                 self._store_setting('enabled',enabled);self.manual_hold=False
                 if not enabled:
                     self.queue=[]
-                    if self.origin.startswith('calendar:'): self._live()
+                    if self.plan or self.origin.startswith('calendar:'):
+                        self._cancel_plan('suspended');self._live()
             elif command=='play':
+                # Validate before interrupting an existing programme.
+                self.info(data.get('name'))
+                self._cancel_plan('suspended')
                 self._play(data.get('name'),origin='manual',loop=data.get('loop') is True);self.manual_hold=True
             elif command=='pause':
                 if self.status!='playing': raise ValueError('Nessuna traccia in riproduzione')
-                self.position=min(self._position(),max(0,self.duration-0.01));self._terminate();self.status='paused';self.manual_hold=True
+                self.position=self._position();self.bus.pause(True);self.status='paused';self.manual_hold=True
+                self._cancel_plan('suspended');self.origin='manual'
             elif command=='resume':
                 if self.status!='paused': raise ValueError('Nessuna traccia in pausa')
-                self._play(self.track,self.position,'manual',self.loop);self.manual_hold=True
+                self.bus.pause(False);self.status='playing';self.origin='manual';self.manual_hold=True
             elif command=='seek':
                 if self.status not in ('playing','paused'): raise ValueError('Nessuna traccia selezionata')
                 value=data.get('position');was_paused=self.status=='paused'
+                # _play validates position before changing the decoder.
                 self._play(self.track,value,'manual',self.loop);self.manual_hold=True
-                if was_paused:
-                    self.position=float(value);self._terminate();self.status='paused'
+                self._cancel_plan('suspended')
+                if was_paused: self.bus.pause(True);self.status='paused'
             elif command=='loop':
                 if type(data.get('enabled')) is not bool: raise ValueError('Loop non valido')
                 self.loop=data['enabled']
-                if self.status in ('playing','paused'): self.manual_hold=True
+                if self.status in ('playing','paused'):
+                    self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
             elif command=='stop':
-                self._live();self.manual_hold=True
+                self._cancel_plan('suspended');self._live();self.manual_hold=True
             else: raise ValueError('Comando player non valido')
             return self.snapshot()
 
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -209,7 +278,22 @@ class Studio:
             if not isinstance(data,dict): raise ValueError('Evento non valido')
             name=data.get('name','')
             if not isinstance(name,str) or not 1<=len(name.strip())<=100: raise ValueError('Titolo evento obbligatorio (max 100 caratteri)')
-            track=audio_name(data.get('track'));self.info(track)
+            tracks=data.get('tracks',[data.get('track')])
+            if not isinstance(tracks,list) or not 1<=len(tracks)<=100: raise ValueError('Scegliere da 1 a 100 tracce nel gruppo')
+            tracks=[audio_name(track) for track in tracks]
+            for track in tracks: self.info(track)
+            track=tracks[0]
+            end_time=data.get('end_time','')
+            if not isinstance(end_time,str): raise ValueError('Orario di fine non valido')
+            if end_time:
+                try:
+                    end=dt.time.fromisoformat(end_time)
+                    if end.tzinfo or end.second or end.microsecond or len(end_time)!=5: raise ValueError()
+                except (ValueError,TypeError): raise ValueError('Orario di fine non valido')
+            repetitions=data.get('repetitions',1);interval=data.get('interval_seconds',0)
+            if type(repetitions) is not int or not 0<=repetitions<=10000: raise ValueError('Passaggi gruppo: da 0 a 10000')
+            if repetitions==0 and not end_time: raise ValueError('La ripetizione continua richiede un orario di fine')
+            if type(interval) is not int or not 0<=interval<=86400: raise ValueError('Intervallo non valido (0–86400 secondi)')
             try:
                 start=dt.datetime.fromisoformat(data.get('start',''))
                 if start.tzinfo or start.second or start.microsecond: raise ValueError()
@@ -224,71 +308,128 @@ class Studio:
             if not isinstance(event_id,str) or not re_id(event_id): raise ValueError('Identificativo evento non valido')
             if data.get('id') and not self.db.execute('SELECT 1 FROM schedules WHERE id=?',(event_id,)).fetchone(): raise ValueError('Evento non trovato')
             if not data.get('id') and self.db.execute('SELECT count(*) FROM schedules').fetchone()[0]>=200: raise ValueError('Massimo 200 eventi')
-            event={'id':event_id,'name':name.strip(),'track':track,'start':start.isoformat(timespec='minutes'),'recurrence':recurrence,'weekdays':sorted(set(weekdays)),'policy':policy,'enabled':enabled}
+            event={'id':event_id,'name':name.strip(),'track':track,'start':start.isoformat(timespec='minutes'),'recurrence':recurrence,'weekdays':sorted(set(weekdays)),'policy':policy,'enabled':enabled,'tracks':tracks,'end_time':end_time,'repetitions':repetitions,'interval_seconds':interval}
             self.db.execute('INSERT OR REPLACE INTO schedules VALUES(?,?)',(event_id,json.dumps(event)));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
+            if self.plan and self.plan['event']['id']==event_id:
+                self._cancel_plan('interrupted');self._live()
             return event
 
     def delete_event(self,event_id):
         if not isinstance(event_id,str) or not re_id(event_id): raise ValueError('Identificativo evento non valido')
         with self.lock:
+            if self.plan and self.plan['event']['id']==event_id:
+                self._cancel_plan('cancelled');self._live()
             self.db.execute('DELETE FROM schedules WHERE id=?',(event_id,));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
 
     @staticmethod
+    def window(event,now):
+        if not event.get('end_time'): return None
+        zone=ZoneInfo('Europe/Rome');local=now.astimezone(zone);start=dt.datetime.fromisoformat(event['start'])
+        for date in (local.date(),local.date()-dt.timedelta(days=1)):
+            if date<start.date(): continue
+            if event['recurrence']=='once' and date!=start.date(): continue
+            if event['recurrence']=='weekly' and date.weekday() not in event['weekdays']: continue
+            begin=dt.datetime.combine(date,start.time(),zone)
+            if begin.astimezone(dt.timezone.utc).astimezone(zone).replace(tzinfo=None)!=begin.replace(tzinfo=None): continue
+            end=dt.datetime.combine(date,dt.time.fromisoformat(event['end_time']),zone)
+            if end<=begin: end+=dt.timedelta(days=1)
+            if begin.timestamp()<=now.timestamp()<end.timestamp(): return begin,end
+        return None
+
+    @staticmethod
     def occurrence(event,now):
-        local=now.astimezone(ZoneInfo('Europe/Rome'))
-        start=dt.datetime.fromisoformat(event['start'])
+        if event.get('end_time'):
+            window=Studio.window(event,now)
+            return window[0].strftime('%Y-%m-%dT%H:%M') if window else None
+        local=now.astimezone(ZoneInfo('Europe/Rome'));start=dt.datetime.fromisoformat(event['start'])
         if local.date()<start.date(): return None
         if event['recurrence']=='once' and local.date()!=start.date(): return None
         if event['recurrence']=='weekly' and local.weekday() not in event['weekdays']: return None
         if (local.hour,local.minute)!=(start.hour,start.minute): return None
-        # Local occurrence identity intentionally ignores fold: once at fall DST.
         return local.strftime('%Y-%m-%dT%H:%M')
 
     def _record(self,event,occurrence,state,message=''):
         self.db.execute('INSERT OR REPLACE INTO runs VALUES(?,?,?,?,?)',(event['id'],occurrence,time.time(),state,message));self.db.commit()
 
-    def _fire(self,event,occurrence):
+    def _fire(self,event,occurrence,now=None):
+        now=now or dt.datetime.now(dt.timezone.utc)
+        window=self.window(event,now)
+        if event.get('end_time') and not window:
+            self._record(event,occurrence,'skipped','Fascia terminata');return
+        self._cancel_plan()
+        plan={'event':event,'event_id':event['id'],'occurrence':occurrence,'tracks':event.get('tracks',[event['track']]),'index':0,'cycle':1,'repetitions':event.get('repetitions',1),'interval_seconds':event.get('interval_seconds',0),'next_at':None,'end_at':window[1].timestamp() if window else None}
         try:
-            self._play(event['track'],origin='calendar:'+event['id'])
+            self._play(plan['tracks'][0],origin='calendar:'+event['id'],deadline=plan['end_at'])
+            self.plan=plan
+            self.queue=[e for e in self.queue if e['id']!=event['id']]
             self._record(event,occurrence,'started')
         except Exception as error:
-            self.error=str(error);self._record(event,occurrence,'failed',str(error))
+            self.error=str(error);self.plan=None;self._record(event,occurrence,'failed',str(error))
+
+    def _next_track(self,now):
+        plan=self.plan
+        plan['index']+=1
+        if plan['index']>=len(plan['tracks']):
+            if plan['repetitions'] and plan['cycle']>=plan['repetitions']:
+                self._record(plan['event'],plan['occurrence'],'completed');self._live();return
+            plan['index']=0;plan['cycle']+=1
+            if plan['interval_seconds']:
+                self._terminate();self.status='live';self.track=None;self.duration=0;self.position=0
+                plan['next_at']=now.timestamp()+plan['interval_seconds'];return
+        self._play(plan['tracks'][plan['index']],origin='calendar:'+plan['event_id'],deadline=plan['end_at'])
 
     def tick(self,now=None):
         with self.lock:
             now=now or dt.datetime.now(dt.timezone.utc)
-            if self.status=='playing' and self.sender and self.sender.poll() is not None:
-                good=self.sender.returncode==0 and self.encoder.wait(timeout=3)==0
-                track=self.track;loop=self.loop;origin=self.origin
-                if not good:
-                    if self.error_log:
-                        self.error_log.seek(0,2);length=self.error_log.tell();self.error_log.seek(max(0,length-2000));self.error=self.error_log.read().decode(errors='replace')
-                    self._live()
-                elif loop: self._play(track,origin=origin,loop=True)
+            if self.bus and not self.bus.snapshot()['active']:
+                self.error=self.bus.snapshot()['error'] or 'Bus audio non disponibile'
+                self._cancel_plan('failed');self._live()
+            if self.plan and self.plan['end_at'] is not None and now.timestamp()>=self.plan['end_at']:
+                self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live()
+            if self.plan and self.plan['next_at'] is not None and now.timestamp()>=self.plan['next_at']:
+                self.plan['next_at']=None
+                try: self._play(self.plan['tracks'][self.plan['index']],origin='calendar:'+self.plan['event_id'],deadline=self.plan['end_at'])
+                except (OSError,ValueError,subprocess.SubprocessError) as error:
+                    self.error=str(error);self._cancel_plan('failed');self._live()
+            if self.status=='playing' and self.bus and self.bus.snapshot()['music_eof'] and self.encoder and self.encoder.poll() is not None:
+                if self.encoder.returncode!=0:
+                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live()
+                elif self.plan:
+                    try: self._next_track(now)
+                    except (OSError,ValueError,subprocess.SubprocessError) as error:
+                        self.error=str(error);self._cancel_plan('failed');self._live()
+                elif self.loop: self._play(self.track,origin=self.origin,loop=True)
                 else: self._live()
             if not self._setting('enabled'): return
             for event in sorted(self.events(),key=lambda e:(e['start'],e['id'])):
                 if not event['enabled']: continue
                 occurrence=self.occurrence(event,now)
                 if occurrence is None: continue
+                row=self.db.execute('SELECT state FROM runs WHERE event=? AND occurrence=?',(event['id'],occurrence)).fetchone()
+                busy=self.status in ('playing','paused') or self.plan is not None
+                if row:
+                    # An active background window can restart after a monitor restart or manual override.
+                    if event.get('end_time') and row[0] in ('started','interrupted','suspended') and not busy and not self.manual_hold:
+                        self._fire(event,occurrence,now)
+                    continue
+                if self.manual_hold and event.get('end_time'): continue
                 with self.db:
                     cursor=self.db.execute('INSERT OR IGNORE INTO runs VALUES(?,?,?,?,?)',(event['id'],occurrence,time.time(),'claimed',''))
                 if not cursor.rowcount: continue
                 if self.manual_hold:
                     self._record(event,occurrence,'skipped','Regia manuale attiva');continue
-                busy=self.status in ('playing','paused')
                 if busy and event['policy']=='skip': self._record(event,occurrence,'skipped','Player occupato')
                 elif busy and event['policy']=='wait':
-                    event=dict(event,occurrence=occurrence,queued_at=now.timestamp());self.queue.append(event);self._record(event,occurrence,'waiting')
-                else: self._fire(event,occurrence)
+                    self.queue.append(dict(event,occurrence=occurrence,queued_at=now.timestamp()));self._record(event,occurrence,'waiting')
+                else: self._fire(event,occurrence,now)
             for event in list(self.queue):
-                if now.timestamp()-event['queued_at']>900:
-                    self._record(event,event['occurrence'],'skipped','Attesa oltre 15 minuti');self.queue.remove(event)
-            if not self.manual_hold and self.status=='live' and self.queue:
-                event=self.queue.pop(0);self._fire(event,event['occurrence'])
-            # Bound persistent history; old scheduled days cannot be replayed.
+                expired=now.timestamp()-event['queued_at']>900 or event.get('end_time') and not self.window(event,now)
+                if expired:
+                    self._record(event,event['occurrence'],'skipped','Attesa scaduta o fascia terminata');self.queue.remove(event)
+            if not self.manual_hold and self.status=='live' and not self.plan and self.queue:
+                event=self.queue.pop(0);self._fire(event,event['occurrence'],now)
             with self.db: self.db.execute('DELETE FROM runs WHERE time<?',(time.time()-90*86400,))
 
     def _worker(self):
@@ -296,7 +437,7 @@ class Studio:
             try: self.tick()
             except Exception as error:
                 with self.lock: self.error=str(error)
-            self.shutdown.wait(1)
+            self.shutdown.wait(.1)
 
     def devices(self):
         tree=json.loads(run(['lsblk','--json','--paths','--output','NAME,PATH,TYPE,TRAN,RM,FSTYPE,LABEL,MOUNTPOINTS']).stdout)
