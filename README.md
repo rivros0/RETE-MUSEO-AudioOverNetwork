@@ -241,3 +241,181 @@ monitor/nodo viene ripristinato il volume salvato su disco.
 Aggiornare **sia TX sia RX**: i ricevitori precedenti non supportano mute e
 conferme, quindi il solo invio non produrrà una spunta blu. Le conferme tornano
 sulla porta heartbeat UDP 19090; non sono necessarie nuove porte.
+
+## Aggiornare i Raspberry dal computer
+
+`aggiorna_raspberry.py` distribuisce l'installer locale tramite OpenSSH, un nodo
+alla volta. Usa i client `ssh` e `scp` del computer e il wizard del setup via
+terminale: non richiede Paramiko e non contiene password. La versione corrente
+non scarica repository e non confronta automaticamente le versioni dei nodi.
+
+```bash
+python3 aggiorna_raspberry.py --dry-run pi@RX1 pi@RX2 pi@TX
+python3 aggiorna_raspberry.py pi@RX1 pi@RX2 pi@TX
+```
+
+Sostituire i nomi con indirizzi o hostname reali. Senza destinazioni, il programma
+le richiede nel terminale. Sono disponibili `--setup /percorso/setup.sh`,
+`--port 22` e `--identity /percorso/chiave`. Il dry-run mostra i comandi senza
+connettersi. Il wizard conserva la configurazione premendo Invio; l'installer
+resta autonomo e include anche sorgenti e interfaccia della regia.
+
+Prima dell'uso registrare e verificare normalmente le chiavi con `ssh utente@IP`.
+L'aggiornamento crea un backup in `/var/backups/roc-museum-DATA-ORA.XXXXXXXX`
+dei programmi, della configurazione, delle credenziali e del calendario SQLite
+(con l'API di backup SQLite). I file audio restano sul posto e non vengono
+duplicati nel backup per evitare di saturare la microSD. Il ripristino è manuale.
+L'aggiornatore verifica che i due servizi siano attivi e interrompe la sequenza
+al primo errore. È consigliabile aggiornare prima gli RX e per ultimo il TX.
+Se il wizard riavvia un nodo, verificare i servizi alla riconnessione.
+
+## Login regia e caricamento audio dal browser
+
+Lo stato dei dispositivi (`/` e `/api/status`) resta pubblico. Volume, mute,
+conferme dei comandi e libreria richiedono una sessione autenticata.
+Il TX continua a distribuire un solo segnale a tutti gli RX.
+
+Dopo aver aggiornato il TX con il setup, impostare la password tramite SSH:
+
+```bash
+sudo /usr/local/sbin/roc-museum-monitor --set-password
+```
+
+L'utente è `admin`; la password richiede almeno 12 caratteri, viene richiesta
+senza mostrarla e salvata come hash PBKDF2 in un file leggibile solo da root.
+Non esiste una password predefinita: fino alla configurazione i comandi restano
+bloccati. Lo stesso comando permette di cambiare la password; riavviare poi
+`roc-museum-monitor` per invalidare subito tutte le sessioni già aperte.
+Le sessioni durano 8 ore e vengono invalidate anche dal riavvio del servizio.
+
+Nella dashboard, dopo il login, scegliere un file dal computer o telefono e
+premere **Carica sul TX**. I file sono salvati in `/var/lib/roc-museum/media`
+e restano disponibili dopo il riavvio. Sono accettate estensioni WAV, MP3,
+FLAC, OGG, M4A e AAC fino a 512 MB per file; l'estensione non certifica che
+il contenuto sia decodificabile. Non vengono sovrascritti nomi esistenti.
+La copia avviene a blocchi e diventa visibile solo al completamento; vengono
+lasciati almeno 256 MB liberi. Un solo caricamento alla volta.
+
+Il caricamento funziona da qualsiasi browser che possa raggiungere il TX:
+rete locale o accesso remoto tramite VPN. L'HTTP attuale non cifra password
+e audio: per accesso su reti non fidate usare VPN oppure un reverse proxy HTTPS;
+non pubblicare direttamente la porta 8080 su Internet.
+
+I file caricati entrano nella libreria: non avviano automaticamente la
+riproduzione. Player, calendario ed explorer USB sono descritti qui sotto.
+
+Test dedicati: `python3 -m unittest discover -s tests -p test_auth_upload.py -v`.
+
+
+## Regia TX · v4.8
+
+Dopo il login compaiono player, calendario ed explorer USB. Il monitor dei nodi
+rimane consultabile senza login; tutte le nuove API di regia richiedono sessione,
+e le operazioni di modifica richiedono anche il token CSRF della sessione.
+Il setup installa automaticamente FFmpeg, gli strumenti USB e i dati dei fusi orari.
+Non servono librerie Python aggiuntive. Versione minima Python: 3.9.
+
+### Player
+
+Selezionare un file dalla libreria e premere **Riproduci selezione**. Sono
+disponibili pausa, ripresa, ricerca a una posizione in secondi, avanzamento e
+ripetizione della singola traccia. Tutti gli RX ricevono lo stesso segnale.
+Il browser è soltanto il telecomando: il servizio sul TX continua a funzionare
+anche chiudendo la pagina, e più browser osservano lo stesso stato.
+
+FFmpeg decodifica il file come PCM stereo al sample rate configurato e lo passa
+via WAV su standard input a Roc. Il TX ferma prima il servizio Roc dell'ingresso
+mixer, così non trasmette due sorgenti contemporaneamente. Alla fine di una
+traccia non ripetuta, o premendo **Stop / ingresso mixer**, riavvia l'ingresso
+Scarlett. In pausa il sender del player è fermo: gli RX restano senza segnale.
+La posizione visualizzata è una stima del tempo trascorso sul TX, non una misura
+dell'istante di uscita analogica degli RX.
+
+Cambio sorgente, ricerca, ripresa e ripetizione possono avere una breve pausa:
+questa versione non implementa dissolvenze, transizioni senza interruzioni,
+playlist o sovrapposizione di annuncio e sottofondo. Un errore di avvio del player
+ripristina l'ingresso mixer. Il riavvio o arresto del monitor ripristina il mixer;
+le tracce interrotte non ripartono da sole. Senza Scarlett il servizio ingresso
+rimane in attesa del dispositivo, mentre il player può usare i file locali.
+
+### Calendario
+
+Gli eventi persistono in `/var/lib/roc-museum/studio/calendar.sqlite` e possono
+essere creati, modificati, disabilitati o eliminati dalla pagina. Ogni evento
+indica una traccia, una data/ora iniziale nell'ora italiana (`Europe/Rome`) e una
+ricorrenza: una volta, giornaliera oppure settimanale nei giorni selezionati.
+Il calendario generale è **disabilitato per impostazione iniziale** e va attivato
+con **Abilita / riprendi programma**. La sua abilitazione persiste al riavvio.
+
+I comandi manuali di riproduzione, pausa, ricerca, stop o loop durante una traccia
+sospendono l'esecuzione degli eventi. **Abilita / riprendi programma** conclude
+l'eventuale traccia manuale, torna al mixer e libera l'automazione. La sospensione
+manuale è temporanea e non persiste dopo un riavvio del monitor.
+
+Quando il player è occupato, la priorità dell'evento può essere:
+
+- **Salta**: registra l'evento come saltato.
+- **Attendi**: mette l'evento in coda fino a fine traccia, per massimo 15 minuti.
+- **Interrompi**: interrompe la traccia attuale e avvia quella programmata.
+
+Il mixer è considerato sorgente disponibile, non player occupato. Le tracce
+interrotte non vengono riprese automaticamente e una traccia programmata torna
+al mixer al termine. Gli eventi nello stesso minuto vengono ordinati per data
+iniziale e identificativo. Un loop occupa il player fino al comando manuale o a
+un evento interrompente. Disabilitare il calendario ferma una traccia avviata dal
+calendario e cancella la coda; non ferma una traccia manuale.
+
+Il servizio controlla gli eventi ogni secondo. Un evento può partire durante
+il minuto indicato (ritardo massimo normale inferiore a un secondo, se il TX è
+libero); al riavvio non recupera minuti già passati né la coda precedente.
+Un registro persistente impedisce di eseguire due volte la stessa occorrenza,
+anche dopo un riavvio o al ritorno dall'ora legale. Nell'ora primaverile inesistente
+l'evento viene saltato. Il registro mostra gli ultimi 30 eventi e conserva 90
+giorni di storico. Non è una garanzia di esecuzione in caso di blackout: il
+registro viene salvato prima dell'avvio per evitare duplicazioni.
+
+L'orologio del Raspberry deve essere corretto. Verificare la sincronizzazione
+NTP; per installazioni isolate dalla rete valutare un RTC. Nessun collegamento
+a Internet è richiesto per riprodurre brani o leggere il calendario locale.
+
+### Explorer USB
+
+Premere **Rileva pennette**, selezionare un dispositivo e **Apri**. Il TX riconosce
+i filesystem FAT, exFAT, NTFS, ext2/3/4 e ISO9660 su dispositivi USB. Esclude i
+dischi usati dal sistema operativo. Le nuove unità sono montate con
+`ro,nosuid,nodev,noexec` sotto `/run/roc-museum-usb`; le unità già montate in
+`/media` o `/run/media` possono essere consultate senza modificarne il mount.
+Non vengono mostrati file nascosti o link simbolici; i percorsi restano confinati
+al dispositivo selezionato, anche durante l'apertura del file.
+
+Aprire le cartelle e premere **Importa** accanto al brano. La copia è completata
+e resa visibile nella libreria prima di poterla riprodurre. Limiti di dimensione,
+spazio libero e nomi duplicati sono gli stessi dell'upload dal browser. La copia
+USB e l'upload condividono il blocco: uno solo può essere attivo alla volta.
+**Espelli** smonta le unità montate dalla regia; per quelle montate dal desktop
+occorre l'espulsione dal sistema operativo. Rimozione improvvisa o copia fallita
+non lasciano un brano parziale visibile nella libreria.
+
+### Sviluppo e verifica
+
+`studio.py` e `studio.html` sono i sorgenti della regia. Dopo una modifica,
+rigenerare la copia incorporata nell'installer autonomo:
+
+```bash
+python3 tools/embed_studio.py
+bash -n setup_roc_museum.sh
+python3 -m unittest discover -s tests -v
+```
+
+La suite verifica login, CSRF, upload, priorità, persistenza, ora legale,
+confinamento USB, copia e ripristino del mixer. Se disponibile un eseguibile Roc,
+attivare anche il test di integrazione reale su UDP localhost:
+
+```bash
+ROC_SEND_BINARY=/usr/bin/roc-send python3 -m unittest discover -s tests -p test_studio.py -v
+```
+
+Il test reale usa FFmpeg e verifica la ricezione di pacchetti RTP L16; non usa
+ALSA, non cambia servizi reali e non contatta i Raspberry. Rimane da collaudare
+sull'hardware il passaggio Scarlett/player, il comportamento degli RX durante
+le pause e il montaggio/espulsione delle pennette effettivamente in uso.
