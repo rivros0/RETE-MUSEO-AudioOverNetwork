@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+
+# Credenziali SSH locali: preservate durante pull e aggiornamenti.
+/aggiorna_raspberry.local.json

@@ -1,65 +1,133 @@
-"""Test the current OpenSSH updater CLI; no network or Raspberry required."""
-import argparse
+"""Verifiche del gestore, senza rete e senza modificare Raspberry."""
 import importlib.util
 import subprocess
-import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock,patch
+from unittest.mock import Mock, patch
 
-spec=importlib.util.spec_from_file_location('updater',Path(__file__).resolve().parents[1]/'aggiorna_raspberry.py')
-updater=importlib.util.module_from_spec(spec);spec.loader.exec_module(updater)
+spec = importlib.util.spec_from_file_location('updater', Path(__file__).resolve().parents[1] / 'aggiorna_raspberry.py')
+updater = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(updater)
+
 
 class UpdaterTests(unittest.TestCase):
-    def test_destinations_reject_shell_and_options(self):
-        for invalid in ('-oProxyCommand=x','pi@host;touch x','host/path','pi@host:22','a b','$(id)'):
-            with self.assertRaises(argparse.ArgumentTypeError): updater.destinazione(invalid)
-        for valid in ('pi@192.168.1.50','tx.local','museo-tx'):
-            self.assertEqual(updater.destinazione(valid),valid)
+    def test_numeric_versions(self):
+        self.assertGreater(updater.numero('4.10'), updater.numero('4.9'))
+        self.assertEqual(updater.numero('4.7.0'), updater.numero('4.7'))
+        self.assertLess(updater.numero('4.7'), updater.numero('4.7.1'))
 
-    def test_dry_run_never_invokes_process(self):
-        with patch.object(updater.subprocess,'run') as command,patch('builtins.print'):
-            updater.aggiorna('pi@tx',Path('/tmp/setup.sh'),22,None,True)
-        command.assert_not_called()
+    def test_version_sources(self):
+        self.assertEqual(updater.versione('VERSION="4.7"\n'), '4.7')
+        self.assertEqual(updater.versione('SOFTWARE_VERSION="4.6"\n', True), '4.6')
+        self.assertEqual(updater.versione('# RETE MUSEO - AudioOverNetwork - setup v4.5\n', True), '4.5')
+        with self.assertRaises(updater.ErroreNodo):
+            updater.versione('VERSION="unknown"')
 
-    def test_update_copies_installs_and_cleans(self):
-        with patch.object(updater.subprocess,'run',return_value=Mock(stdout='/tmp/roc-museum.Ab12\n')) as command:
-            updater.aggiorna('pi@tx',Path('/tmp/setup.sh'),2222,Path('/tmp/key'),False)
-        calls=[c.args[0] for c in command.call_args_list]
-        self.assertEqual([c[0] for c in calls],['ssh','scp','ssh','ssh'])
-        self.assertIn('2222',calls[0]);self.assertIn('/tmp/key',calls[0])
-        self.assertIn('pi@tx:/tmp/roc-museum.Ab12/setup_roc_museum.sh',calls[1])
-        self.assertIn('sudo bash -c',calls[2][-1]);self.assertIn('/var/backups/roc-museum-',calls[2][-1])
-        self.assertIn('systemctl is-active roc-museum-monitor.service',calls[2][-1])
-        self.assertIn('rmdir',calls[3][-1])
+    def test_config_does_not_execute_shell(self):
+        with self.assertRaises(updater.ErroreNodo):
+            updater.configurazione('ROLE="rx"\nNODE_NAME="$(touch /tmp/no)"\nTX_IP="192.168.1.50"')
+        config = updater.configurazione('ROLE="rx"\nNODE_NAME="Sala 1"\nTX_IP="192.168.1.50"')
+        self.assertEqual(config['NODE_NAME'], 'Sala 1')
 
-    def test_untrusted_remote_temp_rejected(self):
-        with patch.object(updater.subprocess,'run',return_value=Mock(stdout='/tmp/bad; touch /x')) as command:
-            with self.assertRaises(RuntimeError): updater.aggiorna('pi@tx',Path('setup'),22,None,False)
-        self.assertEqual(command.call_count,1)
+    def run_node(self, local, latest, check=False, connection_error=None):
+        class SSHError(Exception):
+            pass
+        class AuthError(SSHError):
+            pass
+        class KeyErrorSSH(SSHError):
+            pass
+        class NoConnection(SSHError):
+            pass
+        client = Mock()
+        if connection_error:
+            client.connect.side_effect = connection_error
+        api = types.SimpleNamespace(SSHClient=Mock(return_value=client),
+                                    RejectPolicy=Mock(), AuthenticationException=AuthError,
+                                    BadHostKeyException=KeyErrorSSH, SSHException=SSHError,
+                                    ssh_exception=types.SimpleNamespace(NoValidConnectionsError=NoConnection))
+        ui = Mock()
+        config = f'SOFTWARE_VERSION="{local}"\nROLE="tx"\nNODE_NAME="TX"\n'
+        updated = f'SOFTWARE_VERSION="{latest}"\n'
+        with patch.object(updater, 'comando', side_effect=[config, updated]), patch.object(updater, 'aggiorna') as update:
+            result = updater.esamina('pi@192.168.1.50', 'secret', Path('setup'), latest, ui, check, api)
+        client.close.assert_called_once()
+        return result, update, ui
 
-    def test_failed_copy_still_cleans(self):
-        failure=subprocess.CalledProcessError(1,['scp'])
-        with patch.object(updater.subprocess,'run',side_effect=[Mock(stdout='/tmp/roc-museum.Ab12'),failure,Mock()]) as command:
-            with self.assertRaises(subprocess.CalledProcessError): updater.aggiorna('pi@tx',Path('setup'),22,None,False)
-        self.assertIn('rmdir',command.call_args.args[0][-1])
+    def test_old_node_updated_and_verified(self):
+        result, update, ui = self.run_node('4.6', '4.7')
+        self.assertTrue(result)
+        update.assert_called_once()
+        self.assertEqual(ui.mostra.call_args.args[1], 'Aggiornato')
 
-    def test_cleanup_timeout_preserves_original_error(self):
-        with patch.object(updater.subprocess,'run',side_effect=[Mock(stdout='/tmp/roc-museum.Ab12'),subprocess.CalledProcessError(1,['scp']),subprocess.TimeoutExpired('ssh',25)]),patch('builtins.print'):
-            with self.assertRaises(subprocess.CalledProcessError): updater.aggiorna('pi@tx',Path('setup'),22,None,False)
+    def test_current_and_newer_nodes_skipped(self):
+        for local in ('4.7', '4.10'):
+            result, update, ui = self.run_node(local, '4.7')
+            self.assertTrue(result)
+            update.assert_not_called()
 
-    def test_main_stops_after_failed_node(self):
-        with tempfile.TemporaryDirectory() as directory:
-            setup=Path(directory)/'setup.sh';setup.write_text('# setup')
-            with patch.object(updater.shutil,'which',return_value='/usr/bin/ssh'),patch.object(updater,'aggiorna',side_effect=RuntimeError('offline')) as update,patch('builtins.print'):
-                self.assertEqual(updater.main(['--setup',str(setup),'pi@one','pi@two']),1)
-            self.assertEqual(update.call_count,1)
+    def test_check_only_never_updates(self):
+        result, update, ui = self.run_node('4.6', '4.7', check=True)
+        self.assertTrue(result)
+        update.assert_not_called()
+        self.assertEqual(ui.mostra.call_args.args[1], 'Da aggiornare')
 
-    def test_main_deduplicates_hosts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            setup=Path(directory)/'setup.sh';setup.write_text('# setup')
-            with patch.object(updater.shutil,'which',return_value='/usr/bin/ssh'),patch.object(updater,'aggiorna') as update,patch('builtins.print'):
-                self.assertEqual(updater.main(['--setup',str(setup),'--dry-run','pi@one','pi@one','pi@two']),0)
-            self.assertEqual(update.call_count,2)
+    def test_unreachable_reported(self):
+        result, update, ui = self.run_node('4.6', '4.7', connection_error=TimeoutError())
+        self.assertFalse(result)
+        update.assert_not_called()
+        self.assertEqual(ui.mostra.call_args.args[1], 'Non raggiungibile')
 
-if __name__=='__main__': unittest.main()
+    def test_invalid_online_version_stops_before_nodes(self):
+        with patch.object(updater.subprocess, 'run'), self.assertRaises(updater.ErroreNodo):
+            with __import__('tempfile').TemporaryDirectory() as folder:
+                target = Path(folder)
+                (target / 'setup.sh').write_text('VERSION="invalid"')
+                with patch.object(updater, 'PERCORSO_SETUP', 'setup.sh'):
+                    updater.scarica_repository(target)
+
+class LocalCredentialsTests(unittest.TestCase):
+    def test_project_nodes_preserved(self):
+        self.assertEqual(list(updater.RASPBERRY),['pi@192.168.1.91','pi@192.168.1.92','pi@192.168.1.90'])
+
+    def test_passwords_stay_in_private_file(self):
+        import tempfile,stat,json
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'private.json';nodes={'pi@host':'test-only-password'}
+            updater.salva_credenziali(path,nodes)
+            self.assertEqual(updater.carica_credenziali(path),nodes)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode),0o600)
+            self.assertEqual(json.loads(path.read_text())['raspberry'],nodes)
+
+    def test_configure_blank_keeps_existing_password(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'private.json'
+            with patch.object(updater.getpass,'getpass',return_value=''),patch('builtins.print'):
+                updater.configura_password(path,{'pi@host':'previous-test-only'})
+            self.assertEqual(updater.carica_credenziali(path)['pi@host'],'previous-test-only')
+
+    def test_invalid_config_does_not_echo_secret(self):
+        import tempfile,json
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'private.json';path.write_text(json.dumps({'raspberry':{'bad host':'private-test-value'}}))
+            with self.assertRaises(updater.ErroreNodo) as error: updater.carica_credenziali(path)
+            self.assertNotIn('private-test-value',str(error.exception))
+
+    def test_main_uses_local_passwords_not_empty_defaults(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'private.json';updater.salva_credenziali(path,{'pi@host':'local-test-only'})
+            with patch.object(updater.shutil,'which',return_value='/tool'),patch.dict('sys.modules',{'paramiko':types.SimpleNamespace()}),patch.object(updater,'scarica_repository',return_value=(Path('setup'),'4.8')),patch.object(updater,'esamina',return_value=True) as inspect,patch('builtins.print'):
+                self.assertEqual(updater.main(['--config',str(path),'--check-only']),0)
+            self.assertEqual(inspect.call_args.args[1],'local-test-only')
+
+    def test_newline_password_rejected(self):
+        import tempfile,json
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/'private.json';path.write_text(json.dumps({'raspberry':{'pi@host':'line\nbreak'}}))
+            with self.assertRaises(updater.ErroreNodo): updater.carica_credenziali(path)
+
+
+if __name__ == '__main__':
+    unittest.main()
