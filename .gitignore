@@ -3,3 +3,8 @@ __pycache__/
 
 # Credenziali SSH locali: preservate durante pull e aggiornamenti.
 /aggiorna_raspberry.local.json
+
+# Tool indipendente: https://github.com/rivros0/SSH-Update-Manager
+/aggiorna_raspberry.py
+/aggiorna_raspberry.example.json
+/tests/test_updater.py

@@ -244,56 +244,15 @@ sulla porta heartbeat UDP 19090; non sono necessarie nuove porte.
 
 ## Aggiornare i Raspberry dal computer
 
-`aggiorna_raspberry.py` legge l'ultima versione dalla repository configurata,
-confronta numericamente le versioni installate e aggiorna solo i nodi più vecchi.
-Mostra una tabella nel terminale con versione locale/online, avanzamento ed esito;
-un nodo irraggiungibile viene segnalato senza impedire il controllo dei successivi.
-
-La configurazione di progetto è già ripristinata:
-
-- Repository: `https://github.com/rivros0/RETE-MUSEO-AudioOverNetwork.git`
-- Ramo: `main`; installer: `setup_roc_museum.sh`.
-- RX1: `pi@192.168.1.91`; RX2: `pi@192.168.1.92`; TX: `pi@192.168.1.90`.
-
-Le password sono nel file **locale** `aggiorna_raspberry.local.json`, escluso da
-Git e creato con permessi `0600`. Gli aggiornamenti del sorgente non sostituiscono
-quel file. Non inserire password nel sorgente da pubblicare. Il file
-`aggiorna_raspberry.example.json` contiene soltanto indirizzi e password vuote.
-Le password non presenti nelle copie storiche non sono recuperabili dal gestore.
-
-Per configurarle senza mostrarle a schermo:
-
-```bash
-python3 aggiorna_raspberry.py --configure
-```
-
-Se una password è già salvata, Invio la mantiene. Per aggiungere o cambiare nodi,
-modificare il dizionario `raspberry` nel file locale. `--config /percorso/file.json`
-permette di usare un altro file personale; non pubblicarlo nella repository.
-La stessa password viene utilizzata per SSH e sudo, come nel gestore originale.
-
-Serve Paramiko sul computer che esegue il programma, oltre a Git e Bash:
-
-```bash
-sudo apt install python3-paramiko
-python3 aggiorna_raspberry.py --check-only
-python3 aggiorna_raspberry.py
-```
-
-In alternativa installare Paramiko in un ambiente virtuale. Non usare pip globale
-con `sudo`. `--check-only` (alias `--dry-run`) scarica il setup e legge le versioni
-via SSH senza modificare i Raspberry. Senza opzioni esegue gli aggiornamenti.
-Prima del primo uso verificare e registrare normalmente le chiavi dei Raspberry
-con `ssh utente@IP`; il gestore rifiuta chiavi sconosciute o cambiate.
-
-L'aggiornamento non richiede il wizard: conserva ruolo, nome e IP TX dai dati del
-nodo. Crea un backup in `/var/backups/roc-museum-DATA-ORA.XXXXXXXX` dei programmi,
-della configurazione, delle credenziali della regia e del calendario SQLite,
-con l'API di backup SQLite. I file audio restano sul posto e non sono duplicati
-nel backup. Il ripristino è manuale. Infine verifica versione installata e servizi.
-Gli RX vengono controllati prima del TX. L'audio si interrompe durante il setup;
-il programma non riavvia automaticamente i Raspberry. Un timeout può lasciare
-un comando remoto attivo: verificare il nodo prima di riprovare.
+L’aggiornatore è un progetto indipendente:
+[SSH-Update-Manager](https://github.com/rivros0/SSH-Update-Manager).
+Il tool generico e i suoi test sono gestiti nella repository separata.
+Le copie preesistenti dell’aggiornatore specifico e le credenziali locali restano
+sul computer, escluse da Git, per preservare l’avvio già configurato.
+Questa repository mantiene l’applicazione AON e l’installer
+`setup_roc_museum.sh`, che l’aggiornatore scarica e distribuisce ai Raspberry.
+Le istruzioni e la configurazione delle credenziali sono nel README del tool;
+le password restano soltanto nel file locale escluso da Git.
 
 ## Login regia e caricamento audio dal browser
 
