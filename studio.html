@@ -1,23 +1,30 @@
 <section id="studioTools" class="box" hidden style="margin:18px 0">
 <style>
 .box button,.box input,.box select{font:inherit;color:#e5e7eb;background:#111827;border:1px solid #6b7280;border-radius:6px;padding:8px;margin:4px;max-width:100%;box-sizing:border-box}.box button{cursor:pointer}.box button:hover{border-color:#60a5fa}.box button:disabled{opacity:.5;cursor:wait}
-#studioTools h3{margin-top:28px}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
+#studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
-<h3>Player</h3><p id="playerState" aria-live="polite">Caricamento…</p>
+<section class="studioPanel" aria-labelledby="instantPlayerTitle">
+<h3 id="instantPlayerTitle">Player istantaneo</h3>
+<p class="hint">Riproduzione immediata dalla libreria, indipendente dagli eventi programmati.</p>
+<p id="playerState" aria-live="polite">Caricamento…</p>
 <label>Traccia <select id="trackSelect" aria-label="Traccia dalla libreria"></select></label>
 <button data-player="play">▶ Riproduci selezione</button><button data-player="pause">Pausa musica</button><button data-player="resume">Riprendi traccia</button><button data-player="stop">Stop musica / solo microfono</button>
 <label><input type="checkbox" id="playerLoop"> Ripeti traccia</label>
 <progress id="playerProgress" max="1" value="0" style="width:100%" aria-label="Avanzamento traccia"></progress>
 <form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form>
 <p id="groupState"></p>
+</section>
 <h3>Annunci dal microfono · ducking</h3>
 <p id="microphoneState" role="status"></p>
 <form id="duckingForm"><label><input name="enabled" type="checkbox" checked> Abbassa automaticamente la musica durante gli annunci</label>
 <label>Soglia voce (dBFS) <input name="threshold_db" type="number" min="-60" max="-6" step="1" value="-36" required></label>
 <label>Attenuazione musica (dB) <input name="reduction_db" type="number" min="-40" max="0" step="1" value="-18" required></label><button>Applica ducking</button></form>
 <p class="hint">Il microfono non viene attenuato dal ducking. Se il rumore di fondo fa abbassare la musica, alza la soglia (per esempio da −36 a −30 dBFS). Il volume della musica torna gradualmente normale dopo l’annuncio.</p>
+<details id="scheduledEventsPanel" class="scheduledPanel">
+<summary><span>Eventi programmati</span><span id="scheduledEventsMeta" class="scheduledMeta">caricamento…</span></summary>
+<div class="scheduledBody">
 <h3>Calendario · Europe/Rome</h3><p id="automationState"></p>
 <button id="enableAuto">Abilita / riprendi programma</button><button id="disableAuto">Disabilita programma</button>
 <p class="hint">I comandi manuali sospendono il calendario fino a “Riprendi programma”. Una fascia ancora attiva riparte dall’inizio del gruppo. Il microfono resta sempre disponibile.</p>
@@ -40,6 +47,8 @@
 <label><input name="enabled" type="checkbox" checked> Evento abilitato</label><button>Salva evento</button><button type="button" id="cancelEvent">Annulla modifica</button></fieldset></form>
 <div class="scroll"><table><thead><tr><th>Evento</th><th>Fascia / ricorrenza</th><th>Tracce / ripetizioni</th><th>Azioni</th></tr></thead><tbody id="eventRows"></tbody></table></div>
 <details><summary>Registro eventi (ultimi 30)</summary><ul id="eventHistory"></ul></details>
+</div>
+</details>
 <h3>Explorer USB</h3><button id="scanUSB">Rileva pennette</button><label>Dispositivo <select id="usbDevice"></select></label><button id="openUSB">Apri</button><button id="ejectUSB">Espelli</button>
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
@@ -98,6 +107,7 @@ async function update(){
     el('automationState').textContent=(s.automation_enabled?'Calendario abilitato':'Calendario disabilitato')+(s.manual_hold?' · sospeso dalla regia manuale':'')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');
     el('nextEvents').textContent='Prossimi eventi: '+(s.next_events||[]).map(function(e){return e.name+' · '+new Date(e.at).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}).join(' | ');
     currentEvents=s.events;renderEvents();el('eventHistory').replaceChildren();
+    el('scheduledEventsMeta').textContent=currentEvents.length+' '+(currentEvents.length===1?'evento':'eventi')+' · '+(s.automation_enabled?'programma attivo':'programma disabilitato');
     var states={started:'avviato',completed:'completato',skipped:'saltato',waiting:'in attesa',interrupted:'interrotto',suspended:'sospeso',failed:'errore',cancelled:'annullato'};
     s.history.forEach(function(e){var li=document.createElement('li'),event=s.events.find(function(v){return v.id===e.event;});li.textContent=(event?event.name:e.event)+' · '+e.occurrence+' · '+(states[e.state]||e.state)+(e.message?' · '+e.message:'');el('eventHistory').appendChild(li);});
   }catch(error){message(error.message);}finally{inFlight=false;}
@@ -113,7 +123,7 @@ function renderEvents(){
       var form=el('eventForm');['id','name','start','recurrence','policy'].forEach(function(k){form.elements.namedItem(k).value=e[k];});
       form.elements.namedItem('track').value=tracks[0];form.elements.namedItem('end_time').value=e.end_time||'';form.elements.namedItem('repetitions').value=repetitions;form.elements.namedItem('interval_seconds').value=e.interval_seconds||0;
       form.elements.namedItem('enabled').checked=e.enabled;eventTracks=tracks.slice();renderPlaylist();
-      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';form.scrollIntoView({behavior:'smooth'});
+      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';el('scheduledEventsPanel').open=true;form.scrollIntoView({behavior:'smooth'});
     }));
     actions.appendChild(button('Elimina evento',function(){if(confirm('Eliminare l’evento '+e.name+'?'))perform(async function(){await api('/api/calendar/delete',{id:e.id});await update();});}));
     tr.appendChild(actions);el('eventRows').appendChild(tr);
