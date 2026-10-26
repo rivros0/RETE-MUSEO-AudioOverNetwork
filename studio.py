@@ -69,20 +69,35 @@ class Studio:
         self.origin='mixer';self.error='';self.queue=[];self.manual_hold=False
         self.shutdown=threading.Event();self.metadata={};self.thread=None
         self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
-        self.resume_saved=0.
+        self.resume_saved=0.;self.restore_thread=None
 
     def start(self):
         try:
             self._ensure_audio()
         except Exception as error:
-            self.error=str(error);self._live(clear_resume=False)
-        else:
-            self._restore_playback_resume()
+            self.error=str(error)
+            try: self._live(clear_resume=False)
+            except Exception as fallback:
+                self.error=str(error)+' · fallback live: '+str(fallback)
         self.thread=threading.Thread(target=self._worker,daemon=True);self.thread.start()
+        # Never block dashboard startup while probing/decoding the saved track.
+        self.restore_thread=threading.Thread(target=self._restore_after_start,daemon=True)
+        self.restore_thread.start()
+
+    def _restore_after_start(self):
+        try:
+            with self.lock:
+                if self.shutdown.is_set(): return
+                self._restore_playback_resume()
+        except Exception as error:
+            with self.lock:
+                self.error='Ripristino player non riuscito: '+str(error)
 
     def close(self):
         self.shutdown.set()
         if self.thread: self.thread.join(timeout=5)
+        if self.restore_thread and self.restore_thread is not threading.current_thread():
+            self.restore_thread.join(timeout=5)
         with self.lock:
             if self.status in ('playing','paused') and self.origin=='manual':
                 self._save_playback_resume(force=True)
