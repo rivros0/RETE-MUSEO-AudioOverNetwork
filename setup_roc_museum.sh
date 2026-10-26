@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.11
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.12
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.11"
+VERSION="4.12"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -526,6 +526,9 @@ def run(command):
         return completed.returncode,completed.stdout.strip()
     except (OSError,subprocess.TimeoutExpired):
         return 127,""
+
+def esc_html(value):
+    return str(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;").replace("'","&#39;")
 
 def read_text(path):
     try:
@@ -1151,17 +1154,24 @@ def main():
     heartbeat=threading.Thread(target=heartbeat_loop,args=(config,),daemon=True);heartbeat.start()
     if role=="tx":
         listener=threading.Thread(target=listener_loop,args=(config,),daemon=True);listener.start()
+        Handler.config=config
+        # Compose the complete TX page before starting the audio engine.
+        # Login and studio controls must remain visible even if Studio cannot start.
+        try:
+            snippet=Path("/usr/local/share/roc-museum/studio.html").read_text()
+            Handler.page=PAGE.replace('<div id="summary"',snippet+'<div id="summary"')
+        except Exception as error:
+            Handler.page=PAGE.replace('<div id="summary"','<section class="box"><h2>Regia TX</h2><p>Interfaccia regia non disponibile: '+esc_html(str(error))+'</p></section><div id="summary"')
+            print("Interfaccia regia non disponibile: "+str(error),flush=True)
         try:
             import importlib.util
             spec=importlib.util.spec_from_file_location("roc_studio","/usr/local/lib/roc-museum/studio.py")
             module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
             engine=module.Studio(config,media=MEDIA_DIR,copy_lock=UPLOAD_LOCK)
-            engine.start();STUDIO=engine;Handler.studio=engine
-            snippet=Path("/usr/local/share/roc-museum/studio.html").read_text()
-            Handler.page=PAGE.replace('<div id="summary"',snippet+'<div id="summary"')
+            STUDIO=engine;Handler.studio=engine
+            engine.start()
         except Exception as error:
             print("Regia non disponibile: "+str(error),flush=True)
-        Handler.config=config
         port=int(config.get("MONITOR_HTTP_PORT","8080"))
         server=ThreadingHTTPServer(("0.0.0.0",port),Handler)
         print("Dashboard in ascolto sulla porta "+str(port),flush=True)
