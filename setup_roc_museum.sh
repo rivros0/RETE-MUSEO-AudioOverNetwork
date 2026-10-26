@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.12
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.13
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.12"
+VERSION="4.13"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,6 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
+MONITOR_BUILD="4.13"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -969,10 +970,24 @@ setInterval(renderTxClock,1000);
 PAGE=PAGE.replace('<script>function esc','<script>'+CLOCK_JS+'function esc',1)
 PAGE=PAGE.replace("var data=await response.json();var okCount", "var data=await response.json();syncTxClock(data.generated_at);var okCount",1)
 
+def build_tx_page():
+    page=PAGE
+    # Defensive composition: login must always be present on the TX page.
+    if 'id="login"' not in page:
+        page=page.replace('<div id="summary"',REGIA_UI+'<div id="summary"',1)
+    try:
+        snippet=Path("/usr/local/share/roc-museum/studio.html").read_text()
+        if 'id="studioTools"' not in page:
+            page=page.replace('<div id="summary"',snippet+'<div id="summary"',1)
+    except Exception as error:
+        if 'id="studioTools"' not in page:
+            message='<section class="box"><h2>Regia TX</h2><p>Interfaccia player non disponibile: '+esc_html(str(error))+'</p></section>'
+            page=page.replace('<div id="summary"',message+'<div id="summary"',1)
+    return page
+
 class Handler(BaseHTTPRequestHandler):
     config={}
     studio=None
-    page=None
     def log_message(self,fmt,*args): return
     def reply(self,code,content_type,payload):
         self.send_response(code);self.send_header("Content-Type",content_type);self.send_header("Cache-Control","no-store");self.send_header("Content-Length",str(len(payload)));self.end_headers();self.wfile.write(payload)
@@ -1014,7 +1029,11 @@ class Handler(BaseHTTPRequestHandler):
             if MEDIA_DIR.exists():
                 files=[{"name":p.name,"size":p.stat().st_size} for p in sorted(MEDIA_DIR.iterdir()) if p.is_file() and not p.is_symlink() and not p.name.startswith(".")]
             self.json_reply(200,{"files":files});return
-        if self.path=="/" or self.path=="/index.html": self.reply(200,"text/html; charset=utf-8",(self.page or PAGE).encode("utf-8"));return
+        if self.path=="/" or self.path=="/index.html":
+            page=build_tx_page() if self.config.get("ROLE")=="tx" else PAGE
+            self.reply(200,"text/html; charset=utf-8",page.encode("utf-8"));return
+        if self.path=="/api/version":
+            self.json_reply(200,{"monitor_build":MONITOR_BUILD,"software_version":self.config.get("SOFTWARE_VERSION",""),"role":self.config.get("ROLE","")});return
         if self.path=="/api/status": self.reply(200,"application/json; charset=utf-8",json.dumps(system_status(self.config),indent=2).encode("utf-8"));return
         if self.path.startswith("/api/control/"):
             if not self.require_auth(): return
@@ -1155,14 +1174,6 @@ def main():
     if role=="tx":
         listener=threading.Thread(target=listener_loop,args=(config,),daemon=True);listener.start()
         Handler.config=config
-        # Compose the complete TX page before starting the audio engine.
-        # Login and studio controls must remain visible even if Studio cannot start.
-        try:
-            snippet=Path("/usr/local/share/roc-museum/studio.html").read_text()
-            Handler.page=PAGE.replace('<div id="summary"',snippet+'<div id="summary"')
-        except Exception as error:
-            Handler.page=PAGE.replace('<div id="summary"','<section class="box"><h2>Regia TX</h2><p>Interfaccia regia non disponibile: '+esc_html(str(error))+'</p></section><div id="summary"')
-            print("Interfaccia regia non disponibile: "+str(error),flush=True)
         try:
             import importlib.util
             spec=importlib.util.spec_from_file_location("roc_studio","/usr/local/lib/roc-museum/studio.py")
@@ -2202,6 +2213,7 @@ print_diagnostics() {
     if [ "$ROLE" = "tx" ]; then
         echo "Dashboard           : http://${local_ip:-IP-TX}:${MONITOR_HTTP_PORT}/"
         echo "API                 : http://${local_ip:-IP-TX}:${MONITOR_HTTP_PORT}/api/status"
+        echo "Versione monitor     : http://${local_ip:-IP-TX}:${MONITOR_HTTP_PORT}/api/version"
     else
         echo "Monitor TX          : ${TX_IP}:${MONITOR_PORT}/UDP"
     fi
