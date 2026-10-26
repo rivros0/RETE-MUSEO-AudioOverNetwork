@@ -308,6 +308,16 @@ ripetizione della singola traccia. Tutti gli RX ricevono lo stesso segnale.
 Il browser è soltanto il telecomando: il servizio sul TX continua a funzionare
 anche chiudendo la pagina, e più browser osservano lo stesso stato.
 
+Dalla **v4.10** la riproduzione manuale è persistente rispetto a riavvii del TX
+o del servizio: il sistema salva periodicamente brano, posizione, stato play/pausa
+e loop. Se il TX si riavvia mentre una traccia manuale è in riproduzione, al ritorno
+riprende automaticamente dallo stesso brano e da una posizione prossima a quella
+salvata. Se era in pausa, torna in pausa. Un comando **Stop** esplicito cancella
+lo stato da ripristinare. Le fasce del calendario continuano invece a usare la
+logica già prevista: una fascia ancora valida può ripartire secondo il proprio
+programma, mentre una fascia scaduta non viene riattivata.
+
+
 FFmpeg decodifica la musica in PCM stereo. Un bus Python mantiene aperta
 l'acquisizione `arecord` della Scarlett e un solo sender Roc, miscelando microfono
 e musica. Il microfono rimane udibile durante play, pausa, stop, ricerca, cambio
