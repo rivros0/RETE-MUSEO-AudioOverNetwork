@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.9
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.10
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.9"
+VERSION="4.10"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -1244,17 +1244,23 @@ class Studio:
         self.origin='mixer';self.error='';self.queue=[];self.manual_hold=False
         self.shutdown=threading.Event();self.metadata={};self.thread=None
         self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
+        self.resume_saved=0.
 
     def start(self):
-        try: self._ensure_audio()
+        try:
+            self._ensure_audio()
         except Exception as error:
-            self.error=str(error);self._live()
+            self.error=str(error);self._live(clear_resume=False)
+        else:
+            self._restore_playback_resume()
         self.thread=threading.Thread(target=self._worker,daemon=True);self.thread.start()
 
     def close(self):
         self.shutdown.set()
         if self.thread: self.thread.join(timeout=5)
         with self.lock:
+            if self.status in ('playing','paused') and self.origin=='manual':
+                self._save_playback_resume(force=True)
             self._terminate()
             if self.bus: self.bus.close();self.bus=None
             self.bus_marker.unlink(missing_ok=True)
@@ -1292,6 +1298,52 @@ class Studio:
     def _store_setting(self,key,value):
         self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,json.dumps(value)));self.db.commit()
 
+    def _clear_playback_resume(self):
+        self._store_setting('resume_playback',None)
+        self.resume_saved=0.
+
+    def _save_playback_resume(self,force=False):
+        now=time.time()
+        if not force and now-self.resume_saved<2:
+            return
+        if self.status not in ('playing','paused') or self.origin!='manual' or not self.track:
+            return
+        state={'status':self.status,'track':self.track,'position':round(self._position(),2),
+               'loop':bool(self.loop),'manual_hold':bool(self.manual_hold),'saved_at':now}
+        self._store_setting('resume_playback',state)
+        self.resume_saved=now
+
+    def _restore_playback_resume(self):
+        state=self._setting('resume_playback','null')
+        if not isinstance(state,dict):
+            return False
+        try:
+            status=state.get('status')
+            track=audio_name(state.get('track'))
+            position=state.get('position')
+            loop=state.get('loop')
+            if status not in ('playing','paused') or type(loop) is not bool:
+                raise ValueError('Stato player salvato non valido')
+            if type(position) not in (int,float) or isinstance(position,bool) or not math.isfinite(position) or position<0:
+                raise ValueError('Posizione player salvata non valida')
+            info=self.info(track)
+            if position>=info['duration']:
+                if loop:
+                    position=0.
+                else:
+                    self._clear_playback_resume()
+                    return False
+            self._play(track,position,origin='manual',loop=loop,persist=False)
+            self.manual_hold=bool(state.get('manual_hold',True))
+            if status=='paused':
+                self.bus.pause(True);self.status='paused';self.position=position
+            self._save_playback_resume(force=True)
+            return True
+        except (OSError,ValueError,subprocess.SubprocessError) as error:
+            self.error='Ripristino player non riuscito: '+str(error)
+            self._clear_playback_resume()
+            return False
+
     def _terminate(self):
         if self.bus: self.bus.detach()
         if self.encoder:
@@ -1302,13 +1354,14 @@ class Studio:
         self.encoder=None
         if self.error_log: self.error_log.close();self.error_log=None
 
-    def _live(self):
+    def _live(self,clear_resume=True):
         self._terminate();self.plan=None
         if not self.bus or not self.bus.snapshot()['active']:
             if self.bus: self.bus.close();self.bus=None
             self.sender=None;self.bus_marker.unlink(missing_ok=True)
             run(['systemctl','start','roc-museum.service'])
         self.status='live';self.origin='mixer';self.position=0;self.track=None;self.duration=0
+        if clear_resume: self._clear_playback_resume()
 
     def delete_media(self,name):
         name=audio_name(name)
@@ -1346,7 +1399,7 @@ class Studio:
                 result.append({'name':p.name,'size':p.stat().st_size})
         return result
 
-    def _play(self,name,position=0,origin='manual',loop=False,deadline=None):
+    def _play(self,name,position=0,origin='manual',loop=False,deadline=None,persist=True):
         info=self.info(name)
         if not isinstance(position,(int,float)) or isinstance(position,bool) or not math.isfinite(position) or not 0<=position<info['duration']:
             raise ValueError('Posizione fuori dalla durata del brano')
@@ -1359,6 +1412,7 @@ class Studio:
             self._live();raise
         self.track=name;self.duration=info['duration'];self.position=position;self.started=time.monotonic()
         self.status='playing';self.origin=origin;self.loop=loop;self.error=''
+        if persist and origin=='manual': self._save_playback_resume(force=True)
 
     def _position(self):
         if self.bus and self.status in ('playing','paused'): return min(self.duration,self.bus.snapshot()['position'])
@@ -1398,22 +1452,25 @@ class Studio:
             elif command=='pause':
                 if self.status!='playing': raise ValueError('Nessuna traccia in riproduzione')
                 self.position=self._position();self.bus.pause(True);self.status='paused';self.manual_hold=True
-                self._cancel_plan('suspended');self.origin='manual'
+                self._cancel_plan('suspended');self.origin='manual';self._save_playback_resume(force=True)
             elif command=='resume':
                 if self.status!='paused': raise ValueError('Nessuna traccia in pausa')
                 self.bus.pause(False);self.status='playing';self.origin='manual';self.manual_hold=True
+                self._save_playback_resume(force=True)
             elif command=='seek':
                 if self.status not in ('playing','paused'): raise ValueError('Nessuna traccia selezionata')
                 value=data.get('position');was_paused=self.status=='paused'
                 # _play validates position before changing the decoder.
                 self._play(self.track,value,'manual',self.loop);self.manual_hold=True
                 self._cancel_plan('suspended')
-                if was_paused: self.bus.pause(True);self.status='paused'
+                if was_paused:
+                    self.bus.pause(True);self.status='paused';self._save_playback_resume(force=True)
             elif command=='loop':
                 if type(data.get('enabled')) is not bool: raise ValueError('Loop non valido')
                 self.loop=data['enabled']
                 if self.status in ('playing','paused'):
                     self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
+                    self._save_playback_resume(force=True)
             elif command=='stop':
                 self._cancel_plan('suspended');self._live();self.manual_hold=True
             else: raise ValueError('Comando player non valido')
@@ -1577,6 +1634,7 @@ class Studio:
                         self.error=str(error);self._cancel_plan('failed');self._live()
                 elif self.loop: self._play(self.track,origin=self.origin,loop=True)
                 else: self._live()
+            self._save_playback_resume()
             if not self._setting('enabled'): return
             for event in sorted(self.events(),key=lambda e:(e['start'],e['id'])):
                 if not event['enabled']: continue
