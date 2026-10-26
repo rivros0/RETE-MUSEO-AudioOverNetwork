@@ -80,6 +80,43 @@ class RecoveryTests(StudioCase):
             self.assertEqual(command.call_args.args[0],['systemctl','start','roc-museum.service'])
         self.assertFalse(self.engine.bus_marker.exists());self.assertIsNone(self.engine.bus)
 
+
+class PlaybackResumeTests(StudioCase):
+    def test_manual_playback_restored_after_restart(self):
+        self.engine._play('test.wav',position=.25,origin='manual',loop=True)
+        self.engine.manual_hold=True
+        self.engine.bus.position=.5
+        self.engine._save_playback_resume(force=True)
+        other=studio.Studio({},self.engine.media,self.engine.state,self.engine.usb_root,audio_factory=FakeBus,bus_marker=self.base/'resume-marker')
+        try:
+            with patch.object(other,'_ensure_audio'):
+                other.bus=FakeBus({})
+                with patch.object(other,'_play',wraps=other._play) as play:
+                    other._restore_playback_resume()
+                    play.assert_called_once()
+                    self.assertEqual(other.track,'test.wav')
+                    self.assertTrue(other.loop)
+                    self.assertEqual(other.status,'playing')
+                    self.assertTrue(other.manual_hold)
+        finally: other.close()
+
+    def test_explicit_stop_clears_resume(self):
+        self.engine._play('test.wav',origin='manual')
+        self.engine.command({'command':'stop'})
+        self.assertIsNone(self.engine._setting('resume_playback','null'))
+
+    def test_paused_manual_playback_restores_paused(self):
+        self.engine._play('test.wav',position=.2,origin='manual')
+        self.engine.command({'command':'pause'})
+        other=studio.Studio({},self.engine.media,self.engine.state,self.engine.usb_root,audio_factory=FakeBus,bus_marker=self.base/'paused-marker')
+        try:
+            with patch.object(other,'_ensure_audio'):
+                other.bus=FakeBus({})
+                other._restore_playback_resume()
+                self.assertEqual(other.status,'paused')
+                self.assertTrue(other.bus.paused)
+        finally: other.close()
+
 class WindowsTests(StudioCase):
     def setUp(self):
         super().setUp();wav(self.engine.media/'second.wav')
