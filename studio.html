@@ -1,21 +1,57 @@
 <section id="studioTools" class="box" hidden style="margin:18px 0">
 <style>
 .box button,.box input,.box select{font:inherit;color:#e5e7eb;background:#111827;border:1px solid #6b7280;border-radius:6px;padding:8px;margin:4px;max-width:100%;box-sizing:border-box}.box button{cursor:pointer}.box button:hover{border-color:#60a5fa}.box button:disabled{opacity:.5;cursor:wait}
+#studioTools h3{margin-top:28px}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
+
+#playerPanel{border:1px solid #56606f;border-radius:10px;margin:18px 0;background:#11151c;overflow:hidden}
+#playerPanel>summary{display:flex;align-items:center;gap:12px;cursor:pointer;list-style:none;padding:13px 16px;background:#282e38;user-select:none}
+#playerPanel>summary::-webkit-details-marker{display:none}#playerPanel>summary:after{content:'Espandi ▾';margin-left:auto;font-size:12px;color:#b8c1ce;white-space:nowrap}#playerPanel[open]>summary:after{content:'Riduci ▴'}
+.vlc-summary-copy{min-width:0;display:flex;flex-direction:column;gap:3px}.vlc-summary-copy small{font-size:12px;color:#aeb7c6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw}.vlc-mark{color:#ff9a32;font-size:24px}
+.vlc-screen{min-height:185px;background:radial-gradient(ellipse at center,#242a32 0,#101318 70%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px 16px;gap:10px}
+.vlc-cone{width:64px;height:76px;filter:drop-shadow(0 7px 8px #0008)}#nowPlaying{font-size:20px;font-weight:650;overflow-wrap:anywhere;margin:0;max-width:100%}#playerState{color:#aeb7c6!important;font-size:13px;margin:0}
+.vlc-bottom{background:#252b34;border-top:1px solid #454e5b;padding:10px 14px}.vlc-timeline{display:flex;align-items:center;gap:12px;font-variant-numeric:tabular-nums}.vlc-time{font-family:ui-monospace,monospace;font-size:12px;min-width:47px;text-align:center}
+#studioTools input[type=range].vlc-range{padding:0;margin:8px 0;accent-color:#ff9638;border:0;background:transparent;min-width:0;cursor:pointer}#playerSeek{width:100%;flex:1;height:20px}
+.vlc-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:5px}.vlc-transport,.vlc-options,.vlc-volume{display:flex;align-items:center;gap:3px}
+#studioTools .vlc-button{margin:2px;padding:0;display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid #647082;background:linear-gradient(#3e4755,#29313d);color:#f5f7fb;font-size:17px;border-radius:5px;flex-shrink:0}
+#studioTools .vlc-button:hover{background:#465568;border-color:#ffad63}#studioTools .vlc-button[aria-pressed=true]{color:#ffb36e;border-color:#ff9638;background:#57391f}#studioTools .vlc-play{width:48px;height:44px;font-size:22px;color:#191b20;background:linear-gradient(#ffb969,#f18a2e);border-color:#ffb46d}
+.vlc-volume{margin-left:auto}.vlc-volume input{width:105px}.vlc-volume output{font-size:12px;font-variant-numeric:tabular-nums;min-width:38px}.vlc-statusbar{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;padding-top:9px;margin-top:8px;border-top:1px solid #414957;font-size:12px;color:#b8c1ce}
+#groupState{margin:0}.vlc-library{border-top:1px solid #454e5b;background:#191f28;padding:12px 14px}.vlc-library[hidden]{display:none}.vlc-library-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.vlc-library-heading h4{margin:4px 0}.vlc-library-heading input{width:230px;margin:0!important}
+#studioTools #library{list-style:none;padding:0;margin:10px 0;max-height:270px;overflow:auto;border:1px solid #3f4b5b;border-radius:5px}#library li{display:flex;align-items:center;gap:9px;padding:4px 8px;border-bottom:1px solid #303b49}#library li:last-child{border:0}#library li.selected{background:#354454;box-shadow:inset 3px 0 #ff9638}#library li.playing .vlc-track:before{content:'▶ ';color:#ffb36e}#library li[hidden]{display:none}
+#studioTools .vlc-track{flex:1;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;margin:0;padding:8px 2px;min-width:0}#library .vlc-file-size{font-size:12px;color:#aeb7c6;white-space:nowrap}#studioTools .vlc-delete{background:transparent;border:0;color:#bac3d1;margin:0;padding:5px;font-size:18px}#studioTools .vlc-delete:hover{color:#fca5a5}
+.vlc-precise{font-size:12px;color:#b8c1ce;margin-top:10px}.vlc-precise summary{cursor:pointer}.vlc-notice{font-size:12px;color:#94a3b8;margin:10px 0 0}#playerMessage{color:#fbbf24;min-height:18px;margin:7px 0 0;font-size:13px}
+@media(max-width:540px){.vlc-screen{min-height:150px}.vlc-toolbar{gap:8px}.vlc-transport{gap:0}.vlc-volume{width:100%;justify-content:flex-end}.vlc-library-heading input{width:100%}.vlc-summary-copy small{max-width:48vw}.vlc-file-size{display:none}.vlc-statusbar{font-size:11px}}
 #studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
+
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
-<section class="studioPanel" aria-labelledby="instantPlayerTitle">
-<h3 id="instantPlayerTitle">Player istantaneo</h3>
-<p class="hint">Riproduzione immediata dalla libreria, indipendente dagli eventi programmati.</p>
-<p id="playerState" aria-live="polite">Caricamento…</p>
-<label>Traccia <select id="trackSelect" aria-label="Traccia dalla libreria"></select></label>
-<button data-player="play">▶ Riproduci selezione</button><button data-player="pause">Pausa musica</button><button data-player="resume">Riprendi traccia</button><button data-player="stop">Stop musica / solo microfono</button>
-<label><input type="checkbox" id="playerLoop"> Ripeti traccia</label>
-<progress id="playerProgress" max="1" value="0" style="width:100%" aria-label="Avanzamento traccia"></progress>
-<form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form>
-<p id="groupState"></p>
-</section>
+<details id="playerPanel" open>
+<summary><span class="vlc-mark" aria-hidden="true">▲</span><span class="vlc-summary-copy"><strong>Lettore multimediale</strong><small id="playerSummary">Nessuna traccia in riproduzione</small></span></summary>
+<div id="vlcPlayer" tabindex="0" aria-label="Lettore audio TX">
+<div class="vlc-screen">
+<svg class="vlc-cone" viewBox="0 0 80 100" aria-hidden="true"><path fill="#ef8c28" d="M35 5h10l22 76H13z"/><path fill="#f8f5e8" d="M31 20h18l4 14H27zm-9 30h36l5 16H17z"/><path fill="#e67c1c" d="M12 81h56l9 11H3z"/><path fill="#ffac48" d="M13 81h54l5 5H8z"/></svg>
+<p id="nowPlaying">Nessuna traccia in riproduzione</p><p id="playerState" aria-live="polite">Collegamento al TX…</p>
+</div>
+<div class="vlc-bottom">
+<div class="vlc-timeline"><span id="elapsedTime" class="vlc-time">00:00</span><input id="playerSeek" class="vlc-range" type="range" min="0" max="1" step="0.1" value="0" disabled aria-label="Posizione riproduzione"><span id="totalTime" class="vlc-time">00:00</span></div>
+<div class="vlc-toolbar">
+<div class="vlc-transport">
+<button type="button" id="playerToggle" class="vlc-button vlc-play" aria-label="Riproduci" title="Riproduci / pausa (Spazio)">▶</button>
+<button type="button" data-player="stop" class="vlc-button" aria-label="Ferma musica" title="Ferma la musica; il microfono rimane attivo">■</button>
+<button type="button" id="playerPrevious" class="vlc-button" aria-label="Traccia precedente" title="Traccia precedente / ricomincia">⏮</button>
+<button type="button" id="playerBack" class="vlc-button" aria-label="Indietro 10 secondi" title="Indietro 10 secondi">↶</button>
+<button type="button" id="playerForward" class="vlc-button" aria-label="Avanti 10 secondi" title="Avanti 10 secondi">↷</button>
+<button type="button" id="playerNext" class="vlc-button" aria-label="Traccia successiva" title="Riproduci traccia successiva">⏭</button>
+</div>
+<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻</button><input type="checkbox" id="playerLoop" hidden></div>
+<div class="vlc-volume"><button type="button" id="musicMute" class="vlc-button" aria-label="Silenzia musica" aria-pressed="false" title="Silenzia solo la musica">◖))</button><input id="musicVolume" class="vlc-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume musica"><output id="musicVolumeLabel" for="musicVolume">100%</output></div>
+</div>
+<div class="vlc-statusbar"><span id="playerSource">TX · solo microfono</span><span id="groupState"></span><span id="playlistCount">0 tracce</span></div>
+<p id="playerMessage" role="status"></p>
+<details class="vlc-precise"><summary>Vai a un tempo preciso</summary><form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form></details>
+</div>
+<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Un clic seleziona · doppio clic riproduce. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
+</div></details>
 <h3>Annunci dal microfono · ducking</h3>
 <p id="microphoneState" role="status"></p>
 <form id="duckingForm"><label><input name="enabled" type="checkbox" checked> Abbassa automaticamente la musica durante gli annunci</label>
@@ -53,13 +89,30 @@
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
 <p id="studioMessage" role="status" aria-live="polite"></p>
+<details id="updatePanel" style="margin:24px 0;border:1px solid #4b5563;border-radius:8px;padding:14px">
+<summary style="cursor:pointer"><strong>Aggiornamento dispositivi · TX e RX</strong></summary>
+<p>Controlla la versione su GitHub oppure avvia l’aggiornamento: prima il TX, poi gli RX in sequenza. L’audio si interrompe brevemente durante l’installazione di ciascun dispositivo.</p>
+<p id="updateVersions">Versione installata: in attesa…</p>
+<button type="button" id="checkUpdates">Controlla versione GitHub</button>
+<button type="button" id="deployUpdates">Aggiorna TX e propaga agli RX</button>
+<p id="updateMessage" role="status" aria-live="polite"></p>
+<ul id="updateNodes"></ul>
+<details><summary>Ricevitori da aggiornare</summary>
+<p>Un ricevitore per riga, nel formato utente@indirizzo-IP. Il TX deve già disporre dell’accesso SSH con chiave, della chiave host verificata e di sudo senza password sugli RX.</p>
+<form id="updateReceiversForm"><label for="updateReceivers">Elenco RX</label><br>
+<textarea id="updateReceivers" rows="4" style="width:100%;box-sizing:border-box" placeholder="nino@192.168.1.51"></textarea><br>
+<button id="saveUpdateReceivers">Salva ricevitori</button></form>
+</details>
+<p class="hint">Puoi chiudere il browser: l’operazione prosegue sul TX. Il riavvio della regia richiede un nuovo login; rientra qui per vedere l’esito.</p>
+</details>
 </section>
 <script>
 (function(){
 'use strict';
 var currentEvents=[],eventTracks=[],usbPath='',usbOpened='',inFlight=false,duckInitialized=false;
+var mediaFiles=[],playerSnapshot=null,playerSampleTime=0,scrubbing=false,volumeEditing=false,playerBusy=false,selectionDirty=false,playerRevision=0;
 function el(id){return document.getElementById(id);}
-function message(text){el('studioMessage').textContent=text;}
+function message(text){el('studioMessage').textContent=text;el('playerMessage').textContent=text;}
 async function api(path,data){
   var options={cache:'no-store'};
   if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
@@ -72,19 +125,49 @@ function option(select,value,label){var o=document.createElement('option');o.val
 function button(label,action){var b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=action;return b;}
 library=async function(){
   var data=await api('/api/media'),old=el('trackSelect').value,eventOld=el('eventTrack').value;
-  el('library').replaceChildren();el('trackSelect').replaceChildren();el('eventTrack').replaceChildren();
+  mediaFiles=data.files;el('library').replaceChildren();el('trackSelect').replaceChildren();el('eventTrack').replaceChildren();
   data.files.forEach(function(f){
-    var li=document.createElement('li');li.textContent=f.name+' ('+(f.size/1048576).toFixed(1)+' MB) ';
-    li.appendChild(button('Seleziona',function(){el('trackSelect').value=f.name;}));
-    var remove=button('Elimina traccia',function(){
+    var li=document.createElement('li');li.dataset.name=f.name;
+    var title=button(f.name,function(){selectTrack(f.name);});title.className='vlc-track';title.title=f.name+' · doppio clic per riprodurre';title.setAttribute('aria-label','Seleziona '+f.name);
+    title.ondblclick=function(){playSelected();};title.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();selectTrack(f.name);playSelected();}};
+    var size=document.createElement('span');size.className='vlc-file-size';size.textContent=(f.size/1048576).toFixed(1)+' MB';
+    var remove=button('×',function(){
       if(!confirm('Eliminare definitivamente '+f.name+' dalla libreria del TX?'))return;
       perform(async function(){remove.disabled=true;try{var d=await api('/api/media/delete',{name:f.name});await library();message(d.message);}finally{remove.disabled=false;}});
-    });remove.className='danger';li.appendChild(remove);el('library').appendChild(li);
-    option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
+    });remove.className='vlc-delete';remove.title='Elimina traccia';remove.setAttribute('aria-label','Elimina '+f.name);
+    li.append(title,size,remove);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
   });
   if(data.files.some(function(f){return f.name===old;}))el('trackSelect').value=old;
   if(data.files.some(function(f){return f.name===eventOld;}))el('eventTrack').value=eventOld;
+  markTracks();filterTracks();renderPlayer();
 };
+function selectTrack(name){selectionDirty=true;el('trackSelect').value=name;markTracks();renderPlayer();}
+function markTracks(){document.querySelectorAll('#library li').forEach(function(row){row.classList.toggle('selected',row.dataset.name===el('trackSelect').value);row.classList.toggle('playing',!!playerSnapshot&&row.dataset.name===playerSnapshot.track);});}
+function filterTracks(){var query=el('playlistSearch').value.toLocaleLowerCase('it-IT');document.querySelectorAll('#library li').forEach(function(row){row.hidden=!row.dataset.name.toLocaleLowerCase('it-IT').includes(query);});el('playlistCount').textContent=mediaFiles.length+' tracce';}
+function timeLabel(seconds){seconds=Math.max(0,Math.floor(Number(seconds)||0));var h=Math.floor(seconds/3600),m=Math.floor(seconds%3600/60),s=seconds%60;return (h?h+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
+function playerPosition(){var s=playerSnapshot;if(!s)return 0;var elapsed=s.status==='playing'?Math.min(3,(performance.now()-playerSampleTime)/1000):0;return Math.min(s.duration,s.position+elapsed);}
+function renderTimeline(){var s=playerSnapshot;if(!s||scrubbing)return;var pos=playerPosition();el('playerSeek').value=pos;el('elapsedTime').textContent=timeLabel(pos);}
+function renderPlayer(){
+  var s=playerSnapshot,active=!!s&&['playing','paused'].includes(s.status),selection=el('trackSelect').value;
+  var different=active&&selection!==s.track;
+  el('playerToggle').disabled=playerBusy||!selection;el('musicMute').disabled=el('musicVolume').disabled=!s||playerBusy;
+  var pausing=active&&s.status==='playing'&&!different;
+  el('playerToggle').textContent=pausing?'❚❚':'▶';el('playerToggle').setAttribute('aria-label',pausing?'Pausa musica':active&&s.status==='paused'&&!different?'Riprendi traccia':'Riproduci selezione');
+  el('nowPlaying').textContent=active?s.track:selection||'Nessuna traccia in riproduzione';
+  el('playerSummary').textContent=(active?(s.status==='playing'?'In riproduzione':'In pausa'):'Pronto')+' · '+(active?s.track:selection||'nessuna traccia');
+  el('playerSource').textContent=active?(s.origin.startsWith('calendar:')?'Calendario · tutti gli RX':'Regia manuale · tutti gli RX'):'TX · solo microfono';
+  el('playerSeek').disabled=!active||playerBusy;el('playerSeek').max=active?Math.max(0,s.duration-.01):1;
+  el('playerBack').disabled=el('playerForward').disabled=!active||playerBusy;
+  var index=mediaFiles.findIndex(function(f){return f.name===selection;});el('playerPrevious').disabled=playerBusy||(!active&&index<=0);el('playerNext').disabled=playerBusy||index<0||index>=mediaFiles.length-1;
+  el('totalTime').textContent=timeLabel(s?s.duration:0);
+  if(!volumeEditing&&s){el('musicVolume').value=s.music_volume;el('musicVolumeLabel').textContent=s.music_volume+'%';}
+  if(s){el('musicMute').setAttribute('aria-pressed',s.music_muted?'true':'false');el('musicMute').textContent=s.music_muted?'◖×':'◖))';el('musicMute').setAttribute('aria-label',s.music_muted?'Riattiva musica':'Silenzia musica');}
+  el('repeatToggle').setAttribute('aria-pressed',el('playerLoop').checked?'true':'false');renderTimeline();markTracks();
+}
+async function playerCommand(data){if(playerBusy)return;playerBusy=true;playerRevision++;renderPlayer();try{var result=await api('/api/player',data);playerSnapshot=result;playerSampleTime=performance.now();message('');await update();}finally{playerBusy=false;renderPlayer();}}
+function playSelected(){perform(async function(){await playerCommand({command:'play',name:el('trackSelect').value,loop:el('playerLoop').checked});selectionDirty=false;});}
+function togglePlayback(){var s=playerSnapshot,name=el('trackSelect').value;if(!name)return;if(s&&s.track===name&&s.status==='playing')perform(function(){return playerCommand({command:'pause'});});else if(s&&s.track===name&&s.status==='paused')perform(function(){return playerCommand({command:'resume'});});else playSelected();}
+function seekPlayer(position){var s=playerSnapshot;if(!s||!['playing','paused'].includes(s.status))return;perform(function(){return playerCommand({command:'seek',position:Math.max(0,Math.min(position,s.duration-.01))});});}
 function renderPlaylist(){
   el('eventPlaylist').replaceChildren();
   eventTracks.forEach(function(name,index){
@@ -97,10 +180,11 @@ function renderPlaylist(){
 async function update(){
   el('studioTools').hidden=!authorized;if(!authorized||inFlight)return;inFlight=true;
   try{
-    var s=await api('/api/studio'),bus=s.audio_bus;
+    var revision=playerRevision,s=await api('/api/studio'),bus=s.audio_bus;if(revision!==playerRevision)return;
+    if(!selectionDirty&&s.track&&mediaFiles.some(function(f){return f.name===s.track;}))el('trackSelect').value=s.track;playerSnapshot=s;playerSampleTime=performance.now();
     el('playerState').textContent=({live:'Solo microfono / ingresso mixer',playing:'In riproduzione',paused:'Musica in pausa'}[s.status]||s.status)+(s.track?' · '+s.track:'')+' · origine: '+(s.origin==='manual'?'regia':s.origin.startsWith('calendar:')?'calendario':'ingresso')+(s.error?' · Errore: '+s.error:'');
-    el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);el('playerProgress').max=s.duration||1;el('playerProgress').value=s.position;
-    if(s.status!=='live')el('playerLoop').checked=s.loop;
+    el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);
+    if(s.status!=='live')el('playerLoop').checked=s.loop;renderPlayer();
     el('groupState').textContent=s.plan?'Gruppo: traccia '+(s.plan.index+1)+'/'+s.plan.tracks.length+' · passaggio '+s.plan.cycle+'/'+(s.plan.repetitions||'fino a fine fascia')+(s.plan.next_at?' · prossimo passaggio '+new Date(s.plan.next_at*1000).toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'}):''):'';
     el('microphoneState').textContent=bus?(bus.microphone_online?'Microfono collegato':'ATTENZIONE: '+bus.microphone_error)+' · ingresso '+bus.microphone_dbfs+' dBFS · musica '+bus.music_gain_db+' dB'+(bus.ducking_active?' · DUCKING ATTIVO':''):'Ingresso diretto: il bus annunci si avvia con la regia.';
     if(!duckInitialized){var duck=el('duckingForm');duck.elements.namedItem('enabled').checked=s.ducking.enabled;duck.elements.namedItem('threshold_db').value=s.ducking.threshold_db;duck.elements.namedItem('reduction_db').value=s.ducking.reduction_db;duckInitialized=true;}
@@ -129,9 +213,23 @@ function renderEvents(){
     tr.appendChild(actions);el('eventRows').appendChild(tr);
   });
 }
-document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(async function(){var data={command:b.dataset.player};if(data.command==='play'){data.name=el('trackSelect').value;data.loop=el('playerLoop').checked;}await api('/api/player',data);await update();});};});
-el('playerLoop').onchange=function(){perform(async function(){await api('/api/player',{command:'loop',enabled:el('playerLoop').checked});await update();});};
-el('seekForm').onsubmit=function(e){e.preventDefault();perform(async function(){await api('/api/player',{command:'seek',position:Number(el('seekPosition').value)});await update();});};
+document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(function(){return playerCommand({command:b.dataset.player});});};});
+el('playerToggle').onclick=togglePlayback;
+el('playerNext').onclick=function(){var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
+el('playerPrevious').onclick=function(){if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
+el('playerBack').onclick=function(){seekPlayer(playerPosition()-10);};el('playerForward').onclick=function(){seekPlayer(playerPosition()+10);};
+el('playerSeek').oninput=function(){scrubbing=true;el('elapsedTime').textContent=timeLabel(this.value);};
+el('playerSeek').onchange=function(){var target=Number(this.value);scrubbing=false;seekPlayer(target);};
+el('playerSeek').addEventListener('pointercancel',function(){scrubbing=false;renderTimeline();});
+el('repeatToggle').onclick=function(){el('playerLoop').checked=!el('playerLoop').checked;renderPlayer();perform(function(){return playerCommand({command:'loop',enabled:el('playerLoop').checked});});};
+el('playlistToggle').onclick=function(){var hidden=!el('playerPlaylist').hidden;el('playerPlaylist').hidden=hidden;this.setAttribute('aria-pressed',hidden?'false':'true');};
+el('playlistSearch').oninput=filterTracks;
+el('musicVolume').oninput=function(){volumeEditing=true;el('musicVolumeLabel').textContent=this.value+'%';};
+el('musicVolume').onchange=function(){var value=Number(this.value);perform(async function(){try{await playerCommand({command:'music_volume',value:value});}finally{volumeEditing=false;renderPlayer();}});};
+el('musicMute').onclick=function(){perform(function(){return playerCommand({command:'music_muted',enabled:!playerSnapshot.music_muted});});};
+el('seekForm').onsubmit=function(e){e.preventDefault();seekPlayer(Number(el('seekPosition').value));};
+el('playerPanel').addEventListener('toggle',function(){try{localStorage.setItem('museum.player.open',this.open?'yes':'no');}catch(error){}});
+el('vlcPlayer').addEventListener('keydown',function(e){if(/INPUT|SELECT|TEXTAREA|BUTTON|SUMMARY/.test(e.target.tagName))return;if(e.code==='Space'){e.preventDefault();togglePlayback();}else if(e.key==='ArrowLeft'){e.preventDefault();seekPlayer(playerPosition()-10);}else if(e.key==='ArrowRight'){e.preventDefault();seekPlayer(playerPosition()+10);}});
 el('duckingForm').onsubmit=function(e){e.preventDefault();var f=e.target;perform(async function(){await api('/api/player',{command:'ducking',enabled:f.elements.namedItem('enabled').checked,threshold_db:Number(f.elements.namedItem('threshold_db').value),reduction_db:Number(f.elements.namedItem('reduction_db').value)});message('Impostazioni ducking salvate');await update();});};
 el('enableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:true});await update();});};
 el('disableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:false});await update();});};
@@ -159,6 +257,37 @@ async function browse(path){
 el('scanUSB').onclick=function(){perform(scan);};el('openUSB').onclick=function(){perform(function(){return browse('');});};
 el('usbParent').onclick=function(){perform(function(){return browse(usbPath.split('/').slice(0,-1).join('/'));});};
 el('ejectUSB').onclick=function(){perform(async function(){await api('/api/usb/eject',{device:el('usbDevice').value});usbPath='';usbOpened='';el('usbEntries').replaceChildren();el('usbPath').textContent='Pennetta espulsa';message('È possibile scollegare la pennetta');await scan();});};
-window.addEventListener('DOMContentLoaded',function(){update();setInterval(update,2000);});
+var updateLoaded=false,updatePolling=false;
+async function refreshUpdates(){
+  if(!authorized||updatePolling||!el('updatePanel').open)return;
+  updatePolling=true;
+  try{
+    var s=await api('/api/updates'),busy=['queued','running'].includes(s.state);
+    el('updateVersions').textContent='TX installato: '+s.installed+(s.latest?' · GitHub: '+s.latest:'')+(s.commit?' · commit '+s.commit.slice(0,12):'');
+    el('updateMessage').textContent=s.message;
+    ['checkUpdates','deployUpdates','saveUpdateReceivers'].forEach(function(id){el(id).disabled=busy;});
+    el('updateReceivers').disabled=busy;
+    if(!updateLoaded){el('updateReceivers').value=s.receivers;updateLoaded=true;}
+    el('updateNodes').replaceChildren();(s.nodes||[]).forEach(function(n){var li=document.createElement('li');li.textContent=n.host+' · '+n.message;el('updateNodes').appendChild(li);});
+  }catch(error){el('updateMessage').textContent='Regia non disponibile: attendi il riavvio e accedi nuovamente per leggere l’esito. '+error.message;}
+  finally{updatePolling=false;}
+}
+async function requestUpdate(action){
+  el('checkUpdates').disabled=true;el('deployUpdates').disabled=true;
+  try{await api('/api/updates',{action:action});await refreshUpdates();}
+  catch(error){el('updateMessage').textContent=error.message;el('checkUpdates').disabled=false;el('deployUpdates').disabled=false;}
+}
+el('checkUpdates').onclick=function(){requestUpdate('check');};
+el('deployUpdates').onclick=function(){if(confirm('Aggiornare prima il TX e poi tutti gli RX configurati? L’audio subirà brevi interruzioni.'))requestUpdate('update');};
+el('updateReceiversForm').onsubmit=async function(event){event.preventDefault();try{await api('/api/updates',{action:'configure',receivers:el('updateReceivers').value});el('updateMessage').textContent='Ricevitori salvati';}catch(error){el('updateMessage').textContent=error.message;}};
+el('updatePanel').addEventListener('toggle',refreshUpdates);
+setInterval(refreshUpdates,3000);
+
+window.addEventListener('DOMContentLoaded',function(){
+  el('playlistHost').appendChild(el('library'));el('playlistImport').appendChild(el('upload'));
+  var oldTitle=el('studio').querySelector('h3');if(oldTitle)oldTitle.remove();
+  try{el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';}catch(error){}
+  update();setInterval(update,2000);setInterval(renderTimeline,250);
+});
 })();
 </script>

@@ -292,7 +292,7 @@ riproduzione. Player, calendario ed explorer USB sono descritti qui sotto.
 Test dedicati: `python3 -m unittest discover -s tests -p test_auth_upload.py -v`.
 
 
-## Regia TX · v4.9
+## Regia TX · v4.10
 
 Dopo il login compaiono player, calendario ed explorer USB. Il monitor dei nodi
 rimane consultabile senza login; tutte le nuove API di regia richiedono sessione,
@@ -301,6 +301,13 @@ Il setup installa automaticamente FFmpeg, gli strumenti USB e i dati dei fusi or
 Non servono librerie Python aggiuntive. Versione minima Python: 3.9.
 
 ### Player
+
+Il lettore è un pannello richiudibile ispirato a VLC, con barra temporale,
+contatori, pausa/ripresa, stop, salto di dieci secondi e traccia precedente/successiva.
+La playlist permette ricerca, selezione e doppio clic per avviare una traccia.
+La chiusura del pannello viene ricordata dal browser e non interrompe l’audio.
+Volume e silenziamento agiscono soltanto sulla musica e vengono salvati sul TX:
+gli annunci della Scarlett rimangono udibili.
 
 Selezionare un file dalla libreria e premere **Riproduci selezione**. Sono
 disponibili pausa, ripresa, ricerca a una posizione in secondi, avanzamento e
@@ -456,3 +463,129 @@ L16 e un segnale microfono simulato durante la pausa, senza toccare ALSA o servi
 reali. Rimangono necessari il collaudo Scarlett/Pi 3, una prova prolungata e la
 taratura del ducking sull'impianto. Il setup resta unico per TX e RX, incluse le
 dipendenze, come concordato.
+
+## Accesso remoto TX e manutenzione RX · v4.16
+
+L'installer autonomo installa `roc-museum-remote` e include il watchdog
+[esistente](https://github.com/rivros0/tailscale-funnel-watchdog), fissato al commit
+`eb6beb4717bdd21461b5c5fb5e5084f82fc47a5e` (sorgenti in `vendor/funnel-watchdog`).
+L'accesso pubblico si attiva esplicitamente dopo l'aggiornamento del TX.
+
+Sul TX installare e autenticare Tailscale; abilitare MagicDNS, HTTPS e il permesso
+Funnel nella tailnet. Impostare la password regia, se non è già presente:
+
+```bash
+sudo roc-museum-monitor --set-password
+sudo roc-museum-remote enable
+sudo roc-museum-remote status
+```
+
+`enable` pubblica `http://127.0.0.1:8080` su HTTPS 443 e configura automaticamente
+il watchdog con l'hostname Tailscale del TX. Aprire l'URL mostrato da `status`:
+player, calendario, upload e comandi RX usano la stessa regia e lo stesso login.
+Lo stato dei nodi resta pubblico, come sulla LAN. La porta HTTPS 443 di Funnel
+va dedicata a questa applicazione: l'attivazione e il ripristino ne gestiscono
+il mapping. Non eseguire altri watchdog sullo stesso mapping.
+
+Il timer `tailscale-funnel-watchdog.timer` verifica `/healthz` sia localmente sia
+tramite DNS pubblico e ripristina il proxy dopo i tentativi previsti dal watchdog.
+Non riavvia audio o monitor. Se il backend è guasto, lo segnala senza modificare
+Funnel; il restart del monitor resta affidato a systemd. Il controllo pubblico
+richiede Internet e DNS over HTTPS. Configurazione e log seguono il README del
+watchdog incluso. Per un controllo manuale o per disabilitare l'accesso:
+
+```bash
+sudo roc-museum-remote check
+sudo journalctl -u tailscale-funnel-watchdog.service -n 100 --no-pager
+sudo roc-museum-remote disable
+```
+
+Funnel serve la regia web. Per gli aggiornamenti SSH il computer di gestione deve
+entrare nella tailnet e raggiungere il servizio SSH del TX. Gli RX possono restare
+sulla sola LAN: l'aggiornatore usa un tunnel SSH attraverso il TX. Sul TX occorre
+consentire il forwarding TCP in sshd verso gli indirizzi RX; verificare le chiavi
+host di TX e RX prima dell'uso. Non occorre pubblicare SSH tramite Funnel.
+
+Nel progetto `ssh-update-manager`, copiare `config.museo-rx.example.json` in un
+profilo locale, sostituire utente, hostname Tailscale TX e indirizzi RX, poi usare:
+
+```bash
+python3 ssh_update.py --profile config.local.json --configure
+python3 ssh_update.py --profile config.local.json --check-only
+python3 ssh_update.py --profile config.local.json
+```
+
+Il profilo aggiorna solo RX e conserva nome e IP TX dalla configurazione remota;
+prevede backup e verifica dei servizi. L'aggiornamento interrompe brevemente
+l'audio del singolo RX. Le modifiche sorgente devono essere pubblicate nella
+repository configurata prima di distribuirle con questo profilo.
+
+## Aggiornamenti dalla regia amministrativa · v4.16
+
+Dopo il login, la sezione richiudibile **Aggiornamento dispositivi · TX e RX**
+permette di controllare la versione GitHub e aggiornare l’intero impianto.
+
+1. In **Ricevitori da aggiornare** salvare un RX per riga, per esempio
+   `nino@192.168.1.51`. Si usa la porta SSH standard 22.
+2. **Controlla versione GitHub** legge l’installer dal ramo `main` della repository
+   `rivros0/RETE-MUSEO-AudioOverNetwork` e mostra versione e commit, senza installare.
+3. **Aggiorna TX e propaga agli RX** controlla nuovamente GitHub, aggiorna prima
+   il TX, verifica versione, servizi e risposta della regia, poi aggiorna gli RX
+   uno alla volta usando esattamente lo stesso installer e verificandone SHA-256.
+
+I nodi già alla versione attesa o superiore vengono saltati. Se il TX è più
+recente di GitHub, la distribuzione si ferma per evitare un downgrade del TX e
+una propagazione di una release più vecchia. Un errore TX ferma la propagazione;
+un errore su un RX viene registrato e non impedisce il tentativo sugli altri RX.
+Il profilo dei ricevitori persiste e si modifica soltanto dall’amministrazione;
+non si deducono destinazioni SSH dai pacchetti heartbeat.
+
+Il lavoro gira in `roc-museum-update.service`, separato dal monitor: prosegue
+anche dopo la chiusura del browser e durante il riavvio della regia. Dopo il
+riavvio occorre accedere di nuovo per leggere l’esito persistente e gli stati di
+ciascun RX. Audio, libreria, calendario, password e configurazione Funnel sono
+conservati dall’installer; l’aggiornamento comporta una breve interruzione audio.
+Il nome del nodo e l’IP del TX sugli RX vengono mantenuti. Per ogni nuova release
+incrementare `VERSION` nell’installer prima di pubblicarla su GitHub.
+
+### Preparazione una tantum dell’accesso SSH dal TX
+
+Il servizio gira come root sul TX e usa OpenSSH con `BatchMode=yes` e verifica
+obbligatoria delle chiavi host. Preparare una chiave dedicata sul TX, se non è già
+presente, e installarne la parte pubblica negli `authorized_keys` degli utenti RX.
+Per esempio, sul TX:
+
+```bash
+sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519
+sudo ssh-copy-id nino@192.168.1.51
+sudo ssh -o BatchMode=yes -o StrictHostKeyChecking=yes nino@192.168.1.51 'sudo -n true'
+```
+
+Se esiste già `/root/.ssh/id_ed25519`, riutilizzarla senza sovrascriverla. La chiave
+usata dal servizio deve poter funzionare senza una richiesta interattiva di
+passphrase. Durante il primo collegamento confrontare l’impronta della chiave host
+con quella del ricevitore prima di accettarla. Ripetere per ogni RX. Gli utenti RX
+devono poter eseguire l’installer con `sudo -n`; l’esempio di verifica controlla
+un accesso sudo senza richiesta di password. Non vengono salvate password SSH
+nel browser o nella regia.
+
+Per usare questa funzione occorre installare una prima volta la v4.16 sul TX col
+setup aggiornato. I successivi aggiornamenti partono dal pulsante, purché la
+release sia pubblicata nel ramo GitHub configurato. Non viene eseguito alcun push
+su GitHub dalla regia.
+
+### Diagnostica
+
+Stato, elenco RX e backup della configurazione TX sono in
+`/var/lib/roc-museum/updates`, leggibile soltanto da root. Il log dell’installazione
+TX è `tx-install.log`; gli errori SSH/Git e del worker si consultano con:
+
+```bash
+sudo journalctl -u roc-museum-update.service -n 100 --no-pager
+```
+
+In caso di errore RX, il pannello indica la directory del log lasciata sul nodo.
+Non è previsto rollback automatico: dopo timeout o perdita della connessione
+verificare l’esito sul nodo prima di riprovare. Un job interrotto da reboot o da
+arresto del servizio è segnalato come interrotto e non riparte automaticamente.
+Le API `/api/updates` richiedono login; le azioni POST richiedono anche CSRF.

@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.15
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.16
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.15"
+VERSION="4.16"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -259,7 +259,7 @@ install_packages() {
         fail "roc-toolkit-tools non disponibile. Usare Raspberry Pi OS recente basato su Debian Trixie."
     fi
     info "Installazione di Roc Toolkit e dipendenze..."
-    apt-get install -y roc-toolkit-tools alsa-utils iproute2 python3 ethtool ffmpeg util-linux mount exfatprogs ntfs-3g tzdata
+    apt-get install -y roc-toolkit-tools alsa-utils iproute2 python3 curl git openssh-client ethtool ffmpeg util-linux mount exfatprogs ntfs-3g tzdata
     command_exists roc-send || fail "roc-send non installato."
     command_exists roc-recv || fail "roc-recv non installato."
     command_exists python3 || fail "python3 non installato."
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.15"
+MONITOR_BUILD="4.16"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -988,6 +988,14 @@ def build_tx_page():
 class Handler(BaseHTTPRequestHandler):
     config={}
     studio=None
+    updater=None
+    def update_manager(self):
+        if self.updater is None:
+            import importlib.util
+            spec=importlib.util.spec_from_file_location("roc_updater","/usr/local/lib/roc-museum/updater.py")
+            module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+            type(self).updater=module.Manager()
+        return self.updater
     def log_message(self,fmt,*args): return
     def reply(self,code,content_type,payload):
         self.send_response(code);self.send_header("Content-Type",content_type);self.send_header("Cache-Control","no-store");self.send_header("Content-Length",str(len(payload)));self.end_headers();self.wfile.write(payload)
@@ -1017,6 +1025,12 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,TypeError,KeyError,OSError,subprocess.SubprocessError) as error:
             self.json_reply(400,{"message":str(error)})
     def do_GET(self):
+        if self.path=="/api/updates":
+            if not self.require_auth(): return
+            try: self.json_reply(200,self.update_manager().snapshot())
+            except (ValueError,OSError,RuntimeError,subprocess.SubprocessError) as error:
+                self.json_reply(400,{"message":str(error)})
+            return
         if self.path in ("/api/studio","/api/usb"):
             if not self.require_auth(): return
             self.studio_reply(lambda: self.studio.snapshot() if self.path=="/api/studio" else {"devices":self.studio.devices()});return
@@ -1078,6 +1092,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie","regia="+token+"; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800")
             self.send_header("Content-Length","2");self.send_header("Cache-Control","no-store");self.end_headers();self.wfile.write(b"{}");return
         if not self.require_auth(write=True): return
+        if self.path=="/api/updates":
+            try:
+                length=int(self.headers.get("Content-Length","0"))
+                if not 0<length<=16384 or self.headers.get("Transfer-Encoding"): raise ValueError("Richiesta non valida")
+                data=json.loads(self.rfile.read(length))
+                if not isinstance(data,dict): raise ValueError("Richiesta non valida")
+                result=self.update_manager().request(data.get("action"),data)
+                self.json_reply(202 if data.get("action")!="configure" else 200,result)
+            except (ValueError,OSError,RuntimeError,subprocess.SubprocessError) as error:
+                self.json_reply(409,{"message":str(error)})
+            return
         if self.path=="/api/logout":
             session=self.session()
             with AUTH_LOCK:
@@ -1319,7 +1344,7 @@ class Studio:
             # automatically resumes the original ALSA microphone path.
             fd=os.open(self.bus_marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
             with os.fdopen(fd,'w') as marker: marker.write(str(os.getpid())+'\n')
-            bus=factory(self.config);bus.configure(self.ducking());bus.start()
+            bus=factory(self.config);bus.configure(self.ducking());bus.set_volume(self._setting("music_volume","100"),self._setting("music_muted"));bus.start()
             self.bus=bus;self.sender=bus.sender
             run(['systemctl','start','roc-museum.service'])
         except Exception:
@@ -1463,7 +1488,18 @@ class Studio:
     def command(self,data):
         with self.lock:
             command=data.get('command')
-            if command=='ducking':
+            if command=='music_volume':
+                value=data.get('value')
+                if type(value) is not int or not 0<=value<=100: raise ValueError('Volume musica: valore intero tra 0 e 100')
+                self._store_setting('music_volume',value)
+                if value>0: self._store_setting('music_muted',False)
+                if self.bus: self.bus.set_volume(value,self._setting('music_muted'))
+            elif command=='music_muted':
+                enabled=data.get('enabled')
+                if type(enabled) is not bool: raise ValueError('Mute musica non valido')
+                self._store_setting('music_muted',enabled)
+                if self.bus: self.bus.set_volume(self._setting('music_volume','100'),enabled)
+            elif command=='ducking':
                 settings={k:data.get(k,v) for k,v in self.ducking().items()}
                 if type(settings['enabled']) is not bool: raise ValueError('Ducking non valido')
                 for key,low,high in (('threshold_db',-60,-6),('reduction_db',-40,0)):
@@ -1515,7 +1551,7 @@ class Studio:
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -1823,7 +1859,7 @@ class Ducker:
     def __init__(self,rate=44100):
         self.rate=rate;self.gain=1.;self.limiter=1.;self.hold=0.
         self.enabled=True;self.threshold_db=-36.;self.reduction_db=-18.
-        self.input_db=-96.;self.active=False
+        self.input_db=-96.;self.active=False;self.volume=1.;self.volume_target=1.
 
     def mix(self,music,microphone):
         mic=pcm_samples(microphone);song=pcm_samples(music)
@@ -1834,11 +1870,13 @@ class Ducker:
         else: self.hold=max(0.,self.hold-duration)
         self.active=self.enabled and self.hold>0
         target=10**(self.reduction_db/20) if self.active else 1.
+        old_volume=self.volume
+        self.volume=self.volume_target+(self.volume-self.volume_target)*math.exp(-duration/.015)
         previous=self.gain
         tau=.03 if target<previous else .8
         self.gain=target+(previous-target)*math.exp(-duration/tau)
         # Gain ramp avoids discontinuities; the mic is never multiplied by the duck gain.
-        raw=[int(m+(song[i] if i<len(song) else 0)*(previous+(self.gain-previous)*i/max(1,len(mic)-1))) for i,m in enumerate(mic)]
+        raw=[int(m+(song[i] if i<len(song) else 0)*(previous+(self.gain-previous)*i/max(1,len(mic)-1))*(old_volume+(self.volume-old_volume)*i/max(1,len(mic)-1))) for i,m in enumerate(mic)]
         peak=max((abs(v) for v in raw),default=0)
         limit=min(1.,32760/max(1,peak))
         self.limiter=min(limit,self.limiter+(1-self.limiter)*duration/.2)
@@ -1862,6 +1900,9 @@ class AudioBus:
     def configure(self,settings):
         with self.lock:
             self.ducker.enabled=settings['enabled'];self.ducker.threshold_db=settings['threshold_db'];self.ducker.reduction_db=settings['reduction_db']
+
+    def set_volume(self,percent,muted=False):
+        with self.lock: self.ducker.volume_target=0. if muted else percent/100.
 
     def start(self):
         self.log=tempfile.TemporaryFile()
@@ -1983,21 +2024,57 @@ PY_AUDIO_BUS
 <section id="studioTools" class="box" hidden style="margin:18px 0">
 <style>
 .box button,.box input,.box select{font:inherit;color:#e5e7eb;background:#111827;border:1px solid #6b7280;border-radius:6px;padding:8px;margin:4px;max-width:100%;box-sizing:border-box}.box button{cursor:pointer}.box button:hover{border-color:#60a5fa}.box button:disabled{opacity:.5;cursor:wait}
+#studioTools h3{margin-top:28px}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
+
+#playerPanel{border:1px solid #56606f;border-radius:10px;margin:18px 0;background:#11151c;overflow:hidden}
+#playerPanel>summary{display:flex;align-items:center;gap:12px;cursor:pointer;list-style:none;padding:13px 16px;background:#282e38;user-select:none}
+#playerPanel>summary::-webkit-details-marker{display:none}#playerPanel>summary:after{content:'Espandi ▾';margin-left:auto;font-size:12px;color:#b8c1ce;white-space:nowrap}#playerPanel[open]>summary:after{content:'Riduci ▴'}
+.vlc-summary-copy{min-width:0;display:flex;flex-direction:column;gap:3px}.vlc-summary-copy small{font-size:12px;color:#aeb7c6;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60vw}.vlc-mark{color:#ff9a32;font-size:24px}
+.vlc-screen{min-height:185px;background:radial-gradient(ellipse at center,#242a32 0,#101318 70%);display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px 16px;gap:10px}
+.vlc-cone{width:64px;height:76px;filter:drop-shadow(0 7px 8px #0008)}#nowPlaying{font-size:20px;font-weight:650;overflow-wrap:anywhere;margin:0;max-width:100%}#playerState{color:#aeb7c6!important;font-size:13px;margin:0}
+.vlc-bottom{background:#252b34;border-top:1px solid #454e5b;padding:10px 14px}.vlc-timeline{display:flex;align-items:center;gap:12px;font-variant-numeric:tabular-nums}.vlc-time{font-family:ui-monospace,monospace;font-size:12px;min-width:47px;text-align:center}
+#studioTools input[type=range].vlc-range{padding:0;margin:8px 0;accent-color:#ff9638;border:0;background:transparent;min-width:0;cursor:pointer}#playerSeek{width:100%;flex:1;height:20px}
+.vlc-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:5px}.vlc-transport,.vlc-options,.vlc-volume{display:flex;align-items:center;gap:3px}
+#studioTools .vlc-button{margin:2px;padding:0;display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;border:1px solid #647082;background:linear-gradient(#3e4755,#29313d);color:#f5f7fb;font-size:17px;border-radius:5px;flex-shrink:0}
+#studioTools .vlc-button:hover{background:#465568;border-color:#ffad63}#studioTools .vlc-button[aria-pressed=true]{color:#ffb36e;border-color:#ff9638;background:#57391f}#studioTools .vlc-play{width:48px;height:44px;font-size:22px;color:#191b20;background:linear-gradient(#ffb969,#f18a2e);border-color:#ffb46d}
+.vlc-volume{margin-left:auto}.vlc-volume input{width:105px}.vlc-volume output{font-size:12px;font-variant-numeric:tabular-nums;min-width:38px}.vlc-statusbar{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;padding-top:9px;margin-top:8px;border-top:1px solid #414957;font-size:12px;color:#b8c1ce}
+#groupState{margin:0}.vlc-library{border-top:1px solid #454e5b;background:#191f28;padding:12px 14px}.vlc-library[hidden]{display:none}.vlc-library-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}.vlc-library-heading h4{margin:4px 0}.vlc-library-heading input{width:230px;margin:0!important}
+#studioTools #library{list-style:none;padding:0;margin:10px 0;max-height:270px;overflow:auto;border:1px solid #3f4b5b;border-radius:5px}#library li{display:flex;align-items:center;gap:9px;padding:4px 8px;border-bottom:1px solid #303b49}#library li:last-child{border:0}#library li.selected{background:#354454;box-shadow:inset 3px 0 #ff9638}#library li.playing .vlc-track:before{content:'▶ ';color:#ffb36e}#library li[hidden]{display:none}
+#studioTools .vlc-track{flex:1;text-align:left;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;margin:0;padding:8px 2px;min-width:0}#library .vlc-file-size{font-size:12px;color:#aeb7c6;white-space:nowrap}#studioTools .vlc-delete{background:transparent;border:0;color:#bac3d1;margin:0;padding:5px;font-size:18px}#studioTools .vlc-delete:hover{color:#fca5a5}
+.vlc-precise{font-size:12px;color:#b8c1ce;margin-top:10px}.vlc-precise summary{cursor:pointer}.vlc-notice{font-size:12px;color:#94a3b8;margin:10px 0 0}#playerMessage{color:#fbbf24;min-height:18px;margin:7px 0 0;font-size:13px}
+@media(max-width:540px){.vlc-screen{min-height:150px}.vlc-toolbar{gap:8px}.vlc-transport{gap:0}.vlc-volume{width:100%;justify-content:flex-end}.vlc-library-heading input{width:100%}.vlc-summary-copy small{max-width:48vw}.vlc-file-size{display:none}.vlc-statusbar{font-size:11px}}
 #studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
+
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
-<section class="studioPanel" aria-labelledby="instantPlayerTitle">
-<h3 id="instantPlayerTitle">Player istantaneo</h3>
-<p class="hint">Riproduzione immediata dalla libreria, indipendente dagli eventi programmati.</p>
-<p id="playerState" aria-live="polite">Caricamento…</p>
-<label>Traccia <select id="trackSelect" aria-label="Traccia dalla libreria"></select></label>
-<button data-player="play">▶ Riproduci selezione</button><button data-player="pause">Pausa musica</button><button data-player="resume">Riprendi traccia</button><button data-player="stop">Stop musica / solo microfono</button>
-<label><input type="checkbox" id="playerLoop"> Ripeti traccia</label>
-<progress id="playerProgress" max="1" value="0" style="width:100%" aria-label="Avanzamento traccia"></progress>
-<form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form>
-<p id="groupState"></p>
-</section>
+<details id="playerPanel" open>
+<summary><span class="vlc-mark" aria-hidden="true">▲</span><span class="vlc-summary-copy"><strong>Lettore multimediale</strong><small id="playerSummary">Nessuna traccia in riproduzione</small></span></summary>
+<div id="vlcPlayer" tabindex="0" aria-label="Lettore audio TX">
+<div class="vlc-screen">
+<svg class="vlc-cone" viewBox="0 0 80 100" aria-hidden="true"><path fill="#ef8c28" d="M35 5h10l22 76H13z"/><path fill="#f8f5e8" d="M31 20h18l4 14H27zm-9 30h36l5 16H17z"/><path fill="#e67c1c" d="M12 81h56l9 11H3z"/><path fill="#ffac48" d="M13 81h54l5 5H8z"/></svg>
+<p id="nowPlaying">Nessuna traccia in riproduzione</p><p id="playerState" aria-live="polite">Collegamento al TX…</p>
+</div>
+<div class="vlc-bottom">
+<div class="vlc-timeline"><span id="elapsedTime" class="vlc-time">00:00</span><input id="playerSeek" class="vlc-range" type="range" min="0" max="1" step="0.1" value="0" disabled aria-label="Posizione riproduzione"><span id="totalTime" class="vlc-time">00:00</span></div>
+<div class="vlc-toolbar">
+<div class="vlc-transport">
+<button type="button" id="playerToggle" class="vlc-button vlc-play" aria-label="Riproduci" title="Riproduci / pausa (Spazio)">▶</button>
+<button type="button" data-player="stop" class="vlc-button" aria-label="Ferma musica" title="Ferma la musica; il microfono rimane attivo">■</button>
+<button type="button" id="playerPrevious" class="vlc-button" aria-label="Traccia precedente" title="Traccia precedente / ricomincia">⏮</button>
+<button type="button" id="playerBack" class="vlc-button" aria-label="Indietro 10 secondi" title="Indietro 10 secondi">↶</button>
+<button type="button" id="playerForward" class="vlc-button" aria-label="Avanti 10 secondi" title="Avanti 10 secondi">↷</button>
+<button type="button" id="playerNext" class="vlc-button" aria-label="Traccia successiva" title="Riproduci traccia successiva">⏭</button>
+</div>
+<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻</button><input type="checkbox" id="playerLoop" hidden></div>
+<div class="vlc-volume"><button type="button" id="musicMute" class="vlc-button" aria-label="Silenzia musica" aria-pressed="false" title="Silenzia solo la musica">◖))</button><input id="musicVolume" class="vlc-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume musica"><output id="musicVolumeLabel" for="musicVolume">100%</output></div>
+</div>
+<div class="vlc-statusbar"><span id="playerSource">TX · solo microfono</span><span id="groupState"></span><span id="playlistCount">0 tracce</span></div>
+<p id="playerMessage" role="status"></p>
+<details class="vlc-precise"><summary>Vai a un tempo preciso</summary><form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form></details>
+</div>
+<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Un clic seleziona · doppio clic riproduce. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
+</div></details>
 <h3>Annunci dal microfono · ducking</h3>
 <p id="microphoneState" role="status"></p>
 <form id="duckingForm"><label><input name="enabled" type="checkbox" checked> Abbassa automaticamente la musica durante gli annunci</label>
@@ -2035,13 +2112,30 @@ PY_AUDIO_BUS
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
 <p id="studioMessage" role="status" aria-live="polite"></p>
+<details id="updatePanel" style="margin:24px 0;border:1px solid #4b5563;border-radius:8px;padding:14px">
+<summary style="cursor:pointer"><strong>Aggiornamento dispositivi · TX e RX</strong></summary>
+<p>Controlla la versione su GitHub oppure avvia l’aggiornamento: prima il TX, poi gli RX in sequenza. L’audio si interrompe brevemente durante l’installazione di ciascun dispositivo.</p>
+<p id="updateVersions">Versione installata: in attesa…</p>
+<button type="button" id="checkUpdates">Controlla versione GitHub</button>
+<button type="button" id="deployUpdates">Aggiorna TX e propaga agli RX</button>
+<p id="updateMessage" role="status" aria-live="polite"></p>
+<ul id="updateNodes"></ul>
+<details><summary>Ricevitori da aggiornare</summary>
+<p>Un ricevitore per riga, nel formato utente@indirizzo-IP. Il TX deve già disporre dell’accesso SSH con chiave, della chiave host verificata e di sudo senza password sugli RX.</p>
+<form id="updateReceiversForm"><label for="updateReceivers">Elenco RX</label><br>
+<textarea id="updateReceivers" rows="4" style="width:100%;box-sizing:border-box" placeholder="nino@192.168.1.51"></textarea><br>
+<button id="saveUpdateReceivers">Salva ricevitori</button></form>
+</details>
+<p class="hint">Puoi chiudere il browser: l’operazione prosegue sul TX. Il riavvio della regia richiede un nuovo login; rientra qui per vedere l’esito.</p>
+</details>
 </section>
 <script>
 (function(){
 'use strict';
 var currentEvents=[],eventTracks=[],usbPath='',usbOpened='',inFlight=false,duckInitialized=false;
+var mediaFiles=[],playerSnapshot=null,playerSampleTime=0,scrubbing=false,volumeEditing=false,playerBusy=false,selectionDirty=false,playerRevision=0;
 function el(id){return document.getElementById(id);}
-function message(text){el('studioMessage').textContent=text;}
+function message(text){el('studioMessage').textContent=text;el('playerMessage').textContent=text;}
 async function api(path,data){
   var options={cache:'no-store'};
   if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
@@ -2054,19 +2148,49 @@ function option(select,value,label){var o=document.createElement('option');o.val
 function button(label,action){var b=document.createElement('button');b.type='button';b.textContent=label;b.onclick=action;return b;}
 library=async function(){
   var data=await api('/api/media'),old=el('trackSelect').value,eventOld=el('eventTrack').value;
-  el('library').replaceChildren();el('trackSelect').replaceChildren();el('eventTrack').replaceChildren();
+  mediaFiles=data.files;el('library').replaceChildren();el('trackSelect').replaceChildren();el('eventTrack').replaceChildren();
   data.files.forEach(function(f){
-    var li=document.createElement('li');li.textContent=f.name+' ('+(f.size/1048576).toFixed(1)+' MB) ';
-    li.appendChild(button('Seleziona',function(){el('trackSelect').value=f.name;}));
-    var remove=button('Elimina traccia',function(){
+    var li=document.createElement('li');li.dataset.name=f.name;
+    var title=button(f.name,function(){selectTrack(f.name);});title.className='vlc-track';title.title=f.name+' · doppio clic per riprodurre';title.setAttribute('aria-label','Seleziona '+f.name);
+    title.ondblclick=function(){playSelected();};title.onkeydown=function(e){if(e.key==='Enter'){e.preventDefault();selectTrack(f.name);playSelected();}};
+    var size=document.createElement('span');size.className='vlc-file-size';size.textContent=(f.size/1048576).toFixed(1)+' MB';
+    var remove=button('×',function(){
       if(!confirm('Eliminare definitivamente '+f.name+' dalla libreria del TX?'))return;
       perform(async function(){remove.disabled=true;try{var d=await api('/api/media/delete',{name:f.name});await library();message(d.message);}finally{remove.disabled=false;}});
-    });remove.className='danger';li.appendChild(remove);el('library').appendChild(li);
-    option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
+    });remove.className='vlc-delete';remove.title='Elimina traccia';remove.setAttribute('aria-label','Elimina '+f.name);
+    li.append(title,size,remove);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
   });
   if(data.files.some(function(f){return f.name===old;}))el('trackSelect').value=old;
   if(data.files.some(function(f){return f.name===eventOld;}))el('eventTrack').value=eventOld;
+  markTracks();filterTracks();renderPlayer();
 };
+function selectTrack(name){selectionDirty=true;el('trackSelect').value=name;markTracks();renderPlayer();}
+function markTracks(){document.querySelectorAll('#library li').forEach(function(row){row.classList.toggle('selected',row.dataset.name===el('trackSelect').value);row.classList.toggle('playing',!!playerSnapshot&&row.dataset.name===playerSnapshot.track);});}
+function filterTracks(){var query=el('playlistSearch').value.toLocaleLowerCase('it-IT');document.querySelectorAll('#library li').forEach(function(row){row.hidden=!row.dataset.name.toLocaleLowerCase('it-IT').includes(query);});el('playlistCount').textContent=mediaFiles.length+' tracce';}
+function timeLabel(seconds){seconds=Math.max(0,Math.floor(Number(seconds)||0));var h=Math.floor(seconds/3600),m=Math.floor(seconds%3600/60),s=seconds%60;return (h?h+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
+function playerPosition(){var s=playerSnapshot;if(!s)return 0;var elapsed=s.status==='playing'?Math.min(3,(performance.now()-playerSampleTime)/1000):0;return Math.min(s.duration,s.position+elapsed);}
+function renderTimeline(){var s=playerSnapshot;if(!s||scrubbing)return;var pos=playerPosition();el('playerSeek').value=pos;el('elapsedTime').textContent=timeLabel(pos);}
+function renderPlayer(){
+  var s=playerSnapshot,active=!!s&&['playing','paused'].includes(s.status),selection=el('trackSelect').value;
+  var different=active&&selection!==s.track;
+  el('playerToggle').disabled=playerBusy||!selection;el('musicMute').disabled=el('musicVolume').disabled=!s||playerBusy;
+  var pausing=active&&s.status==='playing'&&!different;
+  el('playerToggle').textContent=pausing?'❚❚':'▶';el('playerToggle').setAttribute('aria-label',pausing?'Pausa musica':active&&s.status==='paused'&&!different?'Riprendi traccia':'Riproduci selezione');
+  el('nowPlaying').textContent=active?s.track:selection||'Nessuna traccia in riproduzione';
+  el('playerSummary').textContent=(active?(s.status==='playing'?'In riproduzione':'In pausa'):'Pronto')+' · '+(active?s.track:selection||'nessuna traccia');
+  el('playerSource').textContent=active?(s.origin.startsWith('calendar:')?'Calendario · tutti gli RX':'Regia manuale · tutti gli RX'):'TX · solo microfono';
+  el('playerSeek').disabled=!active||playerBusy;el('playerSeek').max=active?Math.max(0,s.duration-.01):1;
+  el('playerBack').disabled=el('playerForward').disabled=!active||playerBusy;
+  var index=mediaFiles.findIndex(function(f){return f.name===selection;});el('playerPrevious').disabled=playerBusy||(!active&&index<=0);el('playerNext').disabled=playerBusy||index<0||index>=mediaFiles.length-1;
+  el('totalTime').textContent=timeLabel(s?s.duration:0);
+  if(!volumeEditing&&s){el('musicVolume').value=s.music_volume;el('musicVolumeLabel').textContent=s.music_volume+'%';}
+  if(s){el('musicMute').setAttribute('aria-pressed',s.music_muted?'true':'false');el('musicMute').textContent=s.music_muted?'◖×':'◖))';el('musicMute').setAttribute('aria-label',s.music_muted?'Riattiva musica':'Silenzia musica');}
+  el('repeatToggle').setAttribute('aria-pressed',el('playerLoop').checked?'true':'false');renderTimeline();markTracks();
+}
+async function playerCommand(data){if(playerBusy)return;playerBusy=true;playerRevision++;renderPlayer();try{var result=await api('/api/player',data);playerSnapshot=result;playerSampleTime=performance.now();message('');await update();}finally{playerBusy=false;renderPlayer();}}
+function playSelected(){perform(async function(){await playerCommand({command:'play',name:el('trackSelect').value,loop:el('playerLoop').checked});selectionDirty=false;});}
+function togglePlayback(){var s=playerSnapshot,name=el('trackSelect').value;if(!name)return;if(s&&s.track===name&&s.status==='playing')perform(function(){return playerCommand({command:'pause'});});else if(s&&s.track===name&&s.status==='paused')perform(function(){return playerCommand({command:'resume'});});else playSelected();}
+function seekPlayer(position){var s=playerSnapshot;if(!s||!['playing','paused'].includes(s.status))return;perform(function(){return playerCommand({command:'seek',position:Math.max(0,Math.min(position,s.duration-.01))});});}
 function renderPlaylist(){
   el('eventPlaylist').replaceChildren();
   eventTracks.forEach(function(name,index){
@@ -2079,10 +2203,11 @@ function renderPlaylist(){
 async function update(){
   el('studioTools').hidden=!authorized;if(!authorized||inFlight)return;inFlight=true;
   try{
-    var s=await api('/api/studio'),bus=s.audio_bus;
+    var revision=playerRevision,s=await api('/api/studio'),bus=s.audio_bus;if(revision!==playerRevision)return;
+    if(!selectionDirty&&s.track&&mediaFiles.some(function(f){return f.name===s.track;}))el('trackSelect').value=s.track;playerSnapshot=s;playerSampleTime=performance.now();
     el('playerState').textContent=({live:'Solo microfono / ingresso mixer',playing:'In riproduzione',paused:'Musica in pausa'}[s.status]||s.status)+(s.track?' · '+s.track:'')+' · origine: '+(s.origin==='manual'?'regia':s.origin.startsWith('calendar:')?'calendario':'ingresso')+(s.error?' · Errore: '+s.error:'');
-    el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);el('playerProgress').max=s.duration||1;el('playerProgress').value=s.position;
-    if(s.status!=='live')el('playerLoop').checked=s.loop;
+    el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);
+    if(s.status!=='live')el('playerLoop').checked=s.loop;renderPlayer();
     el('groupState').textContent=s.plan?'Gruppo: traccia '+(s.plan.index+1)+'/'+s.plan.tracks.length+' · passaggio '+s.plan.cycle+'/'+(s.plan.repetitions||'fino a fine fascia')+(s.plan.next_at?' · prossimo passaggio '+new Date(s.plan.next_at*1000).toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'}):''):'';
     el('microphoneState').textContent=bus?(bus.microphone_online?'Microfono collegato':'ATTENZIONE: '+bus.microphone_error)+' · ingresso '+bus.microphone_dbfs+' dBFS · musica '+bus.music_gain_db+' dB'+(bus.ducking_active?' · DUCKING ATTIVO':''):'Ingresso diretto: il bus annunci si avvia con la regia.';
     if(!duckInitialized){var duck=el('duckingForm');duck.elements.namedItem('enabled').checked=s.ducking.enabled;duck.elements.namedItem('threshold_db').value=s.ducking.threshold_db;duck.elements.namedItem('reduction_db').value=s.ducking.reduction_db;duckInitialized=true;}
@@ -2111,9 +2236,23 @@ function renderEvents(){
     tr.appendChild(actions);el('eventRows').appendChild(tr);
   });
 }
-document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(async function(){var data={command:b.dataset.player};if(data.command==='play'){data.name=el('trackSelect').value;data.loop=el('playerLoop').checked;}await api('/api/player',data);await update();});};});
-el('playerLoop').onchange=function(){perform(async function(){await api('/api/player',{command:'loop',enabled:el('playerLoop').checked});await update();});};
-el('seekForm').onsubmit=function(e){e.preventDefault();perform(async function(){await api('/api/player',{command:'seek',position:Number(el('seekPosition').value)});await update();});};
+document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(function(){return playerCommand({command:b.dataset.player});});};});
+el('playerToggle').onclick=togglePlayback;
+el('playerNext').onclick=function(){var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
+el('playerPrevious').onclick=function(){if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
+el('playerBack').onclick=function(){seekPlayer(playerPosition()-10);};el('playerForward').onclick=function(){seekPlayer(playerPosition()+10);};
+el('playerSeek').oninput=function(){scrubbing=true;el('elapsedTime').textContent=timeLabel(this.value);};
+el('playerSeek').onchange=function(){var target=Number(this.value);scrubbing=false;seekPlayer(target);};
+el('playerSeek').addEventListener('pointercancel',function(){scrubbing=false;renderTimeline();});
+el('repeatToggle').onclick=function(){el('playerLoop').checked=!el('playerLoop').checked;renderPlayer();perform(function(){return playerCommand({command:'loop',enabled:el('playerLoop').checked});});};
+el('playlistToggle').onclick=function(){var hidden=!el('playerPlaylist').hidden;el('playerPlaylist').hidden=hidden;this.setAttribute('aria-pressed',hidden?'false':'true');};
+el('playlistSearch').oninput=filterTracks;
+el('musicVolume').oninput=function(){volumeEditing=true;el('musicVolumeLabel').textContent=this.value+'%';};
+el('musicVolume').onchange=function(){var value=Number(this.value);perform(async function(){try{await playerCommand({command:'music_volume',value:value});}finally{volumeEditing=false;renderPlayer();}});};
+el('musicMute').onclick=function(){perform(function(){return playerCommand({command:'music_muted',enabled:!playerSnapshot.music_muted});});};
+el('seekForm').onsubmit=function(e){e.preventDefault();seekPlayer(Number(el('seekPosition').value));};
+el('playerPanel').addEventListener('toggle',function(){try{localStorage.setItem('museum.player.open',this.open?'yes':'no');}catch(error){}});
+el('vlcPlayer').addEventListener('keydown',function(e){if(/INPUT|SELECT|TEXTAREA|BUTTON|SUMMARY/.test(e.target.tagName))return;if(e.code==='Space'){e.preventDefault();togglePlayback();}else if(e.key==='ArrowLeft'){e.preventDefault();seekPlayer(playerPosition()-10);}else if(e.key==='ArrowRight'){e.preventDefault();seekPlayer(playerPosition()+10);}});
 el('duckingForm').onsubmit=function(e){e.preventDefault();var f=e.target;perform(async function(){await api('/api/player',{command:'ducking',enabled:f.elements.namedItem('enabled').checked,threshold_db:Number(f.elements.namedItem('threshold_db').value),reduction_db:Number(f.elements.namedItem('reduction_db').value)});message('Impostazioni ducking salvate');await update();});};
 el('enableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:true});await update();});};
 el('disableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:false});await update();});};
@@ -2141,11 +2280,620 @@ async function browse(path){
 el('scanUSB').onclick=function(){perform(scan);};el('openUSB').onclick=function(){perform(function(){return browse('');});};
 el('usbParent').onclick=function(){perform(function(){return browse(usbPath.split('/').slice(0,-1).join('/'));});};
 el('ejectUSB').onclick=function(){perform(async function(){await api('/api/usb/eject',{device:el('usbDevice').value});usbPath='';usbOpened='';el('usbEntries').replaceChildren();el('usbPath').textContent='Pennetta espulsa';message('È possibile scollegare la pennetta');await scan();});};
-window.addEventListener('DOMContentLoaded',function(){update();setInterval(update,2000);});
+var updateLoaded=false,updatePolling=false;
+async function refreshUpdates(){
+  if(!authorized||updatePolling||!el('updatePanel').open)return;
+  updatePolling=true;
+  try{
+    var s=await api('/api/updates'),busy=['queued','running'].includes(s.state);
+    el('updateVersions').textContent='TX installato: '+s.installed+(s.latest?' · GitHub: '+s.latest:'')+(s.commit?' · commit '+s.commit.slice(0,12):'');
+    el('updateMessage').textContent=s.message;
+    ['checkUpdates','deployUpdates','saveUpdateReceivers'].forEach(function(id){el(id).disabled=busy;});
+    el('updateReceivers').disabled=busy;
+    if(!updateLoaded){el('updateReceivers').value=s.receivers;updateLoaded=true;}
+    el('updateNodes').replaceChildren();(s.nodes||[]).forEach(function(n){var li=document.createElement('li');li.textContent=n.host+' · '+n.message;el('updateNodes').appendChild(li);});
+  }catch(error){el('updateMessage').textContent='Regia non disponibile: attendi il riavvio e accedi nuovamente per leggere l’esito. '+error.message;}
+  finally{updatePolling=false;}
+}
+async function requestUpdate(action){
+  el('checkUpdates').disabled=true;el('deployUpdates').disabled=true;
+  try{await api('/api/updates',{action:action});await refreshUpdates();}
+  catch(error){el('updateMessage').textContent=error.message;el('checkUpdates').disabled=false;el('deployUpdates').disabled=false;}
+}
+el('checkUpdates').onclick=function(){requestUpdate('check');};
+el('deployUpdates').onclick=function(){if(confirm('Aggiornare prima il TX e poi tutti gli RX configurati? L’audio subirà brevi interruzioni.'))requestUpdate('update');};
+el('updateReceiversForm').onsubmit=async function(event){event.preventDefault();try{await api('/api/updates',{action:'configure',receivers:el('updateReceivers').value});el('updateMessage').textContent='Ricevitori salvati';}catch(error){el('updateMessage').textContent=error.message;}};
+el('updatePanel').addEventListener('toggle',refreshUpdates);
+setInterval(refreshUpdates,3000);
+
+window.addEventListener('DOMContentLoaded',function(){
+  el('playlistHost').appendChild(el('library'));el('playlistImport').appendChild(el('upload'));
+  var oldTitle=el('studio').querySelector('h3');if(oldTitle)oldTitle.remove();
+  try{el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';}catch(error){}
+  update();setInterval(update,2000);setInterval(renderTimeline,250);
+});
 })();
 </script>
 HTML_STUDIO
     chmod 0644 /usr/local/lib/roc-museum/studio.py /usr/local/lib/roc-museum/audio_bus.py /usr/local/share/roc-museum/studio.html
+}
+
+write_remote_access() {
+    cat > /usr/local/sbin/roc-museum-remote <<'SH_REMOTE'
+#!/usr/bin/env bash
+# Gestisce soltanto il mapping HTTPS 443 della regia; non modifica SSH o audio.
+set -euo pipefail
+TARGET=http://127.0.0.1:8080
+WATCHDOG=/usr/local/lib/roc-museum/funnel-watchdog
+require_tx() {
+    [ "$(id -u)" -eq 0 ] || { echo 'Eseguire con sudo.' >&2; exit 1; }
+    grep -qx 'ROLE="tx"' /etc/roc-museum.conf || { echo 'Consentito soltanto sul TX.' >&2; exit 1; }
+    command -v tailscale >/dev/null || { echo 'Installare Tailscale e autenticare il TX con tailscale up.' >&2; exit 1; }
+}
+case "${1:-status}" in
+    enable)
+        require_tx
+        # Non pubblicare una regia senza credenziali configurate.
+        python3 - <<'PY'
+import json
+from pathlib import Path
+record=json.loads(Path('/var/lib/roc-museum/auth.json').read_text())
+assert record.get('salt') and record.get('hash'), 'Configurare prima la password regia'
+PY
+        config=$(mktemp)
+        trap 'rm -f -- "$config"' EXIT
+        tailscale status --json | python3 -c '
+import json,re,sys
+name=json.load(sys.stdin)["Self"]["DNSName"].rstrip(".")
+if not re.fullmatch(r"[a-zA-Z0-9.-]+\.ts\.net",name): raise SystemExit("Nome Tailscale non valido")
+print("PUBLIC_URL=https://"+name+"/healthz")
+print("LOCAL_URL=http://127.0.0.1:8080/healthz")
+print("FUNNEL_TARGET=http://127.0.0.1:8080")
+' > "$config"
+        tailscale funnel --bg --https=443 "$TARGET"
+        bash "$WATCHDOG/scripts/install.sh" "$config"
+        ;;
+    check)
+        require_tx
+        systemctl start tailscale-funnel-watchdog.service
+        ;;
+    disable)
+        require_tx
+        systemctl disable --now tailscale-funnel-watchdog.timer
+        systemctl stop tailscale-funnel-watchdog.service
+        tailscale funnel --https=443 off
+        ;;
+    status)
+        require_tx
+        tailscale funnel status
+        systemctl status tailscale-funnel-watchdog.timer --no-pager || true
+        ;;
+    *) echo 'Uso: sudo roc-museum-remote enable|disable|status|check' >&2; exit 2 ;;
+esac
+SH_REMOTE
+    chmod 0755 /usr/local/sbin/roc-museum-remote
+    mkdir -p /usr/local/lib/roc-museum/funnel-watchdog/{scripts,deploy}
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/README.md <<'WATCHDOG_0'
+# Tailscale Funnel Watchdog
+
+Watchdog per Linux con systemd, estratto da OrarioCalendar e riutilizzabile con un servizio HTTP locale. Controlla il percorso pubblico di Tailscale Funnel e prova a ripristinarlo quando il backend risponde ma il servizio pubblico non è raggiungibile.
+
+## Funzionamento
+
+1. Controlla il backend locale: se non risponde HTTP 200 termina senza modificare Funnel.
+2. Risolve il nome pubblico tramite DNS over HTTPS (Google e Cloudflare), scartando gli IPv4 non globali. Usa `curl --resolve` per evitare che MagicDNS faccia passare il controllo attraverso la tailnet.
+3. Dopo tre tentativi pubblici falliti, verifica nuovamente il backend.
+4. Disattiva e riattiva il proxy Funnel HTTPS sulla porta 443, quindi verifica il risultato.
+
+Il timer parte due minuti dopo il boot e ripete il controllo cinque minuti dopo la conclusione del precedente. Non esegue un reset globale di Tailscale e non riavvia il backend.
+
+## Requisiti e limiti
+
+- Linux con systemd, Bash, Python 3, curl, GNU timeout e Tailscale già installato e autenticato.
+- Funnel già abilitato e configurato per il servizio desiderato.
+- Una sola configurazione gestita per host, HTTPS pubblico sulla porta 443 e DNS pubblico IPv4.
+- Endpoint locale e pubblico che rispondano direttamente HTTP 200: i redirect non sono considerati sani.
+- Accesso in uscita ai resolver DNS over HTTPS. Un problema di rete o dei resolver può provocare un tentativo di ripristino anche quando Funnel è sano.
+
+Il ripristino interessa l'intero proxy HTTPS sulla porta 443: usare questo watchdog solo quando quella porta è dedicata al servizio configurato. Altri percorsi sulla stessa porta possono essere rimossi dalla disattivazione. Non installare contemporaneamente questo timer e un precedente watchdog che gestisce lo stesso Funnel.
+
+## Installazione
+
+```bash
+git clone https://github.com/rivros0/tailscale-funnel-watchdog.git
+cd tailscale-funnel-watchdog
+cp watchdog.conf.example watchdog.conf
+nano watchdog.conf
+sudo bash scripts/install.sh watchdog.conf
+```
+
+Personalizzare tutti e tre gli URL prima dell'installazione. `PUBLIC_URL` deve avere la forma `https://nome.ts.net/percorso`, senza credenziali né porta esplicita. `LOCAL_URL` indica il controllo di salute; `FUNNEL_TARGET` indica il servizio da pubblicare. La configurazione è letta da systemd come `EnvironmentFile`, non come script shell.
+
+L'installer copia script e unità con proprietario root, salva la configurazione in `/etc/tailscale-funnel-watchdog.conf` (permessi 600), abilita il timer ed esegue un primo controllo. Quel controllo può ripristinare subito il proxy se rileva un guasto. Una configurazione precedente viene conservata con suffisso `.bak`.
+
+## Diagnostica e aggiornamenti
+
+```bash
+systemctl status tailscale-funnel-watchdog.timer
+sudo journalctl -u tailscale-funnel-watchdog.service -n 100 --no-pager
+sudo systemctl start tailscale-funnel-watchdog.service
+```
+
+I log sono disponibili anche in `/var/log/tailscale-funnel/watchdog.log`; se presente, logrotate conserva 12 rotazioni settimanali. Codici di uscita: `0` controllo riuscito o ripristino riuscito; `1` backend non disponibile o errore di configurazione/esecuzione; `2` ripristino o verifica finale falliti.
+
+Per aggiornare: `git pull`, poi `sudo bash scripts/install.sh`. Senza argomento viene conservata la configurazione installata. Dopo una modifica della configurazione, il controllo successivo la rilegge automaticamente.
+
+Per cambiare la frequenza usare `sudo systemctl edit tailscale-funnel-watchdog.timer`, impostando sotto `[Timer]` prima `OnUnitInactiveSec=` (vuoto) e poi `OnUnitInactiveSec=10min`, quindi riavviare il timer.
+
+## Disinstallazione
+
+```bash
+sudo systemctl disable --now tailscale-funnel-watchdog.timer
+sudo systemctl stop tailscale-funnel-watchdog.service
+sudo rm -f /etc/systemd/system/tailscale-funnel-watchdog.service /etc/systemd/system/tailscale-funnel-watchdog.timer
+sudo rm -f /usr/local/sbin/check-tailscale-funnel.sh /etc/logrotate.d/tailscale-funnel
+sudo systemctl daemon-reload
+```
+
+Configurazione, eventuali override systemd e log restano disponibili e possono essere rimossi separatamente. La disinstallazione non modifica Funnel.
+
+## Test
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+I test simulano curl, tailscale, timeout e sleep: non contattano servizi esterni e non modificano un Funnel reale. Coprono backend indisponibile, guasti transitori, ripristino, errori di riattivazione, redirect e DNS pubblico non valido.
+WATCHDOG_0
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/UPSTREAM <<'WATCHDOG_1'
+https://github.com/rivros0/tailscale-funnel-watchdog
+Commit: eb6beb4717bdd21461b5c5fb5e5084f82fc47a5e
+WATCHDOG_1
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/deploy/check-tailscale-funnel.sh <<'WATCHDOG_3'
+#!/bin/bash
+set -euo pipefail
+
+: "${PUBLIC_URL:?Configurare PUBLIC_URL nel file /etc/tailscale-funnel-watchdog.conf}"
+LOCAL_URL=${LOCAL_URL:-http://127.0.0.1:8000/login}
+FUNNEL_TARGET=${FUNNEL_TARGET:-http://127.0.0.1:8000}
+
+log() {
+    local line
+    line="$(date --iso-8601=seconds) $*"
+    printf '%s\n' "$line"
+    if [[ -n ${LOG_FILE:-} ]]; then printf '%s\n' "$line" >> "$LOG_FILE"; fi
+}
+started=$SECONDS
+finish() { log "Fine controllo: codice=$? durata=$((SECONDS-started))s"; }
+trap finish EXIT
+log 'Inizio controllo watchdog.'
+public_probe() {
+    local host answer ip code
+    host=${PUBLIC_URL#https://}; host=${host%%/*}
+    # DNS over HTTPS bypassa MagicDNS; --resolve forza il percorso pubblico.
+    for resolver in 'https://dns.google/resolve' 'https://cloudflare-dns.com/dns-query'; do
+        if ! answer=$(curl --noproxy '*' --silent --show-error --fail --connect-timeout 5 --max-time 10 \
+            -H 'accept: application/dns-json' "$resolver?name=$host&type=A" 2>&1); then
+            log "DNS pubblico non interrogabile ($resolver): $answer"
+            continue
+        fi
+        if ! ip=$(printf '%s' "$answer" | python3 -c '
+import ipaddress,json,sys
+try:
+    data=json.load(sys.stdin)
+    addresses=[str(ipaddress.IPv4Address(a["data"])) for a in data.get("Answer",[]) if a.get("type")==1 and ipaddress.IPv4Address(a["data"]).is_global]
+    if data.get("Status") != 0 or not addresses:
+        raise ValueError("status=%s, nessun IPv4 pubblico" % data.get("Status"))
+    print(addresses[0])
+except Exception as exc:
+    print(str(exc),file=sys.stderr)
+    sys.exit(1)
+' 2>&1); then
+            log "DNS pubblico fallito ($resolver): $ip"
+            continue
+        fi
+        if ! code=$(curl --noproxy '*' --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --resolve "$host:443:$ip" --connect-timeout 5 --max-time 15 "$PUBLIC_URL" 2>&1); then
+            log "HTTPS pubblico fallito (IP=$ip): $code"
+            continue
+        fi
+        if [[ $code == 200 ]]; then
+            log "Controllo pubblico riuscito: DNS=$resolver IP=$ip HTTP=200"
+            return 0
+        fi
+        log "HTTPS pubblico fallito (IP=$ip): HTTP=$code"
+    done
+    return 1
+}
+probe() {
+    local code
+    code=$(curl --noproxy '*' --silent --show-error --output /dev/null --write-out '%{http_code}' \
+        --connect-timeout 5 --max-time 15 "$1") || return 1
+    [[ "$code" == 200 ]]
+}
+
+if ! probe "$LOCAL_URL"; then
+    log 'Backend locale non disponibile: Funnel non modificato.'
+    exit 1
+fi
+log 'Backend locale disponibile: HTTP=200.'
+for attempt in 1 2 3; do
+    if public_probe; then exit 0; fi
+    log "Controllo pubblico fallito ($attempt/3)."
+    if [[ "$attempt" != 3 ]]; then sleep 5; fi
+done
+# Il backend potrebbe essere in riavvio dopo il primo controllo.
+if ! probe "$LOCAL_URL"; then
+    log 'Backend locale non più disponibile: ripristino annullato.'
+    exit 1
+fi
+
+# Agisce sul proxy HTTPS di questa applicazione, senza un reset globale.
+log 'Ripristino del proxy Funnel HTTPS sulla porta 443: tre controlli pubblici falliti, backend locale disponibile. Vedere le cause DNS/HTTPS precedenti.'
+if ! timeout 30 tailscale funnel --https=443 off; then
+    log 'Disattivazione del proxy fallita; tentativo di riattivazione comunque eseguito.'
+fi
+if ! timeout 30 tailscale funnel --bg --https=443 "$FUNNEL_TARGET"; then
+    log 'ERRORE: riattivazione Funnel fallita.'
+    exit 2
+fi
+sleep 5
+if public_probe; then
+    log 'Funnel ripristinato correttamente.'
+    exit 0
+fi
+log 'ERRORE: il controllo pubblico fallisce ancora dopo il ripristino.'
+exit 2
+WATCHDOG_3
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/deploy/tailscale-funnel-watchdog.service <<'WATCHDOG_4'
+[Unit]
+Description=Watchdog Tailscale Funnel per servizi HTTP locali
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/tailscale-funnel-watchdog.conf
+ExecStart=/usr/local/sbin/check-tailscale-funnel.sh
+TimeoutStartSec=360
+LogsDirectory=tailscale-funnel
+Environment=LOG_FILE=/var/log/tailscale-funnel/watchdog.log
+SyslogIdentifier=tailscale-funnel-watchdog
+WATCHDOG_4
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/deploy/tailscale-funnel-watchdog.timer <<'WATCHDOG_5'
+[Unit]
+Description=Controllo periodico Tailscale Funnel
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=tailscale-funnel-watchdog.service
+
+[Install]
+WantedBy=timers.target
+WATCHDOG_5
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/deploy/tailscale-funnel.logrotate <<'WATCHDOG_6'
+/var/log/tailscale-funnel/watchdog.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
+WATCHDOG_6
+    cat > /usr/local/lib/roc-museum/funnel-watchdog/scripts/install.sh <<'WATCHDOG_8'
+#!/bin/bash
+set -euo pipefail
+if [[ $EUID != 0 ]]; then echo 'Eseguire con sudo bash scripts/install.sh [file configurazione].' >&2; exit 1; fi
+if (( $# > 1 )); then echo 'Specificare al massimo un file configurazione.' >&2; exit 1; fi
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+config=/etc/tailscale-funnel-watchdog.conf
+for command in python3 curl tailscale timeout systemctl; do command -v "$command" >/dev/null; done
+if [[ -n ${1:-} ]]; then
+    [[ -f $1 ]] || { echo 'Configurazione non trovata.' >&2; exit 1; }
+elif [[ ! -f $config ]]; then
+    echo 'Copiare watchdog.conf.example, personalizzarlo e passarlo come argomento.' >&2
+    exit 1
+fi
+systemctl stop tailscale-funnel-watchdog.timer tailscale-funnel-watchdog.service 2>/dev/null || true
+if [[ -n ${1:-} && ! $1 -ef $config ]]; then
+    if [[ -f $config ]]; then cp -p -- "$config" "$config.bak"; fi
+    install -o root -g root -m 600 -- "$1" "$config"
+fi
+install -o root -g root -m 755 "$root/deploy/check-tailscale-funnel.sh" /usr/local/sbin/check-tailscale-funnel.sh
+install -o root -g root -m 644 "$root/deploy/"*.service "$root/deploy/"*.timer /etc/systemd/system/
+if [[ -d /etc/logrotate.d ]]; then
+    install -o root -g root -m 644 "$root/deploy/tailscale-funnel.logrotate" /etc/logrotate.d/tailscale-funnel
+fi
+systemctl daemon-reload
+systemctl enable --now tailscale-funnel-watchdog.timer
+systemctl start tailscale-funnel-watchdog.service
+systemctl is-active --quiet tailscale-funnel-watchdog.timer
+echo 'Watchdog installato, controllo completato e timer attivo.'
+WATCHDOG_8
+}
+
+write_updater() {
+    cat > /usr/local/lib/roc-museum/updater.py <<'PY_UPDATER'
+#!/usr/bin/env python3
+"""Durable TX-first fleet updates, executed outside the monitor's systemd unit."""
+import contextlib
+import fcntl
+import hashlib
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT=Path('/var/lib/roc-museum/updates')
+CONFIG=Path('/etc/roc-museum.conf')
+SERVICE='roc-museum-update.service'
+REPOSITORY='https://github.com/rivros0/RETE-MUSEO-AudioOverNetwork.git'
+BRANCH='main'
+BUSY={'queued','running'}
+
+
+def version(value):
+    if not isinstance(value,str) or not re.fullmatch(r'\d+(?:\.\d+)*',value):
+        raise ValueError('Versione numerica non valida')
+    parts=[int(v) for v in value.split('.')]
+    while len(parts)>1 and parts[-1]==0: parts.pop()
+    return tuple(parts)
+
+
+def read_config(path=CONFIG):
+    result={}
+    for line in Path(path).read_text().splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key,value=line.split('=',1)
+            tokens=shlex.split(value,comments=True)
+            if len(tokens)==1: result[key]=tokens[0]
+    return result
+
+
+def atomic(path,data):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    fd,name=tempfile.mkstemp(dir=path.parent,prefix='.state-')
+    try:
+        with os.fdopen(fd,'w') as stream:
+            json.dump(data,stream,ensure_ascii=False);stream.flush();os.fsync(stream.fileno())
+        os.replace(name,path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+
+
+def read_json(path,default):
+    try: return json.loads(Path(path).read_text())
+    except FileNotFoundError: return default
+
+
+@contextlib.contextmanager
+def lock(root,blocking=False):
+    root.mkdir(parents=True,exist_ok=True,mode=0o700)
+    with (root/'lock').open('a') as stream:
+        try: fcntl.flock(stream,fcntl.LOCK_EX|(0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError: raise ValueError('Operazione di aggiornamento già in corso') from None
+        yield
+
+
+def targets(text):
+    if not isinstance(text,str) or len(text)>8192: raise ValueError('Elenco RX non valido')
+    result=[]
+    for item in text.splitlines():
+        item=item.strip()
+        if not item: continue
+        if not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]*@[0-9.]+',item):
+            raise ValueError('Inserire un RX per riga nel formato utente@IPv4')
+        ipaddress.IPv4Address(item.split('@')[1])
+        if item in result: raise ValueError('RX duplicato')
+        result.append(item)
+    if len(result)>32: raise ValueError('Massimo 32 RX')
+    return result
+
+
+def command(argv,timeout=60,input=None):
+    result=subprocess.run(argv,input=input,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+    if result.returncode:
+        print(result.stderr.decode('utf-8',errors='replace'),file=sys.stderr,flush=True)
+        raise RuntimeError('Comando fallito: '+Path(argv[0]).name+' (consultare il log aggiornamenti)')
+    return result.stdout.decode('utf-8',errors='replace')
+
+
+def ssh(host,script,input=None,timeout=60):
+    return command(['ssh','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes',
+                    '-o','ConnectTimeout=12','-o','ServerAliveInterval=15',
+                    '-o','ServerAliveCountMax=3',host,script],timeout=timeout,input=input)
+
+
+REMOTE_CONFIG="""import json,shlex
+from pathlib import Path
+result={}
+for line in Path('/etc/roc-museum.conf').read_text().splitlines():
+    if '=' in line and not line.lstrip().startswith('#'):
+        key,value=line.split('=',1); tokens=shlex.split(value,comments=True)
+        if len(tokens)==1: result[key]=tokens[0]
+print(json.dumps(result))
+"""
+
+
+def remote_config(host):
+    return json.loads(ssh(host,'python3 -c '+shlex.quote(REMOTE_CONFIG)))
+
+
+def fetch_candidate(directory):
+    repo=Path(directory)/'repo'
+    command(['git','-c','core.hooksPath=/dev/null','clone','--depth','1','--branch',BRANCH,'--',REPOSITORY,str(repo)],timeout=180)
+    commit=command(['git','-C',str(repo),'rev-parse','HEAD']).strip()
+    if not re.fullmatch('[0-9a-f]{40}',commit): raise ValueError('Commit GitHub non valido')
+    artifact=repo/'setup_roc_museum.sh'
+    if artifact.is_symlink() or not artifact.is_file() or artifact.stat().st_size>4*1024*1024:
+        raise ValueError('Installer GitHub non valido')
+    content=artifact.read_bytes()
+    match=re.search(rb'(?m)^VERSION="(\d+(?:\.\d+)*)"$',content)
+    if not match: raise ValueError('Versione GitHub non disponibile')
+    latest=match[1].decode();version(latest)
+    command(['bash','-n',str(artifact)])
+    return artifact,latest,commit,hashlib.sha256(content).hexdigest()
+
+
+def local_install(artifact,config,log):
+    with log.open('ab') as stream:
+        result=subprocess.run(['bash',str(artifact),'--role','tx','--name',config['NODE_NAME']],stdout=stream,stderr=subprocess.STDOUT,timeout=3600)
+    if result.returncode: raise RuntimeError('Aggiornamento TX fallito: consultare il log')
+
+
+def verify_local(latest):
+    if version(read_config().get('SOFTWARE_VERSION',''))!=version(latest):
+        raise ValueError('Versione TX dopo installazione diversa da quella attesa')
+    for service in ('roc-museum.service','roc-museum-monitor.service'):
+        command(['systemctl','is-active','--quiet',service])
+    # Readiness includes the HTTP monitor, not only systemd's process state.
+    import urllib.request
+    for attempt in range(15):
+        try:
+            with urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3) as response:
+                if response.status==200 and response.read(16)==b'ok\n': return
+        except OSError: pass
+        time.sleep(2)
+    raise RuntimeError('TX aggiornato ma regia non disponibile; propagazione RX fermata')
+
+
+def install_rx(host,artifact,latest,digest):
+    config=remote_config(host)
+    if config.get('ROLE')!='rx': raise ValueError('Il dispositivo non è un RX')
+    current=config.get('SOFTWARE_VERSION','');version(current)
+    if version(current)>=version(latest): return 'Già aggiornato ('+current+')'
+    directory=ssh(host,'mktemp -d /tmp/roc-museum-update.XXXXXXXX').strip()
+    if not re.fullmatch(r'/tmp/roc-museum-update\.[a-zA-Z0-9]+',directory): raise ValueError('Directory remota non valida')
+    remote=directory+'/setup.sh'
+    try:
+        ssh(host,'cat > '+shlex.quote(remote),input=artifact.read_bytes(),timeout=120)
+        actual=ssh(host,'sha256sum -- '+shlex.quote(remote)).split()[0]
+        if actual!=digest: raise ValueError('Integrità installer RX non valida')
+        ipaddress.IPv4Address(config['TX_IP'])
+        invocation=['sudo','-n','bash',remote,'--role','rx','--tx-ip',config['TX_IP'],'--name',config['NODE_NAME']]
+        ssh(host,shlex.join(invocation)+' > '+shlex.quote(directory+'/install.log')+' 2>&1',timeout=3600)
+        after=remote_config(host)
+        if after.get('ROLE')!='rx' or version(after.get('SOFTWARE_VERSION',''))!=version(latest):
+            raise ValueError('Verifica versione RX fallita')
+        ssh(host,'systemctl is-active --quiet roc-museum.service && systemctl is-active --quiet roc-museum-monitor.service')
+        ssh(host,'rm -rf -- '+shlex.quote(directory))
+        return 'Aggiornato a '+latest
+    except Exception:
+        # Preserve logs and installer when outcome needs manual inspection.
+        raise RuntimeError('Aggiornamento RX fallito; log su RX: '+directory+'/install.log') from None
+
+
+class Manager:
+    def __init__(self,root=ROOT): self.root=Path(root)
+    def state(self): return read_json(self.root/'status.json',{'state':'idle','message':'Nessun controllo eseguito','nodes':[]})
+    def snapshot(self):
+        if read_config().get('ROLE')!='tx': raise ValueError('Aggiornamenti disponibili soltanto sul TX')
+        state=self.state()
+        if state['state'] in BUSY and time.time()-state.get('updated_at',0)>20:
+            active=command(['systemctl','show',SERVICE,'--property=ActiveState','--value']).strip()
+            if active not in ('active','activating','reloading'):
+                try:
+                    with lock(self.root):
+                        state=self.state()
+                        if state['state'] in BUSY:
+                            state.update(state='failed',message='Operazione interrotta: controllare log e versioni prima di riprovare',updated_at=time.time())
+                            atomic(self.root/'status.json',state)
+                except ValueError: pass
+        return {**state,'installed':read_config().get('SOFTWARE_VERSION',''),
+                'receivers':'\n'.join(read_json(self.root/'receivers.json',[]))}
+    def request(self,action,data):
+        if read_config().get('ROLE')!='tx': raise ValueError('Aggiornamenti disponibili soltanto sul TX')
+        if action not in ('check','update','configure'): raise ValueError('Azione aggiornamento non valida')
+        with lock(self.root):
+            if self.state()['state'] in BUSY: raise ValueError('Operazione già in corso')
+            if action=='configure':
+                atomic(self.root/'receivers.json',targets(data.get('receivers')))
+                return {'ok':True}
+            active=command(['systemctl','show',SERVICE,'--property=ActiveState','--value']).strip()
+            if active in ('active','activating','reloading'): raise ValueError('Servizio di aggiornamento già in corso')
+            receivers=read_json(self.root/'receivers.json',[])
+            if action=='update' and not receivers:
+                raise ValueError('Configurare prima gli RX da aggiornare')
+            atomic(self.root/'status.json',{'state':'queued','action':action,'message':'Operazione in avvio',
+                                          'updated_at':time.time(),'nodes':[]})
+            try: command(['systemctl','start','--no-block',SERVICE])
+            except Exception:
+                atomic(self.root/'status.json',{'state':'failed','message':'Avvio aggiornamento fallito','nodes':[]})
+                raise
+        return {'ok':True}
+    def worker(self):
+        with lock(self.root,blocking=True):
+            state=self.state()
+            if state.get('state')!='queued': raise ValueError('Nessuna operazione in attesa')
+            def progress(message,**extra):
+                state.update(message=message,updated_at=time.time(),**extra)
+                atomic(self.root/'status.json',state)
+            try:
+                progress('Controllo versione su GitHub',state='running')
+                config=read_config()
+                if config.get('ROLE')!='tx': raise ValueError('Il dispositivo non è un TX')
+                with tempfile.TemporaryDirectory(prefix='release-',dir=self.root) as temp:
+                    artifact,latest,commit,digest=fetch_candidate(temp)
+                    receivers=read_json(self.root/'receivers.json',[])
+                    nodes=[{'host':host,'state':'pending','message':'In attesa'} for host in receivers]
+                    progress('Versione GitHub '+latest,latest=latest,commit=commit,sha256=digest,nodes=nodes)
+                    if state['action']=='check':
+                        progress('Controllo completato',state='checked');return
+                    current=config.get('SOFTWARE_VERSION','');version(current)
+                    if version(current)>version(latest):
+                        raise ValueError('TX più recente di GitHub: aggiornamento fermato per evitare versioni miste')
+                    if version(current)<version(latest):
+                        progress('Aggiornamento TX in corso; la regia si riconnetterà dopo il riavvio')
+                        # Backup of configuration only; live SQLite databases are preserved by setup.
+                        (self.root/'tx-config.backup').write_text(CONFIG.read_text())
+                        local_install(artifact,config,self.root/'tx-install.log')
+                    progress('Verifica TX prima della propagazione')
+                    verify_local(latest)
+                    failures=False
+                    for node in nodes:
+                        progress('Aggiornamento '+node['host'])
+                        node.update(state='running',message='Connessione SSH')
+                        progress(state['message'])
+                        try:
+                            node.update(message=install_rx(node['host'],artifact,latest,digest),state='completed')
+                        except Exception as error:
+                            node.update(state='failed',message=str(error));failures=True
+                        progress('Esito '+node['host'])
+                    progress('Aggiornamento completato con errori RX' if failures else 'TX e RX aggiornati',
+                             state='partial' if failures else 'completed')
+            except Exception as error:
+                progress(str(error),state='failed')
+                raise
+
+
+if __name__=='__main__':
+    if sys.argv[1:]!=['worker']: raise SystemExit('Uso interno: updater.py worker')
+    Manager().worker()
+PY_UPDATER
+    chmod 0644 /usr/local/lib/roc-museum/updater.py
+    cat > /etc/systemd/system/roc-museum-update.service <<'UNIT_UPDATE'
+[Unit]
+Description=RETE MUSEO aggiornamento TX e propagazione RX
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/lib/roc-museum/updater.py worker
+TimeoutStartSec=infinity
+UMask=0077
+UNIT_UPDATE
 }
 
 write_systemd_services() {
@@ -2282,6 +3030,8 @@ main() {
     write_monitor
     ok "Monitor installato."
     step "Configurazione servizi automatici"
+    write_remote_access
+    write_updater
     write_systemd_services
     enable_services
     step "Verifica finale"

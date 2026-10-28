@@ -23,7 +23,7 @@ class Ducker:
     def __init__(self,rate=44100):
         self.rate=rate;self.gain=1.;self.limiter=1.;self.hold=0.
         self.enabled=True;self.threshold_db=-36.;self.reduction_db=-18.
-        self.input_db=-96.;self.active=False
+        self.input_db=-96.;self.active=False;self.volume=1.;self.volume_target=1.
 
     def mix(self,music,microphone):
         mic=pcm_samples(microphone);song=pcm_samples(music)
@@ -34,11 +34,13 @@ class Ducker:
         else: self.hold=max(0.,self.hold-duration)
         self.active=self.enabled and self.hold>0
         target=10**(self.reduction_db/20) if self.active else 1.
+        old_volume=self.volume
+        self.volume=self.volume_target+(self.volume-self.volume_target)*math.exp(-duration/.015)
         previous=self.gain
         tau=.03 if target<previous else .8
         self.gain=target+(previous-target)*math.exp(-duration/tau)
         # Gain ramp avoids discontinuities; the mic is never multiplied by the duck gain.
-        raw=[int(m+(song[i] if i<len(song) else 0)*(previous+(self.gain-previous)*i/max(1,len(mic)-1))) for i,m in enumerate(mic)]
+        raw=[int(m+(song[i] if i<len(song) else 0)*(previous+(self.gain-previous)*i/max(1,len(mic)-1))*(old_volume+(self.volume-old_volume)*i/max(1,len(mic)-1))) for i,m in enumerate(mic)]
         peak=max((abs(v) for v in raw),default=0)
         limit=min(1.,32760/max(1,peak))
         self.limiter=min(limit,self.limiter+(1-self.limiter)*duration/.2)
@@ -62,6 +64,9 @@ class AudioBus:
     def configure(self,settings):
         with self.lock:
             self.ducker.enabled=settings['enabled'];self.ducker.threshold_db=settings['threshold_db'];self.ducker.reduction_db=settings['reduction_db']
+
+    def set_volume(self,percent,muted=False):
+        with self.lock: self.ducker.volume_target=0. if muted else percent/100.
 
     def start(self):
         self.log=tempfile.TemporaryFile()

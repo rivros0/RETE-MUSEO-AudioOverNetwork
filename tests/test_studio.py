@@ -29,6 +29,7 @@ class FakeBus:
         self.sender=Mock();self.sender.poll.return_value=None
         self.eof=False;self.position=0;self.paused=False;self.closed=False;self.attached=None
     def configure(self,settings): self.settings=settings
+    def set_volume(self,percent,muted=False): self.volume=percent;self.muted=muted
     def start(self): pass
     def close(self): self.closed=True
     def attach(self,stream,position=0,deadline=None): self.attached=stream;self.position=position;self.eof=False;self.paused=False

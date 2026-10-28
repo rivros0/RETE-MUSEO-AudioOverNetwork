@@ -7,7 +7,7 @@ from pathlib import Path
 import struct
 import unittest
 from unittest.mock import patch,Mock
-from test_studio import StudioCase,wav,studio,ROOT
+from test_studio import StudioCase,wav,studio,ROOT,FakeBus
 
 spec=importlib.util.spec_from_file_location('audio_bus',ROOT/'audio_bus.py')
 audio=importlib.util.module_from_spec(spec);spec.loader.exec_module(audio)
@@ -222,5 +222,35 @@ class LibraryTests(StudioCase):
         self.assertEqual(self.engine.snapshot()['ducking']['threshold_db'],-30)
         for kwargs in ({'threshold_db':float('nan')},{'reduction_db':10},{'enabled':'yes'}):
             with self.assertRaises(ValueError): self.engine.command({'command':'ducking',**kwargs})
+
+class MusicVolumeTests(StudioCase):
+    def test_music_volume_persists_without_suspending_calendar(self):
+        self.engine.command({'command':'music_volume','value':42})
+        self.assertEqual(self.engine.snapshot()['music_volume'],42)
+        self.assertFalse(self.engine.manual_hold)
+        other=studio.Studio({},self.engine.media,self.engine.state,self.engine.usb_root,bus_marker=self.base/'other-marker')
+        try: self.assertEqual(other.snapshot()['music_volume'],42)
+        finally: other.close()
+
+    def test_music_mute_and_slider_unmute(self):
+        self.engine._ensure_audio()
+        self.engine.command({'command':'music_muted','enabled':True})
+        self.assertTrue(self.engine.bus.muted)
+        self.engine.command({'command':'music_volume','value':55})
+        self.assertEqual(self.engine.bus.volume,55);self.assertFalse(self.engine.bus.muted)
+        self.assertTrue(self.engine.bus.snapshot()['active'])
+
+    def test_volume_validation(self):
+        for value in (-1,101,True,4.5,'25',None):
+            with self.assertRaises(ValueError): self.engine.command({'command':'music_volume','value':value})
+        with self.assertRaises(ValueError): self.engine.command({'command':'music_muted','enabled':'yes'})
+
+    def test_volume_does_not_attenuate_microphone(self):
+        d=audio.Ducker();d.enabled=False;d.volume_target=.25
+        for _ in range(50): data=d.mix(pcm(8000),pcm(2000))
+        self.assertAlmostEqual(average(data),4000,delta=2)
+        d.volume_target=0
+        for _ in range(50): data=d.mix(pcm(8000),pcm(2000))
+        self.assertAlmostEqual(average(data),2000,delta=2)
 
 if __name__=='__main__': unittest.main()

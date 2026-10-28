@@ -1,0 +1,14 @@
+[Unit]
+Description=Watchdog Tailscale Funnel per servizi HTTP locali
+After=network-online.target tailscaled.service
+Wants=network-online.target
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/tailscale-funnel-watchdog.conf
+ExecStart=/usr/local/sbin/check-tailscale-funnel.sh
+TimeoutStartSec=360
+LogsDirectory=tailscale-funnel
+Environment=LOG_FILE=/var/log/tailscale-funnel/watchdog.log
+SyslogIdentifier=tailscale-funnel-watchdog

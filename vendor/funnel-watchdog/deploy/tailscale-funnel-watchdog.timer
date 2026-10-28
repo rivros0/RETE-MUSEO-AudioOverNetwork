@@ -1,0 +1,10 @@
+[Unit]
+Description=Controllo periodico Tailscale Funnel
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=tailscale-funnel-watchdog.service
+
+[Install]
+WantedBy=timers.target

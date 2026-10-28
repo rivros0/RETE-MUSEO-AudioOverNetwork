@@ -123,7 +123,7 @@ class Studio:
             # automatically resumes the original ALSA microphone path.
             fd=os.open(self.bus_marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)
             with os.fdopen(fd,'w') as marker: marker.write(str(os.getpid())+'\n')
-            bus=factory(self.config);bus.configure(self.ducking());bus.start()
+            bus=factory(self.config);bus.configure(self.ducking());bus.set_volume(self._setting("music_volume","100"),self._setting("music_muted"));bus.start()
             self.bus=bus;self.sender=bus.sender
             run(['systemctl','start','roc-museum.service'])
         except Exception:
@@ -267,7 +267,18 @@ class Studio:
     def command(self,data):
         with self.lock:
             command=data.get('command')
-            if command=='ducking':
+            if command=='music_volume':
+                value=data.get('value')
+                if type(value) is not int or not 0<=value<=100: raise ValueError('Volume musica: valore intero tra 0 e 100')
+                self._store_setting('music_volume',value)
+                if value>0: self._store_setting('music_muted',False)
+                if self.bus: self.bus.set_volume(value,self._setting('music_muted'))
+            elif command=='music_muted':
+                enabled=data.get('enabled')
+                if type(enabled) is not bool: raise ValueError('Mute musica non valido')
+                self._store_setting('music_muted',enabled)
+                if self.bus: self.bus.set_volume(self._setting('music_volume','100'),enabled)
+            elif command=='ducking':
                 settings={k:data.get(k,v) for k,v in self.ducking().items()}
                 if type(settings['enabled']) is not bool: raise ValueError('Ducking non valido')
                 for key,low,high in (('threshold_db',-60,-6),('reduction_db',-40,0)):
@@ -319,7 +330,7 @@ class Studio:
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
