@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.16"
+VERSION="4.17"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -1290,7 +1290,7 @@ class Studio:
         self.origin='mixer';self.error='';self.queue=[];self.manual_hold=False
         self.shutdown=threading.Event();self.metadata={};self.thread=None
         self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
-        self.resume_saved=0.;self.restore_thread=None
+        self.resume_saved=0.;self.restore_thread=None;self.playlist_active=False
 
     def start(self):
         try:
@@ -1370,7 +1370,7 @@ class Studio:
         if self.status not in ('playing','paused') or self.origin!='manual' or not self.track:
             return
         state={'status':self.status,'track':self.track,'position':round(self._position(),2),
-               'loop':bool(self.loop),'manual_hold':bool(self.manual_hold),'saved_at':now}
+               'playlist_active':self.playlist_active,'loop':bool(self.loop),'manual_hold':bool(self.manual_hold),'saved_at':now}
         self._store_setting('resume_playback',state)
         self.resume_saved=now
 
@@ -1394,6 +1394,7 @@ class Studio:
                 else:
                     self._clear_playback_resume()
                     return False
+            self.playlist_active=bool(state.get('playlist_active',False))
             self._play(track,position,origin='manual',loop=loop,persist=False)
             self.manual_hold=bool(state.get('manual_hold',True))
             if status=='paused':
@@ -1416,7 +1417,7 @@ class Studio:
         if self.error_log: self.error_log.close();self.error_log=None
 
     def _live(self,clear_resume=True):
-        self._terminate();self.plan=None
+        self._terminate();self.plan=None;self.playlist_active=False
         if not self.bus or not self.bus.snapshot()['active']:
             if self.bus: self.bus.close();self.bus=None
             self.sender=None;self.bus_marker.unlink(missing_ok=True)
@@ -1485,10 +1486,47 @@ class Studio:
             if self.bus: self.bus.set_deadline(None)
             self.plan=None
 
+    def playlist(self):
+        available=[f['name'] for f in self.library()]
+        saved=self._setting('playlist_tracks','null')
+        return available if saved is None else [name for name in available if name in saved]
+
+    def _advance_playlist(self,step=1):
+        names=[f['name'] for f in self.library()];selected=self.playlist()
+        if not selected:
+            self._live();return
+        index=names.index(self.track) if self.track in names else (-1 if step>0 else len(names))
+        candidates=[name for name in selected if (names.index(name)-index)*step>0]
+        name=(candidates[0] if step>0 else candidates[-1]) if candidates else None
+        if name is None and self._setting('playlist_loop'): name=selected[0] if step>0 else selected[-1]
+        if name is None: self._live();return
+        self._play(name,origin='manual');self._save_playback_resume(force=True)
+
     def command(self,data):
         with self.lock:
             command=data.get('command')
-            if command=='music_volume':
+            if command=='playlist_select':
+                names=data.get('tracks')
+                available={f['name'] for f in self.library()}
+                if not isinstance(names,list) or len(names)>len(available) or any(not isinstance(n,str) or n not in available for n in names) or len(set(names))!=len(names):
+                    raise ValueError('Selezione scaletta non valida')
+                self._store_setting('playlist_tracks',names)
+            elif command=='playlist_loop':
+                if type(data.get('enabled')) is not bool: raise ValueError('Loop scaletta non valido')
+                self._store_setting('playlist_loop',data['enabled'])
+                if data['enabled']:
+                    self.loop=False;self._store_setting('track_loop',False)
+                self._save_playback_resume(force=True)
+            elif command=='playlist_start':
+                names=self.playlist()
+                if not names: raise ValueError('Selezionare almeno un brano nella scaletta')
+                self.info(names[0]);self._cancel_plan('suspended')
+                self.playlist_active=True;self.manual_hold=True;self._store_setting('track_loop',False)
+                self._play(names[0],origin='manual')
+            elif command in ('playlist_next','playlist_previous'):
+                if not self.playlist_active: raise ValueError('Scaletta non attiva')
+                self._advance_playlist(1 if command=='playlist_next' else -1)
+            elif command=='music_volume':
                 value=data.get('value')
                 if type(value) is not int or not 0<=value<=100: raise ValueError('Volume musica: valore intero tra 0 e 100')
                 self._store_setting('music_volume',value)
@@ -1520,7 +1558,11 @@ class Studio:
                 # Validate before interrupting an existing programme.
                 self.info(data.get('name'))
                 self._cancel_plan('suspended')
-                self._play(data.get('name'),origin='manual',loop=data.get('loop') is True);self.manual_hold=True
+                self.playlist_active=False
+                loop=data.get('loop',self._setting('track_loop')) is True
+                self._store_setting('track_loop',loop)
+                if loop: self._store_setting('playlist_loop',False)
+                self._play(data.get('name'),origin='manual',loop=loop);self.manual_hold=True
             elif command=='pause':
                 if self.status!='playing': raise ValueError('Nessuna traccia in riproduzione')
                 self.position=self._position();self.bus.pause(True);self.status='paused';self.manual_hold=True
@@ -1539,7 +1581,9 @@ class Studio:
                     self.bus.pause(True);self.status='paused';self._save_playback_resume(force=True)
             elif command=='loop':
                 if type(data.get('enabled')) is not bool: raise ValueError('Loop non valido')
-                self.loop=data['enabled']
+                self.loop=data['enabled'];self._store_setting('track_loop',self.loop)
+                if self.loop:
+                    self.playlist_active=False;self._store_setting('playlist_loop',False)
                 if self.status in ('playing','paused'):
                     self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
                     self._save_playback_resume(force=True)
@@ -1551,7 +1595,7 @@ class Studio:
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -1704,6 +1748,10 @@ class Studio:
                     try: self._next_track(now)
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
                         self.error=str(error);self._cancel_plan('failed');self._live()
+                elif self.playlist_active:
+                    try: self._advance_playlist()
+                    except (OSError,ValueError,subprocess.SubprocessError) as error:
+                        self.error=str(error);self._live()
                 elif self.loop: self._play(self.track,origin=self.origin,loop=True)
                 else: self._live()
             self._save_playback_resume()
@@ -2045,6 +2093,7 @@ PY_AUDIO_BUS
 @media(max-width:540px){.vlc-screen{min-height:150px}.vlc-toolbar{gap:8px}.vlc-transport{gap:0}.vlc-volume{width:100%;justify-content:flex-end}.vlc-library-heading input{width:100%}.vlc-summary-copy small{max-width:48vw}.vlc-file-size{display:none}.vlc-statusbar{font-size:11px}}
 #studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
 
+.vlc-options{flex-wrap:wrap}.vlc-options #repeatToggle,.vlc-options #playlistLoop{width:auto;padding:8px 12px;font-weight:700}.playlist-check{width:20px;height:20px;flex-shrink:0;accent-color:#ff9e36}
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
@@ -2066,14 +2115,14 @@ PY_AUDIO_BUS
 <button type="button" id="playerForward" class="vlc-button" aria-label="Avanti 10 secondi" title="Avanti 10 secondi">↷</button>
 <button type="button" id="playerNext" class="vlc-button" aria-label="Traccia successiva" title="Riproduci traccia successiva">⏭</button>
 </div>
-<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻</button><input type="checkbox" id="playerLoop" hidden></div>
+<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻ Loop brano: OFF</button><button type="button" id="playlistLoop" class="vlc-button" aria-pressed="false">↻ Loop scaletta: OFF</button><input type="checkbox" id="playerLoop" hidden></div>
 <div class="vlc-volume"><button type="button" id="musicMute" class="vlc-button" aria-label="Silenzia musica" aria-pressed="false" title="Silenzia solo la musica">◖))</button><input id="musicVolume" class="vlc-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume musica"><output id="musicVolumeLabel" for="musicVolume">100%</output></div>
 </div>
 <div class="vlc-statusbar"><span id="playerSource">TX · solo microfono</span><span id="groupState"></span><span id="playlistCount">0 tracce</span></div>
 <p id="playerMessage" role="status"></p>
 <details class="vlc-precise"><summary>Vai a un tempo preciso</summary><form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form></details>
 </div>
-<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Un clic seleziona · doppio clic riproduce. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
+<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><button type="button" id="playlistStart">▶ Avvia scaletta</button><p id="playlistStatus" role="status"></p><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Spunta i brani da includere nella scaletta, in ordine di libreria. Un doppio clic avvia un brano singolo e interrompe la scaletta; per ripartire usa Avvia scaletta. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
 </div></details>
 <h3>Annunci dal microfono · ducking</h3>
 <p id="microphoneState" role="status"></p>
@@ -2158,7 +2207,7 @@ library=async function(){
       if(!confirm('Eliminare definitivamente '+f.name+' dalla libreria del TX?'))return;
       perform(async function(){remove.disabled=true;try{var d=await api('/api/media/delete',{name:f.name});await library();message(d.message);}finally{remove.disabled=false;}});
     });remove.className='vlc-delete';remove.title='Elimina traccia';remove.setAttribute('aria-label','Elimina '+f.name);
-    li.append(title,size,remove);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
+    var include=document.createElement('input');include.type='checkbox';include.className='playlist-check';include.dataset.name=f.name;include.setAttribute('aria-label','Includi nella scaletta '+f.name);include.checked=!!playerSnapshot&&playerSnapshot.playlist_tracks.includes(f.name);include.disabled=!playerSnapshot;include.onchange=function(){var tracks=Array.from(document.querySelectorAll('.playlist-check:checked')).map(function(c){return c.dataset.name;});perform(function(){return playerCommand({command:'playlist_select',tracks:tracks});});};li.append(include,title,size,remove);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
   });
   if(data.files.some(function(f){return f.name===old;}))el('trackSelect').value=old;
   if(data.files.some(function(f){return f.name===eventOld;}))el('eventTrack').value=eventOld;
@@ -2185,7 +2234,16 @@ function renderPlayer(){
   el('totalTime').textContent=timeLabel(s?s.duration:0);
   if(!volumeEditing&&s){el('musicVolume').value=s.music_volume;el('musicVolumeLabel').textContent=s.music_volume+'%';}
   if(s){el('musicMute').setAttribute('aria-pressed',s.music_muted?'true':'false');el('musicMute').textContent=s.music_muted?'◖×':'◖))';el('musicMute').setAttribute('aria-label',s.music_muted?'Riattiva musica':'Silenzia musica');}
-  el('repeatToggle').setAttribute('aria-pressed',el('playerLoop').checked?'true':'false');renderTimeline();markTracks();
+  var trackLoop=!!s&&s.track_loop,playlistLoop=!!s&&s.playlist_loop;
+  el('playerLoop').checked=trackLoop;
+  el('repeatToggle').setAttribute('aria-pressed',String(trackLoop));el('repeatToggle').textContent='↻ Loop brano: '+(trackLoop?'ON':'OFF');el('repeatToggle').setAttribute('aria-label','Loop brano: '+(trackLoop?'ON':'OFF'));
+  el('playlistLoop').setAttribute('aria-pressed',String(playlistLoop));el('playlistLoop').textContent='↻ Loop scaletta: '+(playlistLoop?'ON':'OFF');
+  el('repeatToggle').disabled=el('playlistLoop').disabled=playerBusy||!s;
+  document.querySelectorAll('.playlist-check').forEach(function(c){c.checked=!!s&&s.playlist_tracks.includes(c.dataset.name);c.disabled=playerBusy||!s;});
+  el('playlistStart').disabled=playerBusy||!s||!s.playlist_tracks.length;
+  el('playlistStatus').textContent=s?(s.playlist_active?'Scaletta in esecuzione':'Scaletta ferma')+' · '+s.playlist_tracks.length+' brani selezionati'+(s.playlist_loop?' · ripetizione continua':' · un passaggio'):'';
+  if(s&&s.playlist_active){el('playerSource').textContent='Scaletta · tutti gli RX';el('playerNext').disabled=el('playerPrevious').disabled=playerBusy;}
+  renderTimeline();markTracks();
 }
 async function playerCommand(data){if(playerBusy)return;playerBusy=true;playerRevision++;renderPlayer();try{var result=await api('/api/player',data);playerSnapshot=result;playerSampleTime=performance.now();message('');await update();}finally{playerBusy=false;renderPlayer();}}
 function playSelected(){perform(async function(){await playerCommand({command:'play',name:el('trackSelect').value,loop:el('playerLoop').checked});selectionDirty=false;});}
@@ -2238,8 +2296,10 @@ function renderEvents(){
 }
 document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(function(){return playerCommand({command:b.dataset.player});});};});
 el('playerToggle').onclick=togglePlayback;
-el('playerNext').onclick=function(){var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
-el('playerPrevious').onclick=function(){if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
+el('playlistStart').onclick=function(){selectionDirty=false;perform(function(){return playerCommand({command:'playlist_start'});});};
+el('playlistLoop').onclick=function(){perform(function(){return playerCommand({command:'playlist_loop',enabled:!playerSnapshot.playlist_loop});});};
+el('playerNext').onclick=function(){if(playerSnapshot&&playerSnapshot.playlist_active){perform(function(){return playerCommand({command:'playlist_next'});});return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
+el('playerPrevious').onclick=function(){if(playerSnapshot&&playerSnapshot.playlist_active){perform(function(){return playerCommand({command:'playlist_previous'});});return;}if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
 el('playerBack').onclick=function(){seekPlayer(playerPosition()-10);};el('playerForward').onclick=function(){seekPlayer(playerPosition()+10);};
 el('playerSeek').oninput=function(){scrubbing=true;el('elapsedTime').textContent=timeLabel(this.value);};
 el('playerSeek').onchange=function(){var target=Number(this.value);scrubbing=false;seekPlayer(target);};

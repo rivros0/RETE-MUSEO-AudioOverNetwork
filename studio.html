@@ -22,6 +22,7 @@
 @media(max-width:540px){.vlc-screen{min-height:150px}.vlc-toolbar{gap:8px}.vlc-transport{gap:0}.vlc-volume{width:100%;justify-content:flex-end}.vlc-library-heading input{width:100%}.vlc-summary-copy small{max-width:48vw}.vlc-file-size{display:none}.vlc-statusbar{font-size:11px}}
 #studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
 
+.vlc-options{flex-wrap:wrap}.vlc-options #repeatToggle,.vlc-options #playlistLoop{width:auto;padding:8px 12px;font-weight:700}.playlist-check{width:20px;height:20px;flex-shrink:0;accent-color:#ff9e36}
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
@@ -43,14 +44,14 @@
 <button type="button" id="playerForward" class="vlc-button" aria-label="Avanti 10 secondi" title="Avanti 10 secondi">↷</button>
 <button type="button" id="playerNext" class="vlc-button" aria-label="Traccia successiva" title="Riproduci traccia successiva">⏭</button>
 </div>
-<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻</button><input type="checkbox" id="playerLoop" hidden></div>
+<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻ Loop brano: OFF</button><button type="button" id="playlistLoop" class="vlc-button" aria-pressed="false">↻ Loop scaletta: OFF</button><input type="checkbox" id="playerLoop" hidden></div>
 <div class="vlc-volume"><button type="button" id="musicMute" class="vlc-button" aria-label="Silenzia musica" aria-pressed="false" title="Silenzia solo la musica">◖))</button><input id="musicVolume" class="vlc-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume musica"><output id="musicVolumeLabel" for="musicVolume">100%</output></div>
 </div>
 <div class="vlc-statusbar"><span id="playerSource">TX · solo microfono</span><span id="groupState"></span><span id="playlistCount">0 tracce</span></div>
 <p id="playerMessage" role="status"></p>
 <details class="vlc-precise"><summary>Vai a un tempo preciso</summary><form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form></details>
 </div>
-<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Un clic seleziona · doppio clic riproduce. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
+<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><button type="button" id="playlistStart">▶ Avvia scaletta</button><p id="playlistStatus" role="status"></p><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Spunta i brani da includere nella scaletta, in ordine di libreria. Un doppio clic avvia un brano singolo e interrompe la scaletta; per ripartire usa Avvia scaletta. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
 </div></details>
 <h3>Annunci dal microfono · ducking</h3>
 <p id="microphoneState" role="status"></p>
@@ -135,7 +136,7 @@ library=async function(){
       if(!confirm('Eliminare definitivamente '+f.name+' dalla libreria del TX?'))return;
       perform(async function(){remove.disabled=true;try{var d=await api('/api/media/delete',{name:f.name});await library();message(d.message);}finally{remove.disabled=false;}});
     });remove.className='vlc-delete';remove.title='Elimina traccia';remove.setAttribute('aria-label','Elimina '+f.name);
-    li.append(title,size,remove);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
+    var include=document.createElement('input');include.type='checkbox';include.className='playlist-check';include.dataset.name=f.name;include.setAttribute('aria-label','Includi nella scaletta '+f.name);include.checked=!!playerSnapshot&&playerSnapshot.playlist_tracks.includes(f.name);include.disabled=!playerSnapshot;include.onchange=function(){var tracks=Array.from(document.querySelectorAll('.playlist-check:checked')).map(function(c){return c.dataset.name;});perform(function(){return playerCommand({command:'playlist_select',tracks:tracks});});};li.append(include,title,size,remove);el('library').appendChild(li);option(el('trackSelect'),f.name,f.name);option(el('eventTrack'),f.name,f.name);
   });
   if(data.files.some(function(f){return f.name===old;}))el('trackSelect').value=old;
   if(data.files.some(function(f){return f.name===eventOld;}))el('eventTrack').value=eventOld;
@@ -162,7 +163,16 @@ function renderPlayer(){
   el('totalTime').textContent=timeLabel(s?s.duration:0);
   if(!volumeEditing&&s){el('musicVolume').value=s.music_volume;el('musicVolumeLabel').textContent=s.music_volume+'%';}
   if(s){el('musicMute').setAttribute('aria-pressed',s.music_muted?'true':'false');el('musicMute').textContent=s.music_muted?'◖×':'◖))';el('musicMute').setAttribute('aria-label',s.music_muted?'Riattiva musica':'Silenzia musica');}
-  el('repeatToggle').setAttribute('aria-pressed',el('playerLoop').checked?'true':'false');renderTimeline();markTracks();
+  var trackLoop=!!s&&s.track_loop,playlistLoop=!!s&&s.playlist_loop;
+  el('playerLoop').checked=trackLoop;
+  el('repeatToggle').setAttribute('aria-pressed',String(trackLoop));el('repeatToggle').textContent='↻ Loop brano: '+(trackLoop?'ON':'OFF');el('repeatToggle').setAttribute('aria-label','Loop brano: '+(trackLoop?'ON':'OFF'));
+  el('playlistLoop').setAttribute('aria-pressed',String(playlistLoop));el('playlistLoop').textContent='↻ Loop scaletta: '+(playlistLoop?'ON':'OFF');
+  el('repeatToggle').disabled=el('playlistLoop').disabled=playerBusy||!s;
+  document.querySelectorAll('.playlist-check').forEach(function(c){c.checked=!!s&&s.playlist_tracks.includes(c.dataset.name);c.disabled=playerBusy||!s;});
+  el('playlistStart').disabled=playerBusy||!s||!s.playlist_tracks.length;
+  el('playlistStatus').textContent=s?(s.playlist_active?'Scaletta in esecuzione':'Scaletta ferma')+' · '+s.playlist_tracks.length+' brani selezionati'+(s.playlist_loop?' · ripetizione continua':' · un passaggio'):'';
+  if(s&&s.playlist_active){el('playerSource').textContent='Scaletta · tutti gli RX';el('playerNext').disabled=el('playerPrevious').disabled=playerBusy;}
+  renderTimeline();markTracks();
 }
 async function playerCommand(data){if(playerBusy)return;playerBusy=true;playerRevision++;renderPlayer();try{var result=await api('/api/player',data);playerSnapshot=result;playerSampleTime=performance.now();message('');await update();}finally{playerBusy=false;renderPlayer();}}
 function playSelected(){perform(async function(){await playerCommand({command:'play',name:el('trackSelect').value,loop:el('playerLoop').checked});selectionDirty=false;});}
@@ -215,8 +225,10 @@ function renderEvents(){
 }
 document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(function(){return playerCommand({command:b.dataset.player});});};});
 el('playerToggle').onclick=togglePlayback;
-el('playerNext').onclick=function(){var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
-el('playerPrevious').onclick=function(){if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
+el('playlistStart').onclick=function(){selectionDirty=false;perform(function(){return playerCommand({command:'playlist_start'});});};
+el('playlistLoop').onclick=function(){perform(function(){return playerCommand({command:'playlist_loop',enabled:!playerSnapshot.playlist_loop});});};
+el('playerNext').onclick=function(){if(playerSnapshot&&playerSnapshot.playlist_active){perform(function(){return playerCommand({command:'playlist_next'});});return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
+el('playerPrevious').onclick=function(){if(playerSnapshot&&playerSnapshot.playlist_active){perform(function(){return playerCommand({command:'playlist_previous'});});return;}if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
 el('playerBack').onclick=function(){seekPlayer(playerPosition()-10);};el('playerForward').onclick=function(){seekPlayer(playerPosition()+10);};
 el('playerSeek').oninput=function(){scrubbing=true;el('elapsedTime').textContent=timeLabel(this.value);};
 el('playerSeek').onchange=function(){var target=Number(this.value);scrubbing=false;seekPlayer(target);};

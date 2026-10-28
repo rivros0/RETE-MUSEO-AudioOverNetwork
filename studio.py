@@ -69,7 +69,7 @@ class Studio:
         self.origin='mixer';self.error='';self.queue=[];self.manual_hold=False
         self.shutdown=threading.Event();self.metadata={};self.thread=None
         self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
-        self.resume_saved=0.;self.restore_thread=None
+        self.resume_saved=0.;self.restore_thread=None;self.playlist_active=False
 
     def start(self):
         try:
@@ -149,7 +149,7 @@ class Studio:
         if self.status not in ('playing','paused') or self.origin!='manual' or not self.track:
             return
         state={'status':self.status,'track':self.track,'position':round(self._position(),2),
-               'loop':bool(self.loop),'manual_hold':bool(self.manual_hold),'saved_at':now}
+               'playlist_active':self.playlist_active,'loop':bool(self.loop),'manual_hold':bool(self.manual_hold),'saved_at':now}
         self._store_setting('resume_playback',state)
         self.resume_saved=now
 
@@ -173,6 +173,7 @@ class Studio:
                 else:
                     self._clear_playback_resume()
                     return False
+            self.playlist_active=bool(state.get('playlist_active',False))
             self._play(track,position,origin='manual',loop=loop,persist=False)
             self.manual_hold=bool(state.get('manual_hold',True))
             if status=='paused':
@@ -195,7 +196,7 @@ class Studio:
         if self.error_log: self.error_log.close();self.error_log=None
 
     def _live(self,clear_resume=True):
-        self._terminate();self.plan=None
+        self._terminate();self.plan=None;self.playlist_active=False
         if not self.bus or not self.bus.snapshot()['active']:
             if self.bus: self.bus.close();self.bus=None
             self.sender=None;self.bus_marker.unlink(missing_ok=True)
@@ -264,10 +265,47 @@ class Studio:
             if self.bus: self.bus.set_deadline(None)
             self.plan=None
 
+    def playlist(self):
+        available=[f['name'] for f in self.library()]
+        saved=self._setting('playlist_tracks','null')
+        return available if saved is None else [name for name in available if name in saved]
+
+    def _advance_playlist(self,step=1):
+        names=[f['name'] for f in self.library()];selected=self.playlist()
+        if not selected:
+            self._live();return
+        index=names.index(self.track) if self.track in names else (-1 if step>0 else len(names))
+        candidates=[name for name in selected if (names.index(name)-index)*step>0]
+        name=(candidates[0] if step>0 else candidates[-1]) if candidates else None
+        if name is None and self._setting('playlist_loop'): name=selected[0] if step>0 else selected[-1]
+        if name is None: self._live();return
+        self._play(name,origin='manual');self._save_playback_resume(force=True)
+
     def command(self,data):
         with self.lock:
             command=data.get('command')
-            if command=='music_volume':
+            if command=='playlist_select':
+                names=data.get('tracks')
+                available={f['name'] for f in self.library()}
+                if not isinstance(names,list) or len(names)>len(available) or any(not isinstance(n,str) or n not in available for n in names) or len(set(names))!=len(names):
+                    raise ValueError('Selezione scaletta non valida')
+                self._store_setting('playlist_tracks',names)
+            elif command=='playlist_loop':
+                if type(data.get('enabled')) is not bool: raise ValueError('Loop scaletta non valido')
+                self._store_setting('playlist_loop',data['enabled'])
+                if data['enabled']:
+                    self.loop=False;self._store_setting('track_loop',False)
+                self._save_playback_resume(force=True)
+            elif command=='playlist_start':
+                names=self.playlist()
+                if not names: raise ValueError('Selezionare almeno un brano nella scaletta')
+                self.info(names[0]);self._cancel_plan('suspended')
+                self.playlist_active=True;self.manual_hold=True;self._store_setting('track_loop',False)
+                self._play(names[0],origin='manual')
+            elif command in ('playlist_next','playlist_previous'):
+                if not self.playlist_active: raise ValueError('Scaletta non attiva')
+                self._advance_playlist(1 if command=='playlist_next' else -1)
+            elif command=='music_volume':
                 value=data.get('value')
                 if type(value) is not int or not 0<=value<=100: raise ValueError('Volume musica: valore intero tra 0 e 100')
                 self._store_setting('music_volume',value)
@@ -299,7 +337,11 @@ class Studio:
                 # Validate before interrupting an existing programme.
                 self.info(data.get('name'))
                 self._cancel_plan('suspended')
-                self._play(data.get('name'),origin='manual',loop=data.get('loop') is True);self.manual_hold=True
+                self.playlist_active=False
+                loop=data.get('loop',self._setting('track_loop')) is True
+                self._store_setting('track_loop',loop)
+                if loop: self._store_setting('playlist_loop',False)
+                self._play(data.get('name'),origin='manual',loop=loop);self.manual_hold=True
             elif command=='pause':
                 if self.status!='playing': raise ValueError('Nessuna traccia in riproduzione')
                 self.position=self._position();self.bus.pause(True);self.status='paused';self.manual_hold=True
@@ -318,7 +360,9 @@ class Studio:
                     self.bus.pause(True);self.status='paused';self._save_playback_resume(force=True)
             elif command=='loop':
                 if type(data.get('enabled')) is not bool: raise ValueError('Loop non valido')
-                self.loop=data['enabled']
+                self.loop=data['enabled'];self._store_setting('track_loop',self.loop)
+                if self.loop:
+                    self.playlist_active=False;self._store_setting('playlist_loop',False)
                 if self.status in ('playing','paused'):
                     self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
                     self._save_playback_resume(force=True)
@@ -330,7 +374,7 @@ class Studio:
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -483,6 +527,10 @@ class Studio:
                     try: self._next_track(now)
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
                         self.error=str(error);self._cancel_plan('failed');self._live()
+                elif self.playlist_active:
+                    try: self._advance_playlist()
+                    except (OSError,ValueError,subprocess.SubprocessError) as error:
+                        self.error=str(error);self._live()
                 elif self.loop: self._play(self.track,origin=self.origin,loop=True)
                 else: self._live()
             self._save_playback_resume()

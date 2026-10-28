@@ -589,3 +589,18 @@ Non è previsto rollback automatico: dopo timeout o perdita della connessione
 verificare l’esito sul nodo prima di riprovare. Un job interrotto da reboot o da
 arresto del servizio è segnalato come interrotto e non riparte automaticamente.
 Le API `/api/updates` richiedono login; le azioni POST richiedono anche CSRF.
+
+### Scaletta manuale · v4.17
+
+Le checkbox nella libreria definiscono i brani della scaletta, in ordine alfabetico.
+**Avvia scaletta** riproduce soltanto quelli spuntati. Le modifiche alle checkbox
+si applicano dal prossimo cambio traccia: il brano corrente termina normalmente.
+Senza **Loop scaletta**, dopo l’ultimo brano la musica si ferma; con il loop
+riparte dal primo selezionato. Una selezione vuota ferma la scaletta al cambio.
+**Loop brano** ripete il singolo brano; i due loop sono alternativi.
+Il doppio clic o Riproduci selezione avvia un brano singolo e interrompe la
+scaletta, senza riprenderla automaticamente al termine. Per ripartire serve
+**Avvia scaletta**. Selezione e modalità loop sono salvate sul TX e condivise
+tra browser; la scaletta attiva viene ripristinata insieme al player al riavvio.
+Nuovi file restano esclusi dopo il primo salvataggio esplicito delle checkbox.
+Calendario, ducking e ingresso annunci rimangono indipendenti dalla selezione.
