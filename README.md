@@ -525,8 +525,8 @@ repository configurata prima di distribuirle con questo profilo.
 Dopo il login, la sezione richiudibile **Aggiornamento dispositivi · TX e RX**
 permette di controllare la versione GitHub e aggiornare l’intero impianto.
 
-1. In **Ricevitori da aggiornare** salvare un RX per riga, per esempio
-   `nino@192.168.1.51`. Si usa la porta SSH standard 22.
+1. Gli RX sono rilevati automaticamente dagli heartbeat ricevuti dal TX: non è
+   necessario compilare indirizzi o utenti. La porta SSH è la 22.
 2. **Controlla versione GitHub** legge l’installer dal ramo `main` della repository
    `rivros0/RETE-MUSEO-AudioOverNetwork` e mostra versione e commit, senza installare.
 3. **Aggiorna TX e propaga agli RX** controlla nuovamente GitHub, aggiorna prima
@@ -537,8 +537,10 @@ I nodi già alla versione attesa o superiore vengono saltati. Se il TX è più
 recente di GitHub, la distribuzione si ferma per evitare un downgrade del TX e
 una propagazione di una release più vecchia. Un errore TX ferma la propagazione;
 un errore su un RX viene registrato e non impedisce il tentativo sugli altri RX.
-Il profilo dei ricevitori persiste e si modifica soltanto dall’amministrazione;
-non si deducono destinazioni SSH dai pacchetti heartbeat.
+La finestra di avvio mostra nome, IP e disponibilità degli RX rilevati. Si possono
+selezionare uno o più RX e usare credenziali comuni oppure specifiche per modulo.
+Il server accetta solo RX online presenti nel registro del TX e verifica via SSH
+che ciascun dispositivo abbia effettivamente ruolo RX prima di aggiornare il TX.
 
 Il lavoro gira in `roc-museum-update.service`, separato dal monitor: prosegue
 anche dopo la chiusura del browser e durante il riavvio della regia. Dopo il
@@ -548,28 +550,24 @@ conservati dall’installer; l’aggiornamento comporta una breve interruzione a
 Il nome del nodo e l’IP del TX sugli RX vengono mantenuti. Per ogni nuova release
 incrementare `VERSION` nell’installer prima di pubblicarla su GitHub.
 
-### Preparazione una tantum dell’accesso SSH dal TX
+### Credenziali richieste all’avvio · v4.18
 
-Il servizio gira come root sul TX e usa OpenSSH con `BatchMode=yes` e verifica
-obbligatoria delle chiavi host. Preparare una chiave dedicata sul TX, se non è già
-presente, e installarne la parte pubblica negli `authorized_keys` degli utenti RX.
-Per esempio, sul TX:
+Premendo **Aggiorna TX e propaga agli RX** si apre una finestra con i ricevitori
+rilevati. Selezionare gli RX e scegliere **Uguali per tutti gli RX selezionati**
+oppure **Specifiche per ciascun RX**. Inserire utente e password SSH; per un utente
+diverso da root inserire anche la password di root, se diversa dalla password SSH.
+Il worker usa `su` per eseguire l’installer come root. Non occorrono chiavi SSH
+preinstallate né sudo senza password; il server SSH del ricevitore deve consentire
+l’accesso con password all’utente scelto e `su` a root deve essere disponibile.
 
-```bash
-sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519
-sudo ssh-copy-id nino@192.168.1.51
-sudo ssh -o BatchMode=yes -o StrictHostKeyChecking=yes nino@192.168.1.51 'sudo -n true'
-```
+Le credenziali sono temporanee: il job le conserva in `/run`, in un file leggibile
+solo da root, per sopravvivere al riavvio della regia e le elimina al termine o
+se l’avvio fallisce. Non vengono incluse negli stati, nei log o nello storage del
+browser. Dopo un riavvio del TX occorre reinserirle. Le chiavi host già note sono
+verificate; quelle sconosciute vengono accettate solo per la connessione corrente
+sulla LAN, senza creare una configurazione SSH persistente.
 
-Se esiste già `/root/.ssh/id_ed25519`, riutilizzarla senza sovrascriverla. La chiave
-usata dal servizio deve poter funzionare senza una richiesta interattiva di
-passphrase. Durante il primo collegamento confrontare l’impronta della chiave host
-con quella del ricevitore prima di accettarla. Ripetere per ogni RX. Gli utenti RX
-devono poter eseguire l’installer con `sudo -n`; l’esempio di verifica controlla
-un accesso sudo senza richiesta di password. Non vengono salvate password SSH
-nel browser o nella regia.
-
-Per usare questa funzione occorre installare una prima volta la v4.16 sul TX col
+Per usare questa funzione occorre installare una prima volta la v4.18 sul TX col
 setup aggiornato. I successivi aggiornamenti partono dal pulsante, purché la
 release sia pubblicata nel ramo GitHub configurato. Non viene eseguito alcun push
 su GitHub dalla regia.

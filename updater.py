@@ -20,6 +20,7 @@ SERVICE='roc-museum-update.service'
 REPOSITORY='https://github.com/rivros0/RETE-MUSEO-AudioOverNetwork.git'
 BRANCH='main'
 BUSY={'queued','running'}
+SECRETS=Path('/run/roc-museum-update-job.json')
 
 
 def version(value):
@@ -94,6 +95,65 @@ def ssh(host,script,input=None,timeout=60):
                     '-o','ServerAliveCountMax=3',host,script],timeout=timeout,input=input)
 
 
+class PasswordSSH:
+    """One in-memory SSH connection; passwords never appear in commands or logs."""
+    def __init__(self, address, credentials):
+        import paramiko
+        self.client=paramiko.SSHClient()
+        self.client.load_system_host_keys()
+        # Unknown LAN hosts are trusted for this connection only. Known changed keys fail.
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self.credentials=credentials
+        try:
+            self.client.connect(address, username=credentials['username'], password=credentials['password'],
+                                look_for_keys=False, allow_agent=False, timeout=12, auth_timeout=15, banner_timeout=15)
+        except Exception:
+            self.client.close()
+            raise RuntimeError('Connessione SSH fallita: verificare credenziali e chiave host') from None
+    def close(self): self.client.close()
+    def __call__(self, host, script, input=None, timeout=60):
+        stdin,stdout,stderr=self.client.exec_command(script,timeout=timeout)
+        if input: stdin.write(input);stdin.flush()
+        stdin.channel.shutdown_write()
+        # Drain both streams concurrently to avoid SSH window deadlocks.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            out=pool.submit(stdout.read);err=pool.submit(stderr.read)
+            result=out.result();err.result()
+        if stdout.channel.recv_exit_status():
+            raise RuntimeError('Comando remoto fallito (consultare il log sul ricevitore)')
+        return result.decode('utf-8',errors='replace')
+    def privileged(self, host, script, timeout=60):
+        if self.credentials['username']=='root': return self(host,script,timeout=timeout)
+        # su reads the root password from a terminal, without exposing it in argv.
+        stdin,stdout,stderr=self.client.exec_command('su - root -c '+shlex.quote(script),get_pty=True,timeout=timeout)
+        import select
+        channel=stdout.channel;output=b'';sent=False;deadline=time.monotonic()+timeout
+        while True:
+            if time.monotonic()>deadline:
+                channel.close();raise RuntimeError('Timeout comando amministrativo RX')
+            if channel.recv_ready():
+                output+=channel.recv(4096)
+                if not sent and (b':' in output or b'password' in output.lower()):
+                    channel.sendall((self.credentials['root_password']+'\n').encode());sent=True
+                # Keep only a short prompt buffer; never log terminal output.
+                output=output[-1024:]
+            elif channel.exit_status_ready(): break
+            else: select.select([channel],[],[],0.1)
+        if channel.recv_exit_status(): raise RuntimeError('Accesso root o comando amministrativo RX fallito')
+
+
+def credential(value):
+    if not isinstance(value,dict): raise ValueError('Credenziali RX mancanti')
+    user=value.get('username','');password=value.get('password','');root=value.get('root_password') or password
+    if not isinstance(user,str) or not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]*',user):
+        raise ValueError('Nome utente SSH non valido')
+    for secret in (password,root):
+        if not isinstance(secret,str) or not secret or len(secret)>1024 or any(c in secret for c in ('\n','\r','\0')):
+            raise ValueError('Password RX mancante o non valida')
+    return {'username':user,'password':password,'root_password':root}
+
+
 REMOTE_CONFIG="""import json,shlex
 from pathlib import Path
 result={}
@@ -105,8 +165,8 @@ print(json.dumps(result))
 """
 
 
-def remote_config(host):
-    return json.loads(ssh(host,'python3 -c '+shlex.quote(REMOTE_CONFIG)))
+def remote_config(host, connection=None):
+    return json.loads((connection or ssh)(host,'python3 -c '+shlex.quote(REMOTE_CONFIG)))
 
 
 def fetch_candidate(directory):
@@ -147,26 +207,29 @@ def verify_local(latest):
     raise RuntimeError('TX aggiornato ma regia non disponibile; propagazione RX fermata')
 
 
-def install_rx(host,artifact,latest,digest):
-    config=remote_config(host)
+def install_rx(host,artifact,latest,digest,connection=None):
+    run=connection or ssh
+    config=remote_config(host,connection) if connection else remote_config(host)
     if config.get('ROLE')!='rx': raise ValueError('Il dispositivo non è un RX')
     current=config.get('SOFTWARE_VERSION','');version(current)
     if version(current)>=version(latest): return 'Già aggiornato ('+current+')'
-    directory=ssh(host,'mktemp -d /tmp/roc-museum-update.XXXXXXXX').strip()
+    directory=run(host,'mktemp -d /tmp/roc-museum-update.XXXXXXXX').strip()
     if not re.fullmatch(r'/tmp/roc-museum-update\.[a-zA-Z0-9]+',directory): raise ValueError('Directory remota non valida')
     remote=directory+'/setup.sh'
     try:
-        ssh(host,'cat > '+shlex.quote(remote),input=artifact.read_bytes(),timeout=120)
-        actual=ssh(host,'sha256sum -- '+shlex.quote(remote)).split()[0]
+        run(host,'cat > '+shlex.quote(remote),input=artifact.read_bytes(),timeout=120)
+        actual=run(host,'sha256sum -- '+shlex.quote(remote)).split()[0]
         if actual!=digest: raise ValueError('Integrità installer RX non valida')
         ipaddress.IPv4Address(config['TX_IP'])
-        invocation=['sudo','-n','bash',remote,'--role','rx','--tx-ip',config['TX_IP'],'--name',config['NODE_NAME']]
-        ssh(host,shlex.join(invocation)+' > '+shlex.quote(directory+'/install.log')+' 2>&1',timeout=3600)
-        after=remote_config(host)
+        invocation=['bash',remote,'--role','rx','--tx-ip',config['TX_IP'],'--name',config['NODE_NAME']]
+        script=shlex.join(invocation)+' > '+shlex.quote(directory+'/install.log')+' 2>&1'
+        if connection: connection.privileged(host,script,timeout=3600)
+        else: run(host,'sudo -n '+script,timeout=3600)
+        after=remote_config(host,connection) if connection else remote_config(host)
         if after.get('ROLE')!='rx' or version(after.get('SOFTWARE_VERSION',''))!=version(latest):
             raise ValueError('Verifica versione RX fallita')
-        ssh(host,'systemctl is-active --quiet roc-museum.service && systemctl is-active --quiet roc-museum-monitor.service')
-        ssh(host,'rm -rf -- '+shlex.quote(directory))
+        run(host,'systemctl is-active --quiet roc-museum.service && systemctl is-active --quiet roc-museum-monitor.service')
+        run(host,'rm -rf -- '+shlex.quote(directory))
         return 'Aggiornato a '+latest
     except Exception:
         # Preserve logs and installer when outcome needs manual inspection.
@@ -174,7 +237,19 @@ def install_rx(host,artifact,latest,digest):
 
 
 class Manager:
-    def __init__(self,root=ROOT): self.root=Path(root)
+    def __init__(self,root=ROOT,discover=None,secrets=SECRETS):
+        self.root=Path(root);self.discover=discover or (lambda: []);self.secrets=Path(secrets)
+    def receivers(self):
+        result=[];seen=set()
+        for node in self.discover():
+            if node.get('role')!='rx': continue
+            try: address=str(ipaddress.IPv4Address(node.get('source_ip','')))
+            except (ValueError,TypeError): continue
+            if address in seen: continue
+            seen.add(address)
+            result.append({'ip':address,'name':str(node.get('name',address))[:100],
+                           'online':time.time()-node.get('received_at',0)<=15})
+        return result[:32]
     def state(self): return read_json(self.root/'status.json',{'state':'idle','message':'Nessun controllo eseguito','nodes':[]})
     def snapshot(self):
         if read_config().get('ROLE')!='tx': raise ValueError('Aggiornamenti disponibili soltanto sul TX')
@@ -188,26 +263,36 @@ class Manager:
                         if state['state'] in BUSY:
                             state.update(state='failed',message='Operazione interrotta: controllare log e versioni prima di riprovare',updated_at=time.time())
                             atomic(self.root/'status.json',state)
+                            self.secrets.unlink(missing_ok=True)
                 except ValueError: pass
         return {**state,'installed':read_config().get('SOFTWARE_VERSION',''),
-                'receivers':'\n'.join(read_json(self.root/'receivers.json',[]))}
+                'receivers':self.receivers()}
     def request(self,action,data):
         if read_config().get('ROLE')!='tx': raise ValueError('Aggiornamenti disponibili soltanto sul TX')
-        if action not in ('check','update','configure'): raise ValueError('Azione aggiornamento non valida')
+        if action not in ('check','update'): raise ValueError('Azione aggiornamento non valida')
         with lock(self.root):
             if self.state()['state'] in BUSY: raise ValueError('Operazione già in corso')
-            if action=='configure':
-                atomic(self.root/'receivers.json',targets(data.get('receivers')))
-                return {'ok':True}
             active=command(['systemctl','show',SERVICE,'--property=ActiveState','--value']).strip()
             if active in ('active','activating','reloading'): raise ValueError('Servizio di aggiornamento già in corso')
-            receivers=read_json(self.root/'receivers.json',[])
-            if action=='update' and not receivers:
-                raise ValueError('Configurare prima gli RX da aggiornare')
+            if action=='update':
+                known={n['ip'] for n in self.receivers() if n['online']}
+                selected=data.get('receivers')
+                if not isinstance(selected,list) or not selected or len(selected)>32:
+                    raise ValueError('Selezionare almeno un RX online')
+                if any(not isinstance(ip,str) or ip not in known for ip in selected) or len(set(selected))!=len(selected):
+                    raise ValueError('Elenco RX cambiato: riaprire la finestra di aggiornamento')
+                scope=data.get('scope')
+                if scope not in ('all','individual'): raise ValueError('Modalità credenziali non valida')
+                values=data.get('credentials')
+                if not isinstance(values,dict): raise ValueError('Credenziali RX mancanti')
+                job=[{'ip':ip,'credentials':credential(values if scope=='all' else values.get(ip))} for ip in selected]
+                self.secrets.parent.mkdir(parents=True,exist_ok=True)
+                atomic(self.secrets,job)
             atomic(self.root/'status.json',{'state':'queued','action':action,'message':'Operazione in avvio',
                                           'updated_at':time.time(),'nodes':[]})
             try: command(['systemctl','start','--no-block',SERVICE])
             except Exception:
+                self.secrets.unlink(missing_ok=True)
                 atomic(self.root/'status.json',{'state':'failed','message':'Avvio aggiornamento fallito','nodes':[]})
                 raise
         return {'ok':True}
@@ -218,13 +303,21 @@ class Manager:
             def progress(message,**extra):
                 state.update(message=message,updated_at=time.time(),**extra)
                 atomic(self.root/'status.json',state)
+            connections={}
             try:
+                job=read_json(self.secrets,None) if state['action']=='update' else None
+                if state['action']=='update' and job is None: raise ValueError('Credenziali scadute: avviare nuovamente l’aggiornamento')
+                for item in job or []:
+                    host=item['ip'];progress('Verifica accesso SSH e root '+host,state='running')
+                    conn=PasswordSSH(host,item['credentials']);connections[host]=conn
+                    if remote_config(host,conn).get('ROLE')!='rx': raise ValueError('Il dispositivo non è un RX: '+host)
+                    conn.privileged(host,'true')
                 progress('Controllo versione su GitHub',state='running')
                 config=read_config()
                 if config.get('ROLE')!='tx': raise ValueError('Il dispositivo non è un TX')
                 with tempfile.TemporaryDirectory(prefix='release-',dir=self.root) as temp:
                     artifact,latest,commit,digest=fetch_candidate(temp)
-                    receivers=read_json(self.root/'receivers.json',[])
+                    receivers=[item['ip'] for item in job] if job is not None else []
                     nodes=[{'host':host,'state':'pending','message':'In attesa'} for host in receivers]
                     progress('Versione GitHub '+latest,latest=latest,commit=commit,sha256=digest,nodes=nodes)
                     if state['action']=='check':
@@ -245,7 +338,7 @@ class Manager:
                         node.update(state='running',message='Connessione SSH')
                         progress(state['message'])
                         try:
-                            node.update(message=install_rx(node['host'],artifact,latest,digest),state='completed')
+                            node.update(message=install_rx(node['host'],artifact,latest,digest,connections[node['host']]),state='completed')
                         except Exception as error:
                             node.update(state='failed',message=str(error));failures=True
                         progress('Esito '+node['host'])
@@ -254,6 +347,9 @@ class Manager:
             except Exception as error:
                 progress(str(error),state='failed')
                 raise
+            finally:
+                for conn in connections.values(): conn.close()
+                self.secrets.unlink(missing_ok=True)
 
 
 if __name__=='__main__':

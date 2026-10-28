@@ -98,12 +98,19 @@
 <button type="button" id="deployUpdates">Aggiorna TX e propaga agli RX</button>
 <p id="updateMessage" role="status" aria-live="polite"></p>
 <ul id="updateNodes"></ul>
-<details><summary>Ricevitori da aggiornare</summary>
-<p>Un ricevitore per riga, nel formato utente@indirizzo-IP. Il TX deve già disporre dell’accesso SSH con chiave, della chiave host verificata e di sudo senza password sugli RX.</p>
-<form id="updateReceiversForm"><label for="updateReceivers">Elenco RX</label><br>
-<textarea id="updateReceivers" rows="4" style="width:100%;box-sizing:border-box" placeholder="nino@192.168.1.51"></textarea><br>
-<button id="saveUpdateReceivers">Salva ricevitori</button></form>
-</details>
+<p>Gli RX vengono rilevati automaticamente dal TX. All’avvio scegli i ricevitori e inserisci le credenziali SSH e di root, comuni a tutti i selezionati oppure diverse per ogni modulo.</p>
+<dialog id="updateCredentials" style="background:#1f2937;color:#e5e7eb;max-width:650px;width:90%;max-height:85vh;overflow:auto;border:1px solid #6b7280;border-radius:10px">
+<form id="updateCredentialsForm">
+<h3>Aggiornamento TX e ricevitori rilevati</h3>
+<p>Il TX si aggiorna per primo, poi gli RX selezionati. L’audio subirà brevi interruzioni.</p>
+<div id="discoveredReceivers"></div>
+<label>Credenziali <select id="credentialScope"><option value="all">Uguali per tutti gli RX selezionati</option><option value="individual">Specifiche per ciascun RX</option></select></label>
+<div id="credentialFields"></div>
+<p class="hint">Per accedere direttamente come root, usa root come nome utente. Con un altro utente, inserisci anche la password di root se diversa da quella SSH. Le credenziali valgono solo per questo aggiornamento.</p>
+<p id="credentialMessage" role="status" aria-live="polite"></p>
+<button type="submit" id="startCredentialUpdate">Avvia aggiornamento</button>
+<button type="button" id="cancelCredentialUpdate">Annulla</button>
+</form></dialog>
 <p class="hint">Puoi chiudere il browser: l’operazione prosegue sul TX. Il riavvio della regia richiede un nuovo login; rientra qui per vedere l’esito.</p>
 </details>
 </section>
@@ -269,7 +276,7 @@ async function browse(path){
 el('scanUSB').onclick=function(){perform(scan);};el('openUSB').onclick=function(){perform(function(){return browse('');});};
 el('usbParent').onclick=function(){perform(function(){return browse(usbPath.split('/').slice(0,-1).join('/'));});};
 el('ejectUSB').onclick=function(){perform(async function(){await api('/api/usb/eject',{device:el('usbDevice').value});usbPath='';usbOpened='';el('usbEntries').replaceChildren();el('usbPath').textContent='Pennetta espulsa';message('È possibile scollegare la pennetta');await scan();});};
-var updateLoaded=false,updatePolling=false;
+var updatePolling=false;
 async function refreshUpdates(){
   if(!authorized||updatePolling||!el('updatePanel').open)return;
   updatePolling=true;
@@ -277,9 +284,7 @@ async function refreshUpdates(){
     var s=await api('/api/updates'),busy=['queued','running'].includes(s.state);
     el('updateVersions').textContent='TX installato: '+s.installed+(s.latest?' · GitHub: '+s.latest:'')+(s.commit?' · commit '+s.commit.slice(0,12):'');
     el('updateMessage').textContent=s.message;
-    ['checkUpdates','deployUpdates','saveUpdateReceivers'].forEach(function(id){el(id).disabled=busy;});
-    el('updateReceivers').disabled=busy;
-    if(!updateLoaded){el('updateReceivers').value=s.receivers;updateLoaded=true;}
+    ['checkUpdates','deployUpdates'].forEach(function(id){el(id).disabled=busy;});
     el('updateNodes').replaceChildren();(s.nodes||[]).forEach(function(n){var li=document.createElement('li');li.textContent=n.host+' · '+n.message;el('updateNodes').appendChild(li);});
   }catch(error){el('updateMessage').textContent='Regia non disponibile: attendi il riavvio e accedi nuovamente per leggere l’esito. '+error.message;}
   finally{updatePolling=false;}
@@ -290,8 +295,45 @@ async function requestUpdate(action){
   catch(error){el('updateMessage').textContent=error.message;el('checkUpdates').disabled=false;el('deployUpdates').disabled=false;}
 }
 el('checkUpdates').onclick=function(){requestUpdate('check');};
-el('deployUpdates').onclick=function(){if(confirm('Aggiornare prima il TX e poi tutti gli RX configurati? L’audio subirà brevi interruzioni.'))requestUpdate('update');};
-el('updateReceiversForm').onsubmit=async function(event){event.preventDefault();try{await api('/api/updates',{action:'configure',receivers:el('updateReceivers').value});el('updateMessage').textContent='Ricevitori salvati';}catch(error){el('updateMessage').textContent=error.message;}};
+var updateReceivers=[],credentialGroups=[];
+function renderCredentialFields(){
+  el('credentialFields').replaceChildren();credentialGroups=[];
+  var groups=el('credentialScope').value==='all'?[{ip:'all',name:'Tutti gli RX selezionati'}]:updateReceivers.filter(function(n){return n.online;});
+  groups.forEach(function(n){
+    var field=document.createElement('fieldset'),legend=document.createElement('legend');legend.textContent=n.name+(n.ip==='all'?'':' · '+n.ip);field.appendChild(legend);
+    var inputs={};[['username','Utente SSH','text'],['password','Password SSH','password'],['root_password','Password root (se diversa)','password']].forEach(function(info){
+      var label=document.createElement('label'),input=document.createElement('input');label.textContent=info[1]+' ';input.type=info[2];input.autocomplete='off';input.maxLength=info[0]==='username'?64:1024;input.required=info[0]!=='root_password';if(info[0]==='username')input.value='root';label.appendChild(input);field.appendChild(label);field.appendChild(document.createElement('br'));inputs[info[0]]=input;
+    });
+    el('credentialFields').appendChild(field);credentialGroups.push({ip:n.ip,inputs:inputs,field:field});
+  });
+  syncCredentialSelection();
+}
+function selectedReceivers(){return Array.from(el('discoveredReceivers').querySelectorAll('input:checked')).map(function(input){return input.value;});}
+function syncCredentialSelection(){
+  var selected=selectedReceivers();credentialGroups.forEach(function(g){g.field.disabled=g.ip!=='all'&&!selected.includes(g.ip);g.field.hidden=g.field.disabled;});
+  el('startCredentialUpdate').disabled=!selected.length;
+}
+function clearUpdateCredentials(){el('credentialFields').replaceChildren();credentialGroups=[];}
+el('credentialScope').onchange=renderCredentialFields;
+el('updateCredentials').addEventListener('close',clearUpdateCredentials);
+el('cancelCredentialUpdate').onclick=function(){el('updateCredentials').close();};
+el('deployUpdates').onclick=function(){perform(async function(){
+  var state=await api('/api/updates');if(['queued','running'].includes(state.state))throw new Error('Aggiornamento già in corso');
+  updateReceivers=state.receivers||[];el('discoveredReceivers').replaceChildren();el('credentialMessage').textContent='';
+  updateReceivers.forEach(function(n){var label=document.createElement('label'),input=document.createElement('input');input.type='checkbox';input.value=n.ip;input.checked=n.online;input.disabled=!n.online;input.onchange=syncCredentialSelection;label.appendChild(input);label.appendChild(document.createTextNode(n.name+' · '+n.ip+(n.online?'':' · offline')));el('discoveredReceivers').appendChild(label);el('discoveredReceivers').appendChild(document.createElement('br'));});
+  if(!updateReceivers.some(function(n){return n.online;}))el('credentialMessage').textContent='Nessun RX online rilevato. Attendi che i ricevitori si colleghino al TX.';
+  renderCredentialFields();el('updateCredentials').showModal();
+});};
+el('updateCredentialsForm').onsubmit=async function(event){
+  event.preventDefault();var credentials={},scope=el('credentialScope').value;
+  credentialGroups.forEach(function(g){if(g.field.disabled)return;var value={};Object.keys(g.inputs).forEach(function(k){value[k]=g.inputs[k].value;});if(scope==='all')credentials=value;else credentials[g.ip]=value;});
+  el('startCredentialUpdate').disabled=true;el('cancelCredentialUpdate').disabled=true;
+  try{
+    await api('/api/updates',{action:'update',scope:scope,receivers:selectedReceivers(),credentials:credentials});
+    el('updateCredentials').close();await refreshUpdates();
+  }catch(error){el('credentialMessage').textContent=error.message;syncCredentialSelection();}
+  finally{credentials=null;el('cancelCredentialUpdate').disabled=false;}
+};
 el('updatePanel').addEventListener('toggle',refreshUpdates);
 setInterval(refreshUpdates,3000);
 
