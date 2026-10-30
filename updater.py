@@ -123,35 +123,73 @@ class PasswordSSH:
         if stdout.channel.recv_exit_status():
             raise RuntimeError('Comando remoto fallito (consultare il log sul ricevitore)')
         return result.decode('utf-8',errors='replace')
-    def privileged(self, host, script, timeout=60):
-        if self.credentials['username']=='root': return self(host,script,timeout=timeout)
-        # su reads the root password from a terminal, without exposing it in argv.
-        stdin,stdout,stderr=self.client.exec_command('su - root -c '+shlex.quote(script),get_pty=True,timeout=timeout)
+    def _sudo_with_password(self, script, timeout):
+        # Use the same password used for SSH authentication. The password is
+        # written only to the sudo terminal and never appears in argv or logs.
+        command='sudo -S -p '+shlex.quote('Password: ')+' -- sh -c '+shlex.quote(script)
+        stdin,stdout,stderr=self.client.exec_command(command,get_pty=True,timeout=timeout)
         import select
-        channel=stdout.channel;output=b'';sent=False;deadline=time.monotonic()+timeout
+        channel=stdout.channel
+        output=b''
+        sent=False
+        deadline=time.monotonic()+timeout
+
         while True:
             if time.monotonic()>deadline:
-                channel.close();raise RuntimeError('Timeout comando amministrativo RX')
+                channel.close()
+                raise RuntimeError('Timeout comando amministrativo RX')
+
             if channel.recv_ready():
                 output+=channel.recv(4096)
-                if not sent and (b':' in output or b'password' in output.lower()):
-                    channel.sendall((self.credentials['root_password']+'\n').encode());sent=True
-                # Keep only a short prompt buffer; never log terminal output.
-                output=output[-1024:]
-            elif channel.exit_status_ready(): break
-            else: select.select([channel],[],[],0.1)
-        if channel.recv_exit_status(): raise RuntimeError('Accesso root o comando amministrativo RX fallito')
+                lowered=output.lower()
+                if not sent and (b'password:' in lowered or b'[sudo]' in lowered):
+                    channel.sendall((self.credentials['password']+'\n').encode())
+                    sent=True
+                output=output[-2048:]
+            elif channel.exit_status_ready():
+                break
+            else:
+                select.select([channel],[],[],0.1)
+
+        result=channel.recv_exit_status()
+        if result:
+            raise RuntimeError(
+                'Comando amministrativo RX fallito: verificare che l’utente SSH sia root '
+                'oppure sia abilitato a sudo con la stessa password'
+            )
+
+    def privileged(self, host, script, timeout=60):
+        if self.credentials['username']=='root':
+            return self(host,script,timeout=timeout)
+
+        # First support accounts configured for passwordless sudo. This avoids
+        # sending anything to stdin when sudo does not need authentication.
+        stdin,stdout,stderr=self.client.exec_command(
+            'sudo -n -- sh -c '+shlex.quote(script),
+            timeout=timeout
+        )
+        stdout.read()
+        stderr.read()
+        if stdout.channel.recv_exit_status()==0:
+            return
+
+        return self._sudo_with_password(script,timeout)
 
 
 def credential(value):
-    if not isinstance(value,dict): raise ValueError('Credenziali RX mancanti')
-    user=value.get('username','');password=value.get('password','');root=value.get('root_password') or password
+    if not isinstance(value,dict):
+        raise ValueError('Credenziali RX mancanti')
+
+    user=value.get('username','')
+    password=value.get('password','')
+
     if not isinstance(user,str) or not re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_-]*',user):
         raise ValueError('Nome utente SSH non valido')
-    for secret in (password,root):
-        if not isinstance(secret,str) or not secret or len(secret)>1024 or any(c in secret for c in ('\n','\r','\0')):
-            raise ValueError('Password RX mancante o non valida')
-    return {'username':user,'password':password,'root_password':root}
+
+    if not isinstance(password,str) or not password or len(password)>1024 or any(c in password for c in ('\n','\r','\0')):
+        raise ValueError('Password RX mancante o non valida')
+
+    return {'username':user,'password':password}
 
 
 REMOTE_CONFIG="""import json,shlex
@@ -308,7 +346,7 @@ class Manager:
                 job=read_json(self.secrets,None) if state['action']=='update' else None
                 if state['action']=='update' and job is None: raise ValueError('Credenziali scadute: avviare nuovamente l’aggiornamento')
                 for item in job or []:
-                    host=item['ip'];progress('Verifica accesso SSH e root '+host,state='running')
+                    host=item['ip'];progress('Verifica accesso SSH e sudo '+host,state='running')
                     conn=PasswordSSH(host,item['credentials']);connections[host]=conn
                     if remote_config(host,conn).get('ROLE')!='rx': raise ValueError('Il dispositivo non è un RX: '+host)
                     conn.privileged(host,'true')
