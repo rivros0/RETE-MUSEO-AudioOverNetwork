@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.18"
+VERSION="4.19"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.16"
+MONITOR_BUILD="4.19"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -424,47 +424,213 @@ REGISTRY_LOCK=threading.Lock()
 # Passive packet capture: never opens ALSA or binds Roc's UDP port.
 # Requires CAP_NET_RAW (the existing systemd monitor runs as root).
 class AudioMeter:
+    """Meter audio e controllo passivo della continuità RTP."""
+
+    INTEGRITY_WINDOW_SECONDS=60
+    STALL_THRESHOLD_SECONDS=0.040
+    RTP_CLOCK_RATE=44100.0
+
     def __init__(self):
         self.lock=threading.Lock()
         self.frames=deque()
         self.last_clip=None
         self.error="In attesa di RTP L16"
 
-    def feed(self, packet, now=None):
-        now=time.monotonic() if now is None else now
+        # Stato della sessione RTP osservata. Il cambio SSRC azzera le metriche
+        # di continuità per evitare di confondere due sender differenti.
+        self.ssrc=None
+        self.last_seq=None
+        self.last_timestamp=None
+        self.last_arrival=None
+        self.jitter_seconds=0.0
+
+        # Finestre mobili usate dall'autodiagnosi. Sono volutamente limitate
+        # agli ultimi 60 secondi: i problemi vecchi non devono mantenere il nodo
+        # in allarme dopo che il flusso è tornato stabile.
+        self.packet_times=deque()
+        self.sequence_gap_events=deque()
+        self.out_of_order_events=deque()
+        self.duplicate_events=deque()
+        self.transport_stall_events=deque()
+        self.packet_count=0
+
+    def _reset_rtp_session(self,ssrc,seq,timestamp,now):
+        self.ssrc=ssrc
+        self.last_seq=seq
+        self.last_timestamp=timestamp
+        self.last_arrival=now
+        self.jitter_seconds=0.0
+        self.packet_times.clear()
+        self.sequence_gap_events.clear()
+        self.out_of_order_events.clear()
+        self.duplicate_events.clear()
+        self.transport_stall_events.clear()
+        self.packet_count=0
+
+    def _track_rtp(self,seq,timestamp,ssrc,now):
+        if self.ssrc!=ssrc or self.last_seq is None:
+            self._reset_rtp_session(ssrc,seq,timestamp,now)
+            self.packet_count=1
+            self.packet_times.append(now)
+            return
+
+        self.packet_count+=1
+        self.packet_times.append(now)
+        delta=(seq-self.last_seq)&0xffff
+
+        if delta==0:
+            self.duplicate_events.append(now)
+            return
+
+        # Delta >= 32768 indica normalmente un pacchetto arrivato in ritardo,
+        # non un salto in avanti di decine di migliaia di pacchetti.
+        if delta>=0x8000:
+            self.out_of_order_events.append(now)
+            return
+
+        if delta>1:
+            missing=delta-1
+            self.sequence_gap_events.append((now,missing))
+
+        if self.last_arrival is not None:
+            arrival_delta=max(0.0,now-self.last_arrival)
+
+            # Una pausa reale superiore a 40 ms è abbastanza lunga da essere
+            # compatibile con il tipo di dropout udito nella registrazione RX.
+            if arrival_delta>=self.STALL_THRESHOLD_SECONDS:
+                self.transport_stall_events.append((now,arrival_delta*1000.0))
+
+            if self.last_timestamp is not None:
+                timestamp_delta=(timestamp-self.last_timestamp)&0xffffffff
+                media_delta=timestamp_delta/self.RTP_CLOCK_RATE
+                if 0.0<media_delta<2.0:
+                    variation=abs(arrival_delta-media_delta)
+                    self.jitter_seconds+=(variation-self.jitter_seconds)/16.0
+
+        self.last_seq=seq
+        self.last_timestamp=timestamp
+        self.last_arrival=now
+
+    def feed(self,packet,now=None):
+        if now is None:
+            now=time.monotonic()
         if len(packet)<12 or packet[0]>>6!=2:
             return
+
         pt=packet[1]&127
         if pt not in (10,11):
-            with self.lock: self.error="Formato RTP non supportato (PT %d)"%pt
+            with self.lock:
+                self.error="Formato RTP non supportato (PT %d)"%pt
             return
-        channels=2 if pt==10 else 1
+
+        seq=struct.unpack_from("!H",packet,2)[0]
+        timestamp=struct.unpack_from("!I",packet,4)[0]
+        ssrc=struct.unpack_from("!I",packet,8)[0]
+
+        channels=2
+        if pt==11:
+            channels=1
+
         offset=12+4*(packet[0]&15)
-        if len(packet)<offset: return
+        if len(packet)<offset:
+            return
         if packet[0]&16:
-            if len(packet)<offset+4: return
+            if len(packet)<offset+4:
+                return
             offset+=4+4*struct.unpack_from("!H",packet,offset+2)[0]
+
         end=len(packet)
         if packet[0]&32:
             padding=packet[-1]
-            if not padding or padding>end-offset: return
+            if not padding or padding>end-offset:
+                return
             end-=padding
-        if end<=offset or (end-offset)%(2*channels): return
+
+        if end<=offset or (end-offset)%(2*channels):
+            return
+
         samples=struct.unpack("!%dh"%((end-offset)//2),packet[offset:end])
         stats=[]
         for channel in range(channels):
             values=samples[channel::channels]
-            stats.append((max(abs(v) for v in values),sum(v*v for v in values),len(values),sum(v in (-32768,32767) for v in values)))
+            peak=max(abs(value) for value in values)
+            square_sum=sum(value*value for value in values)
+            full_scale=sum(value in (-32768,32767) for value in values)
+            stats.append((peak,square_sum,len(values),full_scale))
+
         with self.lock:
             self.error=""
-            if any(v[3] for v in stats): self.last_clip=now
+            self._track_rtp(seq,timestamp,ssrc,now)
+            if any(value[3] for value in stats):
+                self.last_clip=now
             self.frames.append((now,stats))
             self.prune(now)
 
-    def prune(self, now):
-        while self.frames and self.frames[0][0]<now-5: self.frames.popleft()
+    def prune(self,now):
+        while self.frames and self.frames[0][0]<now-5:
+            self.frames.popleft()
+
         # Bound memory even in case of excessive traffic.
-        while len(self.frames)>10000: self.frames.popleft()
+        while len(self.frames)>10000:
+            self.frames.popleft()
+
+        cutoff=now-self.INTEGRITY_WINDOW_SECONDS
+        while self.packet_times and self.packet_times[0]<cutoff:
+            self.packet_times.popleft()
+        while self.sequence_gap_events and self.sequence_gap_events[0][0]<cutoff:
+            self.sequence_gap_events.popleft()
+        while self.out_of_order_events and self.out_of_order_events[0]<cutoff:
+            self.out_of_order_events.popleft()
+        while self.duplicate_events and self.duplicate_events[0]<cutoff:
+            self.duplicate_events.popleft()
+        while self.transport_stall_events and self.transport_stall_events[0][0]<cutoff:
+            self.transport_stall_events.popleft()
+
+    def _integrity_snapshot(self,now,fresh):
+        missing=sum(event[1] for event in self.sequence_gap_events)
+        max_sequence_gap=0
+        if self.sequence_gap_events:
+            max_sequence_gap=max(event[1] for event in self.sequence_gap_events)
+
+        max_transport_gap=0.0
+        if self.transport_stall_events:
+            max_transport_gap=max(event[1] for event in self.transport_stall_events)
+
+        issue_times=[]
+        if self.sequence_gap_events:
+            issue_times.append(self.sequence_gap_events[-1][0])
+        if self.out_of_order_events:
+            issue_times.append(self.out_of_order_events[-1])
+        if self.duplicate_events:
+            issue_times.append(self.duplicate_events[-1])
+        if self.transport_stall_events:
+            issue_times.append(self.transport_stall_events[-1][0])
+
+        last_issue_age=None
+        if issue_times:
+            last_issue_age=round(max(0.0,now-max(issue_times)),1)
+
+        last_packet_age=None
+        if self.packet_times:
+            last_packet_age=round(max(0.0,now-self.packet_times[-1]),3)
+
+        return {
+            "available":fresh,
+            "window_seconds":self.INTEGRITY_WINDOW_SECONDS,
+            "ssrc":self.ssrc,
+            "packets_total":self.packet_count,
+            "packets_window":len(self.packet_times),
+            "missing_packets":missing,
+            "sequence_gap_events":len(self.sequence_gap_events),
+            "max_sequence_gap":max_sequence_gap,
+            "out_of_order_packets":len(self.out_of_order_events),
+            "duplicate_packets":len(self.duplicate_events),
+            "transport_stalls":len(self.transport_stall_events),
+            "max_transport_gap_ms":round(max_transport_gap,1),
+            "jitter_ms":round(self.jitter_seconds*1000.0,2),
+            "last_issue_age_seconds":last_issue_age,
+            "last_packet_age_seconds":last_packet_age
+        }
 
     def snapshot(self):
         now=time.monotonic()
@@ -472,17 +638,40 @@ class AudioMeter:
             self.prune(now)
             frames=list(self.frames)
             error=self.error
-            clip_age=None if self.last_clip is None else round(now-self.last_clip,1)
-        fresh=bool(frames and now-frames[-1][0]<2)
-        result={"available":fresh,"error":error if error else ("" if fresh else "Nessun pacchetto audio recente"),"window_seconds":5,"clip_age_seconds":clip_age,"channels":[]}
-        if not fresh: return result
+            clip_age=None
+            if self.last_clip is not None:
+                clip_age=round(now-self.last_clip,1)
+
+            fresh=bool(frames and now-frames[-1][0]<2)
+            integrity=self._integrity_snapshot(now,fresh)
+
+        result={
+            "available":fresh,
+            "error":error if error else ("" if fresh else "Nessun pacchetto audio recente"),
+            "window_seconds":5,
+            "clip_age_seconds":clip_age,
+            "channels":[],
+            "integrity":integrity
+        }
+        if not fresh:
+            return result
+
         channels=len(frames[-1][1])
-        def db(value): return round(max(-96,20*math.log10(value/32768)),1) if value else -96.0
+
+        def db(value):
+            if not value:
+                return -96.0
+            return round(max(-96,20*math.log10(value/32768)),1)
+
         for ch in range(channels):
-            values=[f[1][ch] for f in frames if len(f[1])==channels]
-            peak=max(v[0] for v in values)
-            rms=math.sqrt(sum(v[1] for v in values)/sum(v[2] for v in values))
-            result["channels"].append({"peak_dbfs":db(peak),"rms_dbfs":db(rms),"full_scale_samples":sum(v[3] for v in values)})
+            values=[frame[1][ch] for frame in frames if len(frame[1])==channels]
+            peak=max(value[0] for value in values)
+            rms=math.sqrt(sum(value[1] for value in values)/sum(value[2] for value in values))
+            result["channels"].append({
+                "peak_dbfs":db(peak),
+                "rms_dbfs":db(rms),
+                "full_scale_samples":sum(value[3] for value in values)
+            })
         return result
 
 METER=AudioMeter()
@@ -695,12 +884,24 @@ def restore_saved_volume():
 
 def network_state(interface):
     path=os.path.join("/sys/class/net",interface)
-    result={"interface":interface,"ipv4":local_ipv4(interface),"carrier":False,"speed_mbps":None}
-    if not os.path.isdir(path): return result
-    if read_text(os.path.join(path,"carrier"))=="1": result["carrier"]=True
+    result={"interface":interface,"ipv4":local_ipv4(interface),"carrier":False,"speed_mbps":None,
+            "rx_errors":0,"rx_dropped":0,"tx_errors":0,"tx_dropped":0}
+    if not os.path.isdir(path):
+        return result
+    if read_text(os.path.join(path,"carrier"))=="1":
+        result["carrier"]=True
     speed=read_text(os.path.join(path,"speed"))
-    try: result["speed_mbps"]=int(speed)
-    except ValueError: result["speed_mbps"]=None
+    try:
+        result["speed_mbps"]=int(speed)
+    except ValueError:
+        result["speed_mbps"]=None
+
+    for counter in ("rx_errors","rx_dropped","tx_errors","tx_dropped"):
+        raw=read_text(os.path.join(path,"statistics",counter))
+        try:
+            result[counter]=int(raw)
+        except ValueError:
+            result[counter]=0
     return result
 
 def multicast_state(role,interface,group,roc_process):
@@ -846,6 +1047,92 @@ def send_control(config,node_name,command,value=None):
         sock.close()
     return True,command_id
 
+def apply_audio_diagnosis(nodes):
+    """Classifica il punto più probabile della catena in cui nasce il dropout."""
+
+    tx_node=None
+    for node in nodes:
+        if node.get("role")=="tx":
+            tx_node=node
+            break
+
+    tx_integrity={}
+    tx_meter={}
+    if tx_node is not None:
+        tx_meter=tx_node.get("audio_meter",{}) or {}
+        tx_integrity=tx_meter.get("integrity",{}) or {}
+
+    tx_has_transport_problem=False
+    if tx_integrity.get("missing_packets",0)>0:
+        tx_has_transport_problem=True
+    if tx_integrity.get("transport_stalls",0)>0:
+        tx_has_transport_problem=True
+
+    for node in nodes:
+        meter=node.get("audio_meter",{}) or {}
+        integrity=meter.get("integrity",{}) or {}
+        warning=(node.get("roc_last_warning") or "").lower()
+        throttled_code=node.get("throttled")
+
+        diagnosis={"severity":"ok","code":"RTP_CONTINUOUS",
+                   "summary":"RTP regolare negli ultimi 60 s",
+                   "detail":"Nessuna discontinuità RTP rilevata nella finestra di osservazione."}
+
+        if not node.get("online",True):
+            diagnosis={"severity":"info","code":"NODE_OFFLINE",
+                       "summary":"Nodo offline",
+                       "detail":"Autodiagnosi sospesa finché il nodo non torna online."}
+        elif not meter.get("available"):
+            if node.get("role")=="rx" and tx_meter.get("available"):
+                diagnosis={"severity":"critical","code":"RX_NO_RTP",
+                           "summary":"RX online ma senza RTP recente",
+                           "detail":"Il TX vede il flusso; controllare multicast, porta switch, IGMP e roc-recv di questo RX."}
+            else:
+                diagnosis={"severity":"critical","code":"NO_RTP",
+                           "summary":"Nessun RTP audio recente",
+                           "detail":"Controllare sender Roc, bus audio e instradamento multicast."}
+        elif throttled_code not in (None,"","0x0","0x00000"):
+            diagnosis={"severity":"warning","code":"POWER_THROTTLING",
+                       "summary":"Throttling/alimentazione Raspberry rilevato",
+                       "detail":"Il Raspberry segnala throttling: verificare alimentatore, temperatura e undervoltage."}
+        elif "underrun" in warning or "overrun" in warning or "xrun" in warning:
+            diagnosis={"severity":"warning","code":"RX_BUFFER_XRUN",
+                       "summary":"Possibile underrun/overrun audio",
+                       "detail":"Roc/ALSA ha segnalato un xrun recente; controllare carico CPU e aumentare la latenza RX se necessario."}
+        elif node.get("role")=="tx" and tx_has_transport_problem:
+            diagnosis={"severity":"warning","code":"TX_RTP_DISCONTINUITY",
+                       "summary":"Discontinuità già osservata sul TX",
+                       "detail":"Il problema nasce prima della rete RX o nel sender/bus TX. Controllare CPU, player e roc-send."}
+        elif node.get("role")=="rx" and tx_has_transport_problem:
+            diagnosis={"severity":"warning","code":"UPSTREAM_TX_DISCONTINUITY",
+                       "summary":"Il TX mostra già discontinuità RTP",
+                       "detail":"Il difetto visto sull'RX è compatibile con una sorgente o trasmissione TX irregolare."}
+        elif node.get("role")=="rx" and integrity.get("missing_packets",0)>0:
+            diagnosis={"severity":"warning","code":"NETWORK_SEQUENCE_GAPS",
+                       "summary":"Pacchetti RTP mancanti o arrivati troppo tardi sull'RX",
+                       "detail":"Il TX è regolare ma questo RX presenta salti di sequenza: controllare Ethernet, switch, IGMP e multicast."}
+        elif node.get("role")=="rx" and integrity.get("transport_stalls",0)>0:
+            diagnosis={"severity":"warning","code":"NETWORK_BURST_STALL",
+                       "summary":"Pause anomale nell'arrivo RTP sull'RX",
+                       "detail":"Rilevate pause superiori a 40 ms; compatibile con burst di rete, scheduling o starvation del ricevitore."}
+        elif node.get("role")=="rx" and integrity.get("jitter_ms",0)>20:
+            diagnosis={"severity":"warning","code":"HIGH_RTP_JITTER",
+                       "summary":"Jitter RTP elevato",
+                       "detail":"Il jitter osservato supera 20 ms; valutare rete e TARGET_LATENCY dell'RX."}
+        elif node.get("role")=="rx":
+            net=node.get("network",{}) or {}
+            ethernet_errors=net.get("rx_errors",0)+net.get("rx_dropped",0)
+            if ethernet_errors>0:
+                diagnosis={"severity":"warning","code":"ETHERNET_ERRORS",
+                           "summary":"Contatori Ethernet RX non nulli",
+                           "detail":"RTP appare regolare nella finestra corrente, ma l'interfaccia registra errori/drop cumulativi."}
+            else:
+                diagnosis={"severity":"ok","code":"RX_RTP_CLEAN",
+                           "summary":"RTP regolare sull'RX",
+                           "detail":"Se il dropout è udibile con queste metriche pulite, concentrare la diagnosi su roc-recv, ALSA, DAC, jack o amplificatore."}
+
+        node["audio_diagnosis"]=diagnosis
+
 def system_status(config):
     now=time.time()
     with REGISTRY_LOCK: nodes=[dict(item) for item in REGISTRY.values()]
@@ -881,6 +1168,8 @@ def system_status(config):
         node["online"]=online
         node["problems"]=problems
         node["state"]=state
+    apply_audio_diagnosis(nodes)
+
     def sort_key(node):
         priority=1
         if node.get("role")=="tx": priority=0
@@ -888,10 +1177,11 @@ def system_status(config):
     nodes.sort(key=sort_key)
     return {"system":"RETE MUSEO - AudioOverNetwork","generated_at":now,"software_version":config.get("SOFTWARE_VERSION",""),"monitor_build":MONITOR_BUILD,"expected_rx":int(config.get("EXPECTED_RX_COUNT","3")),"nodes":nodes}
 
-PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}.titlebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px}h1{margin:0}.versionBadge{display:inline-flex;align-items:center;background:#1d4ed8;color:#dbeafe;border:1px solid #3b82f6;border-radius:999px;padding:7px 12px;font-size:14px;font-weight:800;letter-spacing:.02em;white-space:nowrap}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}</style></head><body><main><div class="titlebar"><h1>RETE MUSEO - AudioOverNetwork</h1><span id="versionBadge" class="versionBadge">Versione installata: …</span></div><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
+PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}.titlebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px}h1{margin:0}.versionBadge{display:inline-flex;align-items:center;background:#1d4ed8;color:#dbeafe;border:1px solid #3b82f6;border-radius:999px;padding:7px 12px;font-size:14px;font-weight:800;letter-spacing:.02em;white-space:nowrap}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}.autodiag{border-top:1px solid #374151;padding:12px 0}.autodiag strong{display:block;margin-bottom:7px}.autodiag.ok strong{color:#a7f3d0}.autodiag.warning strong{color:#fde68a}.autodiag.critical strong{color:#fecaca}.autodiag.info strong{color:#bfdbfe}</style></head><body><main><div class="titlebar"><h1>RETE MUSEO - AudioOverNetwork</h1><span id="versionBadge" class="versionBadge">Versione installata: …</span></div><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
 function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
 return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
-function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function diagnosticsBlock(n){var body='';if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
+function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function audioDiagnosisBlock(n){var d=n.audio_diagnosis||{};var m=n.audio_meter||{};var i=m.integrity||{};if(!d.summary)return '';var html='<section class="autodiag '+esc(d.severity||'info')+'"><strong>Autodiagnosi audio · '+esc(d.summary)+'</strong><small>'+esc(d.detail||'')+'</small>';if(i.window_seconds){html+='<div class="row"><span class="label">RTP ultimi '+esc(i.window_seconds)+' s</span><span class="value">'+esc(i.packets_window||0)+' pacchetti</span></div><div class="row"><span class="label">Pacchetti mancanti/ritardati</span><span class="value">'+esc(i.missing_packets||0)+' · gap max '+esc(i.max_sequence_gap||0)+'</span></div><div class="row"><span class="label">Fuori ordine / duplicati</span><span class="value">'+esc(i.out_of_order_packets||0)+' / '+esc(i.duplicate_packets||0)+'</span></div><div class="row"><span class="label">Pause RTP >40 ms</span><span class="value">'+esc(i.transport_stalls||0)+' · max '+esc(i.max_transport_gap_ms||0)+' ms</span></div><div class="row"><span class="label">Jitter stimato</span><span class="value">'+esc(i.jitter_ms||0)+' ms</span></div>';}html+='</section>';return html;}
+function diagnosticsBlock(n){var body='';if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
 var m=n.audio_meter;var rx=n.role==='rx';var title=rx?'Uscita RX':'Trasmissione TX · microfono + musica';
 if(!n.online||!m||!m.available){return '<section class="meter"><strong>'+title+'</strong><small>'+esc(!n.online?'Nodo offline':m?m.error:'Aggiornare il monitor del nodo')+'</small></section>';}
 var age=rx?m.input_clip_age_seconds:m.clip_age_seconds;var clipped=age!=null&&age<30;
@@ -903,7 +1193,7 @@ if(rx){html+='<small>Guadagno ALSA '+esc(c.gain_db)+' dB'+(c.muted?' · MUTE':''
 else{html+='<small>Fondo scala: '+esc(c.full_scale_samples)+' campioni / 5 s</small>';}});
 html+='<small>'+(clipped?(rx?'FONDO SCALA a monte del fader':'FONDO SCALA rilevato')+' · '+esc(age)+' s fa':hot?'Attenzione: margine inferiore a 3 dB':'Nessun fondo scala recente')+' · scala −60…0 dBFS</small>';
 html+='<small>'+(rx?'Stima: livello RTP degli ultimi 5 s + guadagno ALSA attuale. Abbassare il fader non elimina il clipping a monte.':'Picco/RMS degli ultimi 5 s.')+' Non misura distorsione analogica.</small></section>';return html;}
-function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}var service=esc(n.roc_service||'n/d');if(n.roc_service_sub){service+=' / '+esc(n.roc_service_sub);}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+boolLabel(net.carrier,'collegata','non collegata')+speed+'</span></div><div class="row"><span class="label">Servizio Roc</span><span class="value">'+service+'</span></div><div class="row"><span class="label">Processo Roc</span><span class="value">'+boolLabel(n.roc_process,'in esecuzione','non in esecuzione')+'</span></div><div class="row"><span class="label">Riavvii Roc</span><span class="value">'+esc(n.roc_restarts||0)+'</span></div><div class="row"><span class="label">Dispositivo audio</span><span class="value">'+boolLabel(n.audio_device,'rilevato','non rilevato')+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multicastLabel(multi.state))+'</span></div>'+(n.role==='tx'?'<div class="row"><span class="label">Sorgente</span><span>'+esc(({playing:'Player',paused:'Player in pausa',live:'Ingresso mixer'}[n.studio_source])||'Ingresso mixer')+'</span></div>':'')+meterBlock(n)+latencyBlock(n)+volumeBlock(n)+'<div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s fa</span></div>'+diagnosticsBlock(n)+'</article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var version=data.software_version||data.monitor_build||'n/d';var monitor=data.monitor_build&&data.monitor_build!==version?' · monitor '+data.monitor_build:'';document.getElementById('versionBadge').textContent='Versione installata: v'+String(version).replace(/^v/,'')+monitor;var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}var active=document.activeElement;var focusedNode=active&&active.classList.contains('volumeNumber')?active.closest('form').dataset.node:null;document.getElementById('nodes').innerHTML=html;bindVolumeControls();if(focusedNode){document.querySelectorAll('.volumeForm').forEach(function(f){if(f.dataset.node===focusedNode)f.querySelector('input').focus();});}document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}function showFeedback(node,text){feedback[node]=text;var el=document.getElementById('vol-msg-'+node);if(el)el.innerHTML=text;}
+function nodeCard(n){var net=n.network||{};var multi=n.multicast||{};var speed='';if(net.speed_mbps){speed=' · '+esc(net.speed_mbps)+' Mb/s';}var temp='n/d';if(n.temperature_c!=null){temp=esc(n.temperature_c)+' °C';}var service=esc(n.roc_service||'n/d');if(n.roc_service_sub){service+=' / '+esc(n.roc_service_sub);}return '<article class="card"><div class="head"><strong>'+esc(n.name)+' · '+esc((n.role||'').toUpperCase())+'</strong><span class="badge '+esc(n.state)+'">'+esc(n.state)+'</span></div><div class="row"><span class="label">IPv4</span><span class="value">'+esc(net.ipv4||'n/d')+'</span></div><div class="row"><span class="label">Ethernet</span><span class="value">'+boolLabel(net.carrier,'collegata','non collegata')+speed+'</span></div><div class="row"><span class="label">Servizio Roc</span><span class="value">'+service+'</span></div><div class="row"><span class="label">Processo Roc</span><span class="value">'+boolLabel(n.roc_process,'in esecuzione','non in esecuzione')+'</span></div><div class="row"><span class="label">Riavvii Roc</span><span class="value">'+esc(n.roc_restarts||0)+'</span></div><div class="row"><span class="label">Dispositivo audio</span><span class="value">'+boolLabel(n.audio_device,'rilevato','non rilevato')+'</span></div><div class="row"><span class="label">Multicast</span><span class="value"><code>'+esc(multi.group)+'</code> · '+esc(multicastLabel(multi.state))+'</span></div>'+(n.role==='tx'?'<div class="row"><span class="label">Sorgente</span><span>'+esc(({playing:'Player',paused:'Player in pausa',live:'Ingresso mixer'}[n.studio_source])||'Ingresso mixer')+'</span></div>':'')+audioDiagnosisBlock(n)+meterBlock(n)+latencyBlock(n)+volumeBlock(n)+'<div class="row"><span class="label">Temperatura</span><span class="value">'+temp+'</span></div><div class="row"><span class="label">Load 1m</span><span class="value">'+esc(n.load_1m)+'</span></div><div class="row"><span class="label">Heartbeat</span><span class="value">'+esc(n.age_seconds)+' s fa</span></div>'+diagnosticsBlock(n)+'</article>';}async function refresh(){try{var response=await fetch('/api/status',{cache:'no-store'});var data=await response.json();var version=data.software_version||data.monitor_build||'n/d';var monitor=data.monitor_build&&data.monitor_build!==version?' · monitor '+data.monitor_build:'';document.getElementById('versionBadge').textContent='Versione installata: v'+String(version).replace(/^v/,'')+monitor;var okCount=0;var offCount=0;for(var i=0;i<data.nodes.length;i++){if(data.nodes[i].state==='OK'){okCount++;}if(data.nodes[i].state==='OFFLINE'){offCount++;}}document.getElementById('summary').innerHTML='<div class="box"><div class="label">Nodi</div><div class="num">'+data.nodes.length+'</div></div><div class="box"><div class="label">OK</div><div class="num">'+okCount+'</div></div><div class="box"><div class="label">Offline</div><div class="num">'+offCount+'</div></div><div class="box"><div class="label">RX previsti</div><div class="num">'+data.expected_rx+'</div></div>';var html='';for(var j=0;j<data.nodes.length;j++){html+=nodeCard(data.nodes[j]);}if(!html){html='<div class="box">Nessun nodo rilevato.</div>';}var active=document.activeElement;var focusedNode=active&&active.classList.contains('volumeNumber')?active.closest('form').dataset.node:null;document.getElementById('nodes').innerHTML=html;bindVolumeControls();if(focusedNode){document.querySelectorAll('.volumeForm').forEach(function(f){if(f.dataset.node===focusedNode)f.querySelector('input').focus();});}document.getElementById('footer').textContent='Aggiornato '+new Date().toLocaleTimeString()+' · refresh 2 s · offline dopo 15 s';}catch(error){document.getElementById('footer').textContent='Errore dashboard: '+error;}}function showFeedback(node,text){feedback[node]=text;var el=document.getElementById('vol-msg-'+node);if(el)el.innerHTML=text;}
 async function sendCommand(node,command,value){if(pending[node])return;pending[node]=true;showFeedback(node,'Invio…');
 try{var response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({node:node,command:command,value:value})});var result=await response.json();if(!response.ok||!result.ok)throw new Error(result.message||'Invio fallito');
 showFeedback(node,'<span style="color:#9ca3af">✓ Inviato</span>');
