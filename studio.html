@@ -23,9 +23,25 @@
 #studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
 
 .vlc-options{flex-wrap:wrap}.vlc-options #repeatToggle,.vlc-options #playlistLoop{width:auto;padding:8px 12px;font-weight:700}.playlist-check{width:20px;height:20px;flex-shrink:0;accent-color:#ff9e36}
+
+/* Navigazione principale della regia: separa uso quotidiano, calendario e manutenzione. */
+.regia-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0;border-bottom:1px solid #4b5563;padding-bottom:8px}
+#studioTools .regia-tab{margin:0;padding:10px 18px;border-radius:8px 8px 0 0;background:#111827;border:1px solid #4b5563;font-weight:750}
+#studioTools .regia-tab[aria-selected=true]{background:#1d4ed8;border-color:#60a5fa;color:#eff6ff}
+.regia-tab-panel{min-width:0}.regia-tab-panel[hidden]{display:none!important}
+.regia-section-title{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#rxAudioHost{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:12px}
+#systemDashboardHost{margin-top:16px}
+@media(max-width:600px){.regia-tabs{display:grid;grid-template-columns:repeat(3,1fr)}#studioTools .regia-tab{padding:9px 6px;font-size:13px}}
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
+<nav class="regia-tabs" role="tablist" aria-label="Sezioni regia">
+<button type="button" class="regia-tab" id="tabPlayer" role="tab" aria-selected="true" aria-controls="regiaPlayer" data-regia-tab="player">Player</button>
+<button type="button" class="regia-tab" id="tabEvents" role="tab" aria-selected="false" aria-controls="regiaEvents" data-regia-tab="events">Eventi</button>
+<button type="button" class="regia-tab" id="tabSystem" role="tab" aria-selected="false" aria-controls="regiaSystem" data-regia-tab="system">Sistema</button>
+</nav>
+<section id="regiaPlayer" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabPlayer">
 <details id="playerPanel" open>
 <summary><span class="vlc-mark" aria-hidden="true">▲</span><span class="vlc-summary-copy"><strong>Lettore multimediale</strong><small id="playerSummary">Nessuna traccia in riproduzione</small></span></summary>
 <div id="vlcPlayer" tabindex="0" aria-label="Lettore audio TX">
@@ -59,7 +75,13 @@
 <label>Soglia voce (dBFS) <input name="threshold_db" type="number" min="-60" max="-6" step="1" value="-36" required></label>
 <label>Attenuazione musica (dB) <input name="reduction_db" type="number" min="-40" max="0" step="1" value="-18" required></label><button>Applica ducking</button></form>
 <p class="hint">Il microfono non viene attenuato dal ducking. Se il rumore di fondo fa abbassare la musica, alza la soglia (per esempio da −36 a −30 dBFS). Il volume della musica torna gradualmente normale dopo l’annuncio.</p>
-<details id="scheduledEventsPanel" class="scheduledPanel">
+<section class="studioPanel" aria-labelledby="audioMonitorTitle">
+<div class="regia-section-title"><h3 id="audioMonitorTitle">Monitor audio TX e RX</h3><span class="hint">Meter in tempo reale · volume e mute RX</span></div>
+<div id="rxAudioHost"><p class="hint">Caricamento stato audio…</p></div>
+</section>
+</section>
+<section id="regiaEvents" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabEvents" hidden>
+<details id="scheduledEventsPanel" class="scheduledPanel" open>
 <summary><span>Eventi programmati</span><span id="scheduledEventsMeta" class="scheduledMeta">caricamento…</span></summary>
 <div class="scheduledBody">
 <h3>Calendario · Europe/Rome</h3><p id="automationState"></p>
@@ -86,6 +108,12 @@
 <details><summary>Registro eventi (ultimi 30)</summary><ul id="eventHistory"></ul></details>
 </div>
 </details>
+</section>
+<section id="regiaSystem" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabSystem" hidden>
+<div id="systemDashboardHost">
+<h3>Stato sistema</h3>
+<p class="hint">Stato TX/RX, rete, servizi, autodiagnosi e manutenzione.</p>
+</div>
 <h3>Explorer USB</h3><button id="scanUSB">Rileva pennette</button><label>Dispositivo <select id="usbDevice"></select></label><button id="openUSB">Apri</button><button id="ejectUSB">Espelli</button>
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
@@ -114,12 +142,32 @@
 <p class="hint">Puoi chiudere il browser: l’operazione prosegue sul TX. Il riavvio della regia richiede un nuovo login; rientra qui per vedere l’esito.</p>
 </details>
 </section>
+</section>
 <script>
 (function(){
 'use strict';
 var currentEvents=[],eventTracks=[],usbPath='',usbOpened='',inFlight=false,duckInitialized=false;
 var mediaFiles=[],playerSnapshot=null,playerSampleTime=0,scrubbing=false,volumeEditing=false,playerBusy=false,selectionDirty=false,playerRevision=0;
 function el(id){return document.getElementById(id);}
+
+/* Le schede cambiano solo presentazione: i servizi continuano a girare sempre. */
+function activateRegiaTab(name,persist){
+  var valid=['player','events','system'];
+  if(!valid.includes(name)){name='player';}
+  document.querySelectorAll('[data-regia-tab]').forEach(function(button){
+    var active=button.dataset.regiaTab===name;
+    button.setAttribute('aria-selected',String(active));
+  });
+  valid.forEach(function(tabName){
+    var panel=el('regia'+tabName.charAt(0).toUpperCase()+tabName.slice(1));
+    if(panel){panel.hidden=tabName!==name;}
+  });
+  if(persist){
+    try{localStorage.setItem('museum.regia.tab',name);}catch(error){}
+  }
+  if(name==='system'&&typeof placeDashboard==='function'){placeDashboard();}
+}
+
 function message(text){el('studioMessage').textContent=text;el('playerMessage').textContent=text;}
 async function api(path,data){
   var options={cache:'no-store'};
@@ -224,7 +272,7 @@ function renderEvents(){
       var form=el('eventForm');['id','name','start','recurrence','policy'].forEach(function(k){form.elements.namedItem(k).value=e[k];});
       form.elements.namedItem('track').value=tracks[0];form.elements.namedItem('end_time').value=e.end_time||'';form.elements.namedItem('repetitions').value=repetitions;form.elements.namedItem('interval_seconds').value=e.interval_seconds||0;
       form.elements.namedItem('enabled').checked=e.enabled;eventTracks=tracks.slice();renderPlaylist();
-      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';el('scheduledEventsPanel').open=true;form.scrollIntoView({behavior:'smooth'});
+      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';activateRegiaTab('events',true);el('scheduledEventsPanel').open=true;form.scrollIntoView({behavior:'smooth'});
     }));
     actions.appendChild(button('Elimina evento',function(){if(confirm('Eliminare l’evento '+e.name+'?'))perform(async function(){await api('/api/calendar/delete',{id:e.id});await update();});}));
     tr.appendChild(actions);el('eventRows').appendChild(tr);
@@ -341,7 +389,18 @@ setInterval(refreshUpdates,3000);
 window.addEventListener('DOMContentLoaded',function(){
   el('playlistHost').appendChild(el('library'));el('playlistImport').appendChild(el('upload'));
   var oldTitle=el('studio').querySelector('h3');if(oldTitle)oldTitle.remove();
-  try{el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';}catch(error){}
+
+  document.querySelectorAll('[data-regia-tab]').forEach(function(button){
+    button.addEventListener('click',function(){activateRegiaTab(button.dataset.regiaTab,true);});
+  });
+
+  var initialTab='player';
+  try{
+    el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';
+    initialTab=localStorage.getItem('museum.regia.tab')||'player';
+  }catch(error){}
+  activateRegiaTab(initialTab,false);
+
   update();setInterval(update,2000);setInterval(renderTimeline,250);
 });
 })();
