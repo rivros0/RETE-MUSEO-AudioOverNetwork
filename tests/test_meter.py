@@ -9,8 +9,8 @@ source=(Path(__file__).resolve().parents[1]/'setup_roc_museum.sh').read_text().s
 monitor=types.ModuleType('monitor')
 exec(compile(source,'monitor','exec'),monitor.__dict__)
 
-def rtp(samples, pt=10, flags=0x80):
-    return struct.pack('!BBHII',flags,pt,1,0,42)+struct.pack('!%dh'%len(samples),*samples)
+def rtp(samples, pt=10, flags=0x80, seq=1, timestamp=0, ssrc=42):
+    return struct.pack('!BBHII',flags,pt,seq,timestamp,ssrc)+struct.pack('!%dh'%len(samples),*samples)
 
 class MeterTests(unittest.TestCase):
     def test_stereo_peak_rms_and_clipping(self):
@@ -46,6 +46,47 @@ class MeterTests(unittest.TestCase):
         for packet in (b'',bytes(12),rtp([1],10),rtp([1],96),rtp([1],11,0x90),rtp([1],11,0xa0)):
             m=monitor.AudioMeter();m.feed(packet)
             self.assertFalse(m.snapshot()['available'])
+
+
+class IntegrityTests(unittest.TestCase):
+    def test_sequence_gap_counts_missing_packets(self):
+        m=monitor.AudioMeter()
+        base=monitor.time.monotonic()
+        m.feed(rtp([100,100],seq=10,timestamp=0),base)
+        m.feed(rtp([100,100],seq=14,timestamp=441),base+.01)
+        integrity=m.snapshot()['integrity']
+        self.assertEqual(integrity['missing_packets'],3)
+        self.assertEqual(integrity['sequence_gap_events'],1)
+        self.assertEqual(integrity['max_sequence_gap'],3)
+
+    def test_out_of_order_and_duplicate_are_distinct(self):
+        m=monitor.AudioMeter()
+        base=monitor.time.monotonic()
+        m.feed(rtp([100,100],seq=100,timestamp=0),base)
+        m.feed(rtp([100,100],seq=101,timestamp=441),base+.01)
+        m.feed(rtp([100,100],seq=101,timestamp=441),base+.011)
+        m.feed(rtp([100,100],seq=100,timestamp=0),base+.012)
+        integrity=m.snapshot()['integrity']
+        self.assertEqual(integrity['duplicate_packets'],1)
+        self.assertEqual(integrity['out_of_order_packets'],1)
+
+    def test_transport_stall_is_detected(self):
+        m=monitor.AudioMeter()
+        base=monitor.time.monotonic()
+        m.feed(rtp([100,100],seq=1,timestamp=0),base)
+        m.feed(rtp([100,100],seq=2,timestamp=441),base+.085)
+        integrity=m.snapshot()['integrity']
+        self.assertEqual(integrity['transport_stalls'],1)
+        self.assertGreaterEqual(integrity['max_transport_gap_ms'],85)
+
+    def test_ssrc_change_resets_continuity_state(self):
+        m=monitor.AudioMeter()
+        base=monitor.time.monotonic()
+        m.feed(rtp([100,100],seq=1,timestamp=0,ssrc=1),base)
+        m.feed(rtp([100,100],seq=50,timestamp=0,ssrc=2),base+.01)
+        integrity=m.snapshot()['integrity']
+        self.assertEqual(integrity['missing_packets'],0)
+        self.assertEqual(integrity['ssrc'],2)
 
 class PostFaderTests(unittest.TestCase):
     def test_attenuation_and_mute(self):
