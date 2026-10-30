@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.22"
+VERSION="4.23"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.22"
+MONITOR_BUILD="4.23"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -1219,7 +1219,7 @@ def system_status(config):
     nodes.sort(key=sort_key)
     return {"system":"RETE MUSEO - AudioOverNetwork","generated_at":now,"software_version":config.get("SOFTWARE_VERSION",""),"monitor_build":MONITOR_BUILD,"expected_rx":int(config.get("EXPECTED_RX_COUNT","3")),"nodes":nodes}
 
-PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}.titlebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px}h1{margin:0}.versionBadge{display:inline-flex;align-items:center;background:#1d4ed8;color:#dbeafe;border:1px solid #3b82f6;border-radius:999px;padding:7px 12px;font-size:14px;font-weight:800;letter-spacing:.02em;white-space:nowrap}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}.autodiag{border-top:1px solid #374151;padding:12px 0}.autodiag strong{display:block;margin-bottom:7px}.autodiag.ok strong{color:#a7f3d0}.autodiag.warning strong{color:#fde68a}.autodiag.critical strong{color:#fecaca}.autodiag.info strong{color:#bfdbfe}</style></head><body><main><div class="titlebar"><h1>RETE MUSEO - AudioOverNetwork</h1><span id="versionBadge" class="versionBadge">Versione installata: …</span></div><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
+PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}.titlebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px}h1{margin:0}.versionBadge{display:inline-flex;align-items:center;background:#1d4ed8;color:#dbeafe;border:1px solid #3b82f6;border-radius:999px;padding:7px 12px;font-size:14px;font-weight:800;letter-spacing:.02em;white-space:nowrap}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}.autodiag{border-top:1px solid #374151;padding:12px 0}.autodiag strong{display:block;margin-bottom:7px}.autodiag.ok strong{color:#a7f3d0}.autodiag.warning strong{color:#fde68a}.autodiag.critical strong{color:#fecaca}.autodiag.info strong{color:#bfdbfe}</style></head><body><main><div class="titlebar"><h1>RETE MUSEO - AudioOverNetwork</h1><span id="versionBadge" class="versionBadge">Versione installata: …</span></div><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="publicDashboardHome"><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer></div><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
 function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
 return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
 function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function audioDiagnosisBlock(n){var d=n.audio_diagnosis||{};var m=n.audio_meter||{};var i=m.integrity||{};var p=n.throttled||{};if(!d.summary)return '';var html='<section class="autodiag '+esc(d.severity||'info')+'"><strong>Autodiagnosi audio · '+esc(d.summary)+'</strong><small>'+esc(d.detail||'')+'</small>';if(i.window_seconds){html+='<div class="row"><span class="label">RTP ultimi '+esc(i.window_seconds)+' s</span><span class="value">'+esc(i.packets_window||0)+' pacchetti</span></div><div class="row"><span class="label">Pacchetti mancanti/ritardati</span><span class="value">'+esc(i.missing_packets||0)+' · gap max '+esc(i.max_sequence_gap||0)+'</span></div><div class="row"><span class="label">Fuori ordine / duplicati</span><span class="value">'+esc(i.out_of_order_packets||0)+' / '+esc(i.duplicate_packets||0)+'</span></div><div class="row"><span class="label">Pause RTP >40 ms</span><span class="value">'+esc(i.transport_stalls||0)+' · max '+esc(i.max_transport_gap_ms||0)+' ms</span></div><div class="row"><span class="label">Jitter stimato</span><span class="value">'+esc(i.jitter_ms||0)+' ms</span></div>';}if(p.raw){var power='OK';if(p.active){power='ATTIVO: '+(p.current_flags||[]).join(', ');}else if(p.historical){power='OK ora · storico: '+(p.historical_flags||[]).join(', ');}html+='<div class="row"><span class="label">Alimentazione/termica</span><span class="value">'+esc(power)+' · '+esc(p.raw)+'</span></div>';}html+='</section>';return html;}
@@ -1281,7 +1281,7 @@ REGIA_UI=r'''<section class="box" style="margin-bottom:18px"><h2>Accesso regia</
 <script>
 var csrf='',authorized=false;
 async function library(){var r=await fetch('/api/media');if(!r.ok)return;var d=await r.json();document.getElementById('library').replaceChildren();d.files.forEach(function(f){var li=document.createElement('li');li.textContent=f.name+' ('+(f.size/1048576).toFixed(1)+' MB)';document.getElementById('library').appendChild(li);});}
-async function session(){var r=await fetch('/api/session');var d=await r.json();authorized=d.authenticated;csrf=d.csrf||'';document.getElementById('login').hidden=authorized;document.getElementById('studio').hidden=!authorized;if(authorized)await library();refresh();}
+async function session(){var r=await fetch('/api/session');var d=await r.json();authorized=d.authenticated;csrf=d.csrf||'';document.getElementById('login').hidden=authorized;document.getElementById('studio').hidden=!authorized;if(authorized)await library();if(typeof placeDashboard==='function')placeDashboard();if(authorized&&typeof refreshAudioMonitor==='function')refreshAudioMonitor();refresh();}
 document.getElementById('login').onsubmit=async function(e){e.preventDefault();var f=new FormData(e.target);try{var r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json','X-Regia-Request':'1'},body:JSON.stringify(Object.fromEntries(f))});var d=await r.json();document.getElementById('authMessage').textContent=d.message||'';e.target.password.value='';await session();}catch(e){document.getElementById('authMessage').textContent='Connessione non riuscita';}};
 document.getElementById('logout').onclick=async function(){await fetch('/api/logout',{method:'POST',headers:{'X-CSRF-Token':csrf}});await session();};
 document.getElementById('upload').onsubmit=function(e){e.preventDefault();var file=document.getElementById('audiofile').files[0];if(!file)return;var x=new XMLHttpRequest();x.open('POST','/api/upload');x.setRequestHeader('X-CSRF-Token',csrf);x.setRequestHeader('X-Filename',encodeURIComponent(file.name));var bar=document.getElementById('uploadProgress');bar.hidden=false;bar.value=0;x.upload.onprogress=function(e){if(e.lengthComputable)bar.value=e.loaded/e.total*100;};x.onload=function(){try{document.getElementById('authMessage').textContent=JSON.parse(x.responseText).message;}catch(e){document.getElementById('authMessage').textContent='Caricamento fallito';}library();};x.onerror=function(){document.getElementById('authMessage').textContent='Connessione interrotta: riprovare il caricamento';};x.send(file);};
@@ -2428,9 +2428,25 @@ PY_AUDIO_BUS
 #studioTools h3{margin-top:28px}#studioTools .studioPanel{border:1px solid #374151;border-radius:10px;padding:16px;margin:18px 0;background:#18212f}#studioTools .studioPanel>h3{margin-top:0}#studioTools .scheduledPanel{border:1px solid #4b5563;border-radius:10px;margin:18px 0;background:#18212f}#studioTools .scheduledPanel>summary{cursor:pointer;list-style:none;padding:16px;font-size:1.12rem;font-weight:700;display:flex;justify-content:space-between;align-items:center;gap:12px}#studioTools .scheduledPanel>summary::-webkit-details-marker{display:none}#studioTools .scheduledPanel>summary:after{content:'▾';color:#93c5fd;transition:transform .15s ease}#studioTools .scheduledPanel[open]>summary:after{transform:rotate(180deg)}#studioTools .scheduledBody{border-top:1px solid #374151;padding:0 16px 16px}#studioTools .scheduledMeta{font-size:.85rem;font-weight:400;color:#9ca3af;margin-left:auto}#studioTools fieldset{border:1px solid #4b5563;margin:12px 0}#studioTools label{display:inline-block}#studioTools table{width:100%;border-collapse:collapse}#studioTools td,#studioTools th{padding:8px;text-align:left;border-bottom:1px solid #374151}#studioTools .scroll{overflow-x:auto}#studioTools ul,#studioTools ol{padding-left:24px}#studioTools .hint{color:#9ca3af}#studioTools [role=status]{color:#93c5fd;white-space:pre-wrap}.danger{border-color:#f87171!important}.playlist-row{margin:6px 0}
 
 .vlc-options{flex-wrap:wrap}.vlc-options #repeatToggle,.vlc-options #playlistLoop{width:auto;padding:8px 12px;font-weight:700}.playlist-check{width:20px;height:20px;flex-shrink:0;accent-color:#ff9e36}
+
+/* Navigazione principale della regia: separa uso quotidiano, calendario e manutenzione. */
+.regia-tabs{display:flex;gap:8px;flex-wrap:wrap;margin:18px 0;border-bottom:1px solid #4b5563;padding-bottom:8px}
+#studioTools .regia-tab{margin:0;padding:10px 18px;border-radius:8px 8px 0 0;background:#111827;border:1px solid #4b5563;font-weight:750}
+#studioTools .regia-tab[aria-selected=true]{background:#1d4ed8;border-color:#60a5fa;color:#eff6ff}
+.regia-tab-panel{min-width:0}.regia-tab-panel[hidden]{display:none!important}
+.regia-section-title{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#rxAudioHost{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:12px}
+#systemDashboardHost{margin-top:16px}
+@media(max-width:600px){.regia-tabs{display:grid;grid-template-columns:repeat(3,1fr)}#studioTools .regia-tab{padding:9px 6px;font-size:13px}}
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
+<nav class="regia-tabs" role="tablist" aria-label="Sezioni regia">
+<button type="button" class="regia-tab" id="tabPlayer" role="tab" aria-selected="true" aria-controls="regiaPlayer" data-regia-tab="player">Player</button>
+<button type="button" class="regia-tab" id="tabEvents" role="tab" aria-selected="false" aria-controls="regiaEvents" data-regia-tab="events">Eventi</button>
+<button type="button" class="regia-tab" id="tabSystem" role="tab" aria-selected="false" aria-controls="regiaSystem" data-regia-tab="system">Sistema</button>
+</nav>
+<section id="regiaPlayer" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabPlayer">
 <details id="playerPanel" open>
 <summary><span class="vlc-mark" aria-hidden="true">▲</span><span class="vlc-summary-copy"><strong>Lettore multimediale</strong><small id="playerSummary">Nessuna traccia in riproduzione</small></span></summary>
 <div id="vlcPlayer" tabindex="0" aria-label="Lettore audio TX">
@@ -2464,7 +2480,13 @@ PY_AUDIO_BUS
 <label>Soglia voce (dBFS) <input name="threshold_db" type="number" min="-60" max="-6" step="1" value="-36" required></label>
 <label>Attenuazione musica (dB) <input name="reduction_db" type="number" min="-40" max="0" step="1" value="-18" required></label><button>Applica ducking</button></form>
 <p class="hint">Il microfono non viene attenuato dal ducking. Se il rumore di fondo fa abbassare la musica, alza la soglia (per esempio da −36 a −30 dBFS). Il volume della musica torna gradualmente normale dopo l’annuncio.</p>
-<details id="scheduledEventsPanel" class="scheduledPanel">
+<section class="studioPanel" aria-labelledby="audioMonitorTitle">
+<div class="regia-section-title"><h3 id="audioMonitorTitle">Monitor audio TX e RX</h3><span class="hint">Meter in tempo reale · volume e mute RX</span></div>
+<div id="rxAudioHost"><p class="hint">Caricamento stato audio…</p></div>
+</section>
+</section>
+<section id="regiaEvents" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabEvents" hidden>
+<details id="scheduledEventsPanel" class="scheduledPanel" open>
 <summary><span>Eventi programmati</span><span id="scheduledEventsMeta" class="scheduledMeta">caricamento…</span></summary>
 <div class="scheduledBody">
 <h3>Calendario · Europe/Rome</h3><p id="automationState"></p>
@@ -2491,6 +2513,12 @@ PY_AUDIO_BUS
 <details><summary>Registro eventi (ultimi 30)</summary><ul id="eventHistory"></ul></details>
 </div>
 </details>
+</section>
+<section id="regiaSystem" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabSystem" hidden>
+<div id="systemDashboardHost">
+<h3>Stato sistema</h3>
+<p class="hint">Stato TX/RX, rete, servizi, autodiagnosi e manutenzione.</p>
+</div>
 <h3>Explorer USB</h3><button id="scanUSB">Rileva pennette</button><label>Dispositivo <select id="usbDevice"></select></label><button id="openUSB">Apri</button><button id="ejectUSB">Espelli</button>
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
@@ -2519,13 +2547,83 @@ PY_AUDIO_BUS
 <p class="hint">Puoi chiudere il browser: l’operazione prosegue sul TX. Il riavvio della regia richiede un nuovo login; rientra qui per vedere l’esito.</p>
 </details>
 </section>
+</section>
 <script>
 (function(){
 'use strict';
 var currentEvents=[],eventTracks=[],usbPath='',usbOpened='',inFlight=false,duckInitialized=false;
 var mediaFiles=[],playerSnapshot=null,playerSampleTime=0,scrubbing=false,volumeEditing=false,playerBusy=false,selectionDirty=false,playerRevision=0;
 function el(id){return document.getElementById(id);}
+
+/* Le schede cambiano solo presentazione: i servizi continuano a girare sempre. */
+function activateRegiaTab(name,persist){
+  var valid=['player','events','system'];
+  if(!valid.includes(name)){name='player';}
+  document.querySelectorAll('[data-regia-tab]').forEach(function(button){
+    var active=button.dataset.regiaTab===name;
+    button.setAttribute('aria-selected',String(active));
+  });
+  valid.forEach(function(tabName){
+    var panel=el('regia'+tabName.charAt(0).toUpperCase()+tabName.slice(1));
+    if(panel){panel.hidden=tabName!==name;}
+  });
+  if(persist){
+    try{localStorage.setItem('museum.regia.tab',name);}catch(error){}
+  }
+  if(typeof placeDashboard==='function'){placeDashboard();}
+  if(name==='player'&&typeof refreshAudioMonitor==='function'){refreshAudioMonitor();}
+}
+
 function message(text){el('studioMessage').textContent=text;el('playerMessage').textContent=text;}
+
+/* Vista operativa: usa i dati del monitor centrale ma mostra soltanto audio e comandi RX. */
+async function refreshAudioMonitor(){
+  var host=el('rxAudioHost');
+  if(!host||!authorized){return;}
+  try{
+    var response=await fetch('/api/status',{cache:'no-store'});
+    if(!response.ok){throw new Error('stato sistema non disponibile');}
+    var data=await response.json();
+    var html='';
+    (data.nodes||[]).forEach(function(node){
+      var title=esc(node.name)+' · '+esc((node.role||'').toUpperCase());
+      html+='<article class="card"><div class="head"><strong>'+title+'</strong><span class="badge '+esc(node.state||'OK')+'">'+esc(node.state||'')+'</span></div>';
+      html+=meterBlock(node);
+      if(node.role==='rx'){
+        html+=volumeBlock(node);
+      }
+      html+='</article>';
+    });
+    if(!html){html='<p class="hint">Nessun nodo audio rilevato.</p>';}
+    host.innerHTML=html;
+    if(typeof bindVolumeControls==='function'){bindVolumeControls();}
+  }catch(error){
+    host.innerHTML='<p class="hint">Monitor audio non disponibile: '+esc(error.message)+'</p>';
+  }
+}
+
+/* La dashboard tecnica completa vive in Sistema durante la sessione di regia.
+   Al logout viene riportata nella sua posizione pubblica originale. */
+function placeDashboard(){
+  var systemHost=el('systemDashboardHost');
+  var publicHome=document.getElementById('publicDashboardHome');
+  var summary=document.getElementById('summary');
+  var nodes=document.getElementById('nodes');
+  var footer=document.getElementById('footer');
+  if(!systemHost||!publicHome||!summary||!nodes||!footer){return;}
+
+  if(authorized){
+    if(summary.parentNode!==systemHost){
+      systemHost.appendChild(summary);
+      systemHost.appendChild(nodes);
+      systemHost.appendChild(footer);
+    }
+  }else if(summary.parentNode!==publicHome){
+    publicHome.appendChild(summary);
+    publicHome.appendChild(nodes);
+    publicHome.appendChild(footer);
+  }
+}
 async function api(path,data){
   var options={cache:'no-store'};
   if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
@@ -2629,7 +2727,7 @@ function renderEvents(){
       var form=el('eventForm');['id','name','start','recurrence','policy'].forEach(function(k){form.elements.namedItem(k).value=e[k];});
       form.elements.namedItem('track').value=tracks[0];form.elements.namedItem('end_time').value=e.end_time||'';form.elements.namedItem('repetitions').value=repetitions;form.elements.namedItem('interval_seconds').value=e.interval_seconds||0;
       form.elements.namedItem('enabled').checked=e.enabled;eventTracks=tracks.slice();renderPlaylist();
-      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';el('scheduledEventsPanel').open=true;form.scrollIntoView({behavior:'smooth'});
+      document.querySelectorAll('#weekdays input').forEach(function(c){c.checked=e.weekdays.includes(Number(c.value));});el('eventLegend').textContent='Modifica evento';activateRegiaTab('events',true);el('scheduledEventsPanel').open=true;form.scrollIntoView({behavior:'smooth'});
     }));
     actions.appendChild(button('Elimina evento',function(){if(confirm('Eliminare l’evento '+e.name+'?'))perform(async function(){await api('/api/calendar/delete',{id:e.id});await update();});}));
     tr.appendChild(actions);el('eventRows').appendChild(tr);
@@ -2746,8 +2844,24 @@ setInterval(refreshUpdates,3000);
 window.addEventListener('DOMContentLoaded',function(){
   el('playlistHost').appendChild(el('library'));el('playlistImport').appendChild(el('upload'));
   var oldTitle=el('studio').querySelector('h3');if(oldTitle)oldTitle.remove();
-  try{el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';}catch(error){}
-  update();setInterval(update,2000);setInterval(renderTimeline,250);
+
+  document.querySelectorAll('[data-regia-tab]').forEach(function(button){
+    button.addEventListener('click',function(){activateRegiaTab(button.dataset.regiaTab,true);});
+  });
+
+  var initialTab='player';
+  try{
+    el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';
+    initialTab=localStorage.getItem('museum.regia.tab')||'player';
+  }catch(error){}
+  activateRegiaTab(initialTab,false);
+  placeDashboard();
+  refreshAudioMonitor();
+
+  update();
+  setInterval(update,2000);
+  setInterval(refreshAudioMonitor,2000);
+  setInterval(renderTimeline,250);
 });
 })();
 </script>
