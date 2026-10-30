@@ -23,7 +23,7 @@ class UpdateTests(unittest.TestCase):
         self.remote=patch.object(u,'remote_config',return_value={'ROLE':'rx'});self.remote.start();self.addCleanup(self.remote.stop)
     def queued(self,action='update'):
         u.atomic(self.root/'status.json',{'state':'queued','action':action,'nodes':[]})
-        if action=='update': u.atomic(self.manager.secrets,[{'ip':ip,'credentials':{'username':'root','password':'secret','root_password':'secret'}} for ip in ('192.168.1.51','192.168.1.52')])
+        if action=='update': u.atomic(self.manager.secrets,[{'ip':ip,'credentials':{'username':'root','password':'secret'}} for ip in ('192.168.1.51','192.168.1.52')])
     def test_numeric_versions_and_targets(self):
         self.assertLess(u.version('4.9'),u.version('4.11'))
         self.assertEqual(u.version('4.11.0'),u.version('4.11'))
@@ -83,13 +83,14 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(len(nodes),1);self.assertTrue(nodes[0]['online']);self.assertEqual(nodes[0]['name'],'Sala')
     def test_credentials_individual_and_secret_file_permissions(self):
         data={'receivers':['192.168.1.51','192.168.1.52'],'scope':'individual','credentials':{
-            '192.168.1.51':{'username':'pi','password':'first','root_password':'root-secret'},
+            '192.168.1.51':{'username':'pi','password':'first'},
             '192.168.1.52':{'username':'root','password':'second'}}}
         with patch.object(u,'command',return_value='inactive'): self.manager.request('update',data)
         job=u.read_json(self.manager.secrets,[])
         self.assertEqual([i['credentials']['password'] for i in job],['first','second'])
         self.assertEqual(self.manager.secrets.stat().st_mode & 0o777,0o600)
-        self.assertNotIn('root-secret',json.dumps(self.manager.snapshot()))
+        self.assertNotIn('first',json.dumps(self.manager.snapshot()))
+        self.assertNotIn('second',json.dumps(self.manager.snapshot()))
     def test_unknown_offline_or_missing_credentials_rejected(self):
         for addresses,values in [(['192.168.1.99'],{'username':'root','password':'secret'}),(['192.168.1.51'],{})]:
             with patch.object(u,'command',return_value='inactive'),self.assertRaises(ValueError):
@@ -151,29 +152,67 @@ class UpdateTests(unittest.TestCase):
 class PasswordTransportTests(unittest.TestCase):
     def connection(self):
         conn=u.PasswordSSH.__new__(u.PasswordSSH)
-        conn.client=Mock();conn.credentials={'username':'pi','password':'ssh-secret','root_password':'root-secret'}
+        conn.client=Mock();conn.credentials={'username':'pi','password':'ssh-secret'}
         return conn
-    def test_root_password_sent_to_terminal_only(self):
-        conn=self.connection();stdin=Mock();stdout=Mock();channel=stdout.channel
-        conn.client.exec_command.return_value=(stdin,stdout,Mock())
-        channel.recv_ready.side_effect=[True,True,False]
-        channel.recv.side_effect=[b'Pass',b'word: ']
-        channel.exit_status_ready.return_value=True;channel.recv_exit_status.return_value=0
+
+    def test_passwordless_sudo_is_tried_first(self):
+        conn=self.connection()
+        stdout=Mock();stderr=Mock()
+        stdout.read.return_value=b'';stderr.read.return_value=b''
+        stdout.channel.recv_exit_status.return_value=0
+        conn.client.exec_command.return_value=(Mock(),stdout,stderr)
         conn.privileged('192.168.1.51','true')
-        channel.sendall.assert_called_once_with(b'root-secret\n')
-        self.assertNotIn('root-secret',str(conn.client.exec_command.call_args))
-        self.assertTrue(conn.client.exec_command.call_args.kwargs['get_pty'])
-    def test_wrong_root_password_fails(self):
-        conn=self.connection();stdout=Mock();conn.client.exec_command.return_value=(Mock(),stdout,Mock())
-        stdout.channel.recv_ready.return_value=False;stdout.channel.exit_status_ready.return_value=True
-        stdout.channel.recv_exit_status.return_value=1
-        with self.assertRaisesRegex(RuntimeError,'Accesso root'):conn.privileged('192.168.1.51','true')
-    def test_root_login_uses_no_su(self):
+        command=conn.client.exec_command.call_args.args[0]
+        self.assertIn('sudo -n',command)
+        self.assertNotIn('ssh-secret',command)
+
+    def test_same_ssh_password_is_used_for_sudo(self):
+        conn=self.connection()
+        first_stdout=Mock();first_stderr=Mock()
+        first_stdout.read.return_value=b'';first_stderr.read.return_value=b''
+        first_stdout.channel.recv_exit_status.return_value=1
+
+        second_stdout=Mock();second_stderr=Mock();channel=second_stdout.channel
+        channel.recv_ready.side_effect=[True,False]
+        channel.recv.side_effect=[b'[sudo] password for pi: ']
+        channel.exit_status_ready.side_effect=[False,True]
+        channel.recv_exit_status.return_value=0
+
+        conn.client.exec_command.side_effect=[
+            (Mock(),first_stdout,first_stderr),
+            (Mock(),second_stdout,second_stderr)
+        ]
+        conn.privileged('192.168.1.51','true')
+        channel.sendall.assert_called_once_with(b'ssh-secret\n')
+        command=conn.client.exec_command.call_args.args[0]
+        self.assertIn('sudo -S',command)
+        self.assertNotIn('ssh-secret',command)
+
+    def test_failed_sudo_has_clear_error(self):
+        conn=self.connection()
+        first_stdout=Mock();first_stderr=Mock()
+        first_stdout.read.return_value=b'';first_stderr.read.return_value=b''
+        first_stdout.channel.recv_exit_status.return_value=1
+
+        second_stdout=Mock();second_stderr=Mock();channel=second_stdout.channel
+        channel.recv_ready.return_value=False
+        channel.exit_status_ready.return_value=True
+        channel.recv_exit_status.return_value=1
+
+        conn.client.exec_command.side_effect=[
+            (Mock(),first_stdout,first_stderr),
+            (Mock(),second_stdout,second_stderr)
+        ]
+        with self.assertRaisesRegex(RuntimeError,'abilitato a sudo'):
+            conn.privileged('192.168.1.51','true')
+
+    def test_root_login_uses_no_sudo(self):
         conn=self.connection();conn.credentials['username']='root'
         stdout=Mock();stdout.read.return_value=b'';stdout.channel.recv_exit_status.return_value=0
         conn.client.exec_command.return_value=(Mock(),stdout,Mock())
         conn.privileged('192.168.1.51','true')
         self.assertEqual(conn.client.exec_command.call_args.args[0],'true')
+
 
 class UpdateAccessTests(unittest.TestCase):
     setUp=access.AccessTests.setUp
