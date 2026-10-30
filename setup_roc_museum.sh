@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.20"
+VERSION="4.21"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.20"
+MONITOR_BUILD="4.21"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -1258,7 +1258,7 @@ function renderTxClock(){var el=document.getElementById('systemClock');if(el&&tx
 setInterval(renderTxClock,1000);
 '''
 PAGE=PAGE.replace('<script>function esc','<script>'+CLOCK_JS+'function esc',1)
-PAGE=PAGE.replace("var data=await response.json();var okCount", "var data=await response.json();syncTxClock(data.generated_at);var okCount",1)
+PAGE=PAGE.replace("var data=await response.json();", "var data=await response.json();syncTxClock(data.generated_at);",1)
 
 def build_tx_page():
     page=PAGE
