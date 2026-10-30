@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.21"
+VERSION="4.22"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.21"
+MONITOR_BUILD="4.22"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -919,10 +919,48 @@ def temperature():
 
 def throttled():
     code,output=run(["vcgencmd","get_throttled"])
-    if code!=0: return None
+    if code!=0:
+        return None
     match=re.search(r"0x[0-9a-fA-F]+",output)
-    if match is None: return None
-    return match.group(0)
+    if match is None:
+        return None
+
+    raw=match.group(0)
+    try:
+        value=int(raw,16)
+    except ValueError:
+        return {"raw":raw,"active":False,"historical":False,"current_flags":[],"historical_flags":[]}
+
+    current_map=(
+        (0x1,"undervoltage"),
+        (0x2,"frequenza CPU limitata"),
+        (0x4,"throttling"),
+        (0x8,"limite termico soft")
+    )
+    historical_map=(
+        (0x10000,"undervoltage"),
+        (0x20000,"frequenza CPU limitata"),
+        (0x40000,"throttling"),
+        (0x80000,"limite termico soft")
+    )
+
+    current_flags=[]
+    for bit,label in current_map:
+        if value & bit:
+            current_flags.append(label)
+
+    historical_flags=[]
+    for bit,label in historical_map:
+        if value & bit:
+            historical_flags.append(label)
+
+    return {
+        "raw":raw,
+        "active":bool(current_flags),
+        "historical":bool(historical_flags),
+        "current_flags":current_flags,
+        "historical_flags":historical_flags
+    }
 
 def build_snapshot(config):
     role=config.get("ROLE","")
@@ -1072,7 +1110,10 @@ def apply_audio_diagnosis(nodes):
         meter=node.get("audio_meter",{}) or {}
         integrity=meter.get("integrity",{}) or {}
         warning=(node.get("roc_last_warning") or "").lower()
-        throttled_code=node.get("throttled")
+        throttled_state=node.get("throttled") or {}
+        if not isinstance(throttled_state,dict):
+            throttled_state={"raw":str(throttled_state),"active":False,"historical":False,
+                             "current_flags":[],"historical_flags":[]}
 
         diagnosis={"severity":"ok","code":"RTP_CONTINUOUS",
                    "summary":"RTP regolare negli ultimi 60 s",
@@ -1091,10 +1132,11 @@ def apply_audio_diagnosis(nodes):
                 diagnosis={"severity":"critical","code":"NO_RTP",
                            "summary":"Nessun RTP audio recente",
                            "detail":"Controllare sender Roc, bus audio e instradamento multicast."}
-        elif throttled_code not in (None,"","0x0","0x00000"):
+        elif throttled_state.get("active"):
+            current=", ".join(throttled_state.get("current_flags",[])) or "anomalia alimentazione/termica"
             diagnosis={"severity":"warning","code":"POWER_THROTTLING",
-                       "summary":"Throttling/alimentazione Raspberry rilevato",
-                       "detail":"Il Raspberry segnala throttling: verificare alimentatore, temperatura e undervoltage."}
+                       "summary":"Problema alimentazione/termico attualmente attivo",
+                       "detail":"Segnalazione corrente Raspberry: "+current+". Verificare alimentatore, temperatura e undervoltage."}
         elif "underrun" in warning or "overrun" in warning or "xrun" in warning:
             diagnosis={"severity":"warning","code":"RX_BUFFER_XRUN",
                        "summary":"Possibile underrun/overrun audio",
@@ -1180,7 +1222,7 @@ def system_status(config):
 PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}.titlebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px}h1{margin:0}.versionBadge{display:inline-flex;align-items:center;background:#1d4ed8;color:#dbeafe;border:1px solid #3b82f6;border-radius:999px;padding:7px 12px;font-size:14px;font-weight:800;letter-spacing:.02em;white-space:nowrap}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}.autodiag{border-top:1px solid #374151;padding:12px 0}.autodiag strong{display:block;margin-bottom:7px}.autodiag.ok strong{color:#a7f3d0}.autodiag.warning strong{color:#fde68a}.autodiag.critical strong{color:#fecaca}.autodiag.info strong{color:#bfdbfe}</style></head><body><main><div class="titlebar"><h1>RETE MUSEO - AudioOverNetwork</h1><span id="versionBadge" class="versionBadge">Versione installata: …</span></div><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
 function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
 return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
-function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function audioDiagnosisBlock(n){var d=n.audio_diagnosis||{};var m=n.audio_meter||{};var i=m.integrity||{};if(!d.summary)return '';var html='<section class="autodiag '+esc(d.severity||'info')+'"><strong>Autodiagnosi audio · '+esc(d.summary)+'</strong><small>'+esc(d.detail||'')+'</small>';if(i.window_seconds){html+='<div class="row"><span class="label">RTP ultimi '+esc(i.window_seconds)+' s</span><span class="value">'+esc(i.packets_window||0)+' pacchetti</span></div><div class="row"><span class="label">Pacchetti mancanti/ritardati</span><span class="value">'+esc(i.missing_packets||0)+' · gap max '+esc(i.max_sequence_gap||0)+'</span></div><div class="row"><span class="label">Fuori ordine / duplicati</span><span class="value">'+esc(i.out_of_order_packets||0)+' / '+esc(i.duplicate_packets||0)+'</span></div><div class="row"><span class="label">Pause RTP >40 ms</span><span class="value">'+esc(i.transport_stalls||0)+' · max '+esc(i.max_transport_gap_ms||0)+' ms</span></div><div class="row"><span class="label">Jitter stimato</span><span class="value">'+esc(i.jitter_ms||0)+' ms</span></div>';}html+='</section>';return html;}
+function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function audioDiagnosisBlock(n){var d=n.audio_diagnosis||{};var m=n.audio_meter||{};var i=m.integrity||{};var p=n.throttled||{};if(!d.summary)return '';var html='<section class="autodiag '+esc(d.severity||'info')+'"><strong>Autodiagnosi audio · '+esc(d.summary)+'</strong><small>'+esc(d.detail||'')+'</small>';if(i.window_seconds){html+='<div class="row"><span class="label">RTP ultimi '+esc(i.window_seconds)+' s</span><span class="value">'+esc(i.packets_window||0)+' pacchetti</span></div><div class="row"><span class="label">Pacchetti mancanti/ritardati</span><span class="value">'+esc(i.missing_packets||0)+' · gap max '+esc(i.max_sequence_gap||0)+'</span></div><div class="row"><span class="label">Fuori ordine / duplicati</span><span class="value">'+esc(i.out_of_order_packets||0)+' / '+esc(i.duplicate_packets||0)+'</span></div><div class="row"><span class="label">Pause RTP >40 ms</span><span class="value">'+esc(i.transport_stalls||0)+' · max '+esc(i.max_transport_gap_ms||0)+' ms</span></div><div class="row"><span class="label">Jitter stimato</span><span class="value">'+esc(i.jitter_ms||0)+' ms</span></div>';}if(p.raw){var power='OK';if(p.active){power='ATTIVO: '+(p.current_flags||[]).join(', ');}else if(p.historical){power='OK ora · storico: '+(p.historical_flags||[]).join(', ');}html+='<div class="row"><span class="label">Alimentazione/termica</span><span class="value">'+esc(power)+' · '+esc(p.raw)+'</span></div>';}html+='</section>';return html;}
 function diagnosticsBlock(n){var body='';if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
 var m=n.audio_meter;var rx=n.role==='rx';var title=rx?'Uscita RX':'Trasmissione TX · microfono + musica';
 if(!n.online||!m||!m.available){return '<section class="meter"><strong>'+title+'</strong><small>'+esc(!n.online?'Nodo offline':m?m.error:'Aggiornare il monitor del nodo')+'</small></section>';}
