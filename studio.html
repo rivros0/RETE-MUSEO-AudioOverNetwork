@@ -301,9 +301,10 @@ function renderCredentialFields(){
   var groups=el('credentialScope').value==='all'?[{ip:'all',name:'Tutti gli RX selezionati'}]:updateReceivers.filter(function(n){return n.online;});
   groups.forEach(function(n){
     var field=document.createElement('fieldset'),legend=document.createElement('legend');legend.textContent=n.name+(n.ip==='all'?'':' · '+n.ip);field.appendChild(legend);
-    var inputs={};[['username','Utente SSH','text'],['password','Password SSH','password'],['root_password','Password root (se diversa)','password']].forEach(function(info){
-      var label=document.createElement('label'),input=document.createElement('input');label.textContent=info[1]+' ';input.type=info[2];input.autocomplete='off';input.maxLength=info[0]==='username'?64:1024;input.required=info[0]!=='root_password';if(info[0]==='username')input.value='root';label.appendChild(input);field.appendChild(label);field.appendChild(document.createElement('br'));inputs[info[0]]=input;
+    var inputs={};[['username','Utente SSH','text'],['password','Password SSH / sudo','password']].forEach(function(info){
+      var label=document.createElement('label'),input=document.createElement('input');label.textContent=info[1]+' ';input.type=info[2];input.autocomplete='off';input.maxLength=info[0]==='username'?64:1024;input.required=true;if(info[0]==='username')input.value='root';label.appendChild(input);field.appendChild(label);field.appendChild(document.createElement('br'));inputs[info[0]]=input;
     });
+    var hint=document.createElement('small');hint.className='hint';hint.textContent='Usa una sola coppia di credenziali. Se l’utente non è root deve poter usare sudo con la stessa password.';field.appendChild(hint);
     el('credentialFields').appendChild(field);credentialGroups.push({ip:n.ip,inputs:inputs,field:field});
   });
   syncCredentialSelection();
