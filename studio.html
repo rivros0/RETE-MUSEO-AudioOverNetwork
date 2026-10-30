@@ -98,7 +98,7 @@
 <button type="button" id="deployUpdates">Aggiorna TX e propaga agli RX</button>
 <p id="updateMessage" role="status" aria-live="polite"></p>
 <ul id="updateNodes"></ul>
-<p>Gli RX vengono rilevati automaticamente dal TX. All’avvio scegli i ricevitori e inserisci le credenziali SSH e di root, comuni a tutti i selezionati oppure diverse per ogni modulo.</p>
+<p>Gli RX vengono rilevati automaticamente dal TX. All’avvio scegli i ricevitori e inserisci una sola coppia di credenziali SSH, comune a tutti i selezionati oppure diversa per ogni modulo.</p>
 <dialog id="updateCredentials" style="background:#1f2937;color:#e5e7eb;max-width:650px;width:90%;max-height:85vh;overflow:auto;border:1px solid #6b7280;border-radius:10px">
 <form id="updateCredentialsForm">
 <h3>Aggiornamento TX e ricevitori rilevati</h3>
@@ -106,7 +106,7 @@
 <div id="discoveredReceivers"></div>
 <label>Credenziali <select id="credentialScope"><option value="all">Uguali per tutti gli RX selezionati</option><option value="individual">Specifiche per ciascun RX</option></select></label>
 <div id="credentialFields"></div>
-<p class="hint">Per accedere direttamente come root, usa root come nome utente. Con un altro utente, inserisci anche la password di root se diversa da quella SSH. Le credenziali valgono solo per questo aggiornamento.</p>
+<p class="hint">Per accedere direttamente come root, usa root come nome utente. Con un altro utente, la stessa password SSH viene usata anche per sudo. Le credenziali valgono solo per questo aggiornamento.</p>
 <p id="credentialMessage" role="status" aria-live="polite"></p>
 <button type="submit" id="startCredentialUpdate">Avvia aggiornamento</button>
 <button type="button" id="cancelCredentialUpdate">Annulla</button>
