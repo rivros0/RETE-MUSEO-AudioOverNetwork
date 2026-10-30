@@ -165,10 +165,60 @@ function activateRegiaTab(name,persist){
   if(persist){
     try{localStorage.setItem('museum.regia.tab',name);}catch(error){}
   }
-  if(name==='system'&&typeof placeDashboard==='function'){placeDashboard();}
+  if(typeof placeDashboard==='function'){placeDashboard();}
+  if(name==='player'&&typeof refreshAudioMonitor==='function'){refreshAudioMonitor();}
 }
 
 function message(text){el('studioMessage').textContent=text;el('playerMessage').textContent=text;}
+
+/* Vista operativa: usa i dati del monitor centrale ma mostra soltanto audio e comandi RX. */
+async function refreshAudioMonitor(){
+  var host=el('rxAudioHost');
+  if(!host||!authorized){return;}
+  try{
+    var response=await fetch('/api/status',{cache:'no-store'});
+    if(!response.ok){throw new Error('stato sistema non disponibile');}
+    var data=await response.json();
+    var html='';
+    (data.nodes||[]).forEach(function(node){
+      var title=esc(node.name)+' · '+esc((node.role||'').toUpperCase());
+      html+='<article class="card"><div class="head"><strong>'+title+'</strong><span class="badge '+esc(node.state||'OK')+'">'+esc(node.state||'')+'</span></div>';
+      html+=meterBlock(node);
+      if(node.role==='rx'){
+        html+=volumeBlock(node);
+      }
+      html+='</article>';
+    });
+    if(!html){html='<p class="hint">Nessun nodo audio rilevato.</p>';}
+    host.innerHTML=html;
+    if(typeof bindVolumeControls==='function'){bindVolumeControls();}
+  }catch(error){
+    host.innerHTML='<p class="hint">Monitor audio non disponibile: '+esc(error.message)+'</p>';
+  }
+}
+
+/* La dashboard tecnica completa vive in Sistema durante la sessione di regia.
+   Al logout viene riportata nella sua posizione pubblica originale. */
+function placeDashboard(){
+  var systemHost=el('systemDashboardHost');
+  var publicHome=document.getElementById('publicDashboardHome');
+  var summary=document.getElementById('summary');
+  var nodes=document.getElementById('nodes');
+  var footer=document.getElementById('footer');
+  if(!systemHost||!publicHome||!summary||!nodes||!footer){return;}
+
+  if(authorized){
+    if(summary.parentNode!==systemHost){
+      systemHost.appendChild(summary);
+      systemHost.appendChild(nodes);
+      systemHost.appendChild(footer);
+    }
+  }else if(summary.parentNode!==publicHome){
+    publicHome.appendChild(summary);
+    publicHome.appendChild(nodes);
+    publicHome.appendChild(footer);
+  }
+}
 async function api(path,data){
   var options={cache:'no-store'};
   if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
@@ -400,8 +450,13 @@ window.addEventListener('DOMContentLoaded',function(){
     initialTab=localStorage.getItem('museum.regia.tab')||'player';
   }catch(error){}
   activateRegiaTab(initialTab,false);
+  placeDashboard();
+  refreshAudioMonitor();
 
-  update();setInterval(update,2000);setInterval(renderTimeline,250);
+  update();
+  setInterval(update,2000);
+  setInterval(refreshAudioMonitor,2000);
+  setInterval(renderTimeline,250);
 });
 })();
 </script>
