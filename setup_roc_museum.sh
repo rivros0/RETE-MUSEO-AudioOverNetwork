@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.24"
+VERSION="4.25"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.24"
+MONITOR_BUILD="4.25"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -614,6 +614,14 @@ class AudioMeter:
         if issue_times:
             last_issue_age=round(max(0.0,now-max(issue_times)),1)
 
+        last_sequence_gap_age=None
+        if self.sequence_gap_events:
+            last_sequence_gap_age=round(max(0.0,now-self.sequence_gap_events[-1][0]),1)
+
+        last_transport_stall_age=None
+        if self.transport_stall_events:
+            last_transport_stall_age=round(max(0.0,now-self.transport_stall_events[-1][0]),1)
+
         last_packet_age=None
         if self.packet_times:
             last_packet_age=round(max(0.0,now-self.packet_times[-1]),3)
@@ -633,6 +641,8 @@ class AudioMeter:
             "max_transport_gap_ms":round(max_transport_gap,1),
             "jitter_ms":round(self.jitter_seconds*1000.0,2),
             "last_issue_age_seconds":last_issue_age,
+            "last_sequence_gap_age_seconds":last_sequence_gap_age,
+            "last_transport_stall_age_seconds":last_transport_stall_age,
             "last_packet_age_seconds":last_packet_age
         }
 
@@ -1130,11 +1140,47 @@ def apply_audio_diagnosis(nodes):
         tx_meter=tx_node.get("audio_meter",{}) or {}
         tx_integrity=tx_meter.get("integrity",{}) or {}
 
-    tx_has_transport_problem=False
-    if tx_integrity.get("missing_packets",0)>0:
-        tx_has_transport_problem=True
-    if tx_integrity.get("transport_stalls",0)>0:
-        tx_has_transport_problem=True
+    # Il monitor TX usa una cattura AF_PACKET in user space. Una singola pausa
+    # nei tempi di osservazione può essere causata dallo scheduling del monitor
+    # anche quando il kernel continua a trasmettere regolarmente. Per attribuire
+    # il problema al TX serve quindi una conferma temporale dagli RX.
+    online_rx=[]
+    for candidate in nodes:
+        if candidate.get("role")!="rx" or not candidate.get("online",True):
+            continue
+        candidate_meter=candidate.get("audio_meter",{}) or {}
+        if candidate_meter.get("available"):
+            online_rx.append(candidate)
+
+    required_confirmations=1
+    if len(online_rx)>=2:
+        required_confirmations=2
+
+    def correlated_issue(tx_age,rx_age,tolerance=5.0):
+        if tx_age is None or rx_age is None:
+            return False
+        return abs(float(tx_age)-float(rx_age))<=tolerance
+
+    sequence_confirmations=0
+    stall_confirmations=0
+    tx_sequence_age=tx_integrity.get("last_sequence_gap_age_seconds")
+    tx_stall_age=tx_integrity.get("last_transport_stall_age_seconds")
+
+    for candidate in online_rx:
+        rx_integrity=(candidate.get("audio_meter",{}) or {}).get("integrity",{}) or {}
+        if rx_integrity.get("missing_packets",0)>0 and correlated_issue(
+                tx_sequence_age,rx_integrity.get("last_sequence_gap_age_seconds")):
+            sequence_confirmations+=1
+        if rx_integrity.get("transport_stalls",0)>0 and correlated_issue(
+                tx_stall_age,rx_integrity.get("last_transport_stall_age_seconds")):
+            stall_confirmations+=1
+
+    tx_sequence_observed=tx_integrity.get("missing_packets",0)>0
+    tx_stall_observed=tx_integrity.get("transport_stalls",0)>0
+    tx_sequence_confirmed=tx_sequence_observed and sequence_confirmations>=required_confirmations
+    tx_stall_confirmed=tx_stall_observed and stall_confirmations>=required_confirmations
+    tx_has_confirmed_transport_problem=tx_sequence_confirmed or tx_stall_confirmed
+    tx_has_unconfirmed_observation=(tx_sequence_observed or tx_stall_observed) and not tx_has_confirmed_transport_problem
 
     for node in nodes:
         meter=node.get("audio_meter",{}) or {}
@@ -1182,14 +1228,18 @@ def apply_audio_diagnosis(nodes):
             diagnosis={"severity":"warning","code":"RX_BUFFER_XRUN",
                        "summary":"Possibile underrun/overrun audio",
                        "detail":"Roc/ALSA ha segnalato un xrun recente; controllare carico CPU e aumentare la latenza RX se necessario."}
-        elif node.get("role")=="tx" and tx_has_transport_problem:
-            diagnosis={"severity":"warning","code":"TX_RTP_DISCONTINUITY",
-                       "summary":"Discontinuità già osservata sul TX",
-                       "detail":"Il problema nasce prima della rete RX o nel sender/bus TX. Controllare CPU, player e roc-send."}
-        elif node.get("role")=="rx" and tx_has_transport_problem:
-            diagnosis={"severity":"warning","code":"UPSTREAM_TX_DISCONTINUITY",
-                       "summary":"Il TX mostra già discontinuità RTP",
-                       "detail":"Il difetto visto sull'RX è compatibile con una sorgente o trasmissione TX irregolare."}
+        elif node.get("role")=="tx" and tx_has_confirmed_transport_problem:
+            diagnosis={"severity":"warning","code":"TX_RTP_DISCONTINUITY_CONFIRMED",
+                       "summary":"Discontinuità TX confermata dagli RX",
+                       "detail":"La stessa anomalia RTP è stata osservata temporalmente su più ricevitori: controllare bus TX, player, roc-send e carico CPU."}
+        elif node.get("role")=="tx" and tx_has_unconfirmed_observation:
+            diagnosis={"severity":"info","code":"TX_MONITOR_STALL_UNCONFIRMED",
+                       "summary":"Pausa osservata sul monitor TX, non confermata dagli RX",
+                       "detail":"Gli RX non mostrano la stessa anomalia. Può trattarsi di scheduling della cattura locale e non di una reale interruzione del flusso."}
+        elif node.get("role")=="rx" and tx_has_confirmed_transport_problem:
+            diagnosis={"severity":"warning","code":"UPSTREAM_TX_DISCONTINUITY_CONFIRMED",
+                       "summary":"Discontinuità TX confermata su più RX",
+                       "detail":"L'anomalia è coerente tra TX e ricevitori ed è quindi probabilmente a monte della rete RX."}
         elif node.get("role")=="rx" and integrity.get("missing_packets",0)>0:
             diagnosis={"severity":"warning","code":"NETWORK_SEQUENCE_GAPS",
                        "summary":"Pacchetti RTP mancanti o arrivati troppo tardi sull'RX",
