@@ -75,6 +75,16 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(rows[0]['severity'],'warning')
         self.assertEqual(rows[0]['summary'],'Segnale diverso')
 
+    def test_probe_timing_and_cost_are_information_only(self):
+        node=self.node(None)
+        node['waveform_diagnostics']={'status':'matched','confirmed':False,
+            'timing_observation':'capture_delay_change','timing_message':'Stima temporale variata',
+            'workload':{'over_budget':True,'analysis_cpu_ms':250}}
+        self.history.observe([node],100)
+        rows=self.history.query()['events']
+        self.assertEqual({r['source'] for r in rows},{'probe_timing','probe_runtime'})
+        self.assertTrue(all(r['severity']=='info' for r in rows))
+
     def test_offline_does_not_close_error_as_recovered(self):
         node=self.node()
         self.history.observe([node],100)

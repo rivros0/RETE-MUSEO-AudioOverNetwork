@@ -143,7 +143,8 @@ class OptionalRuntimeTests(unittest.TestCase):
              self.patch.object(monitor.threading,'Thread') as thread:
             capture.loop()
         module.Diagnostics.assert_called_once()
-        diagnostics.feed_capture.assert_called_once_with(bytes(32000))
+        diagnostics.feed_capture.assert_called_once()
+        self.assertEqual(diagnostics.feed_capture.call_args.args[0],bytes(32000))
         self.assertTrue(capture.analysis_stop.is_set())
         thread.return_value.join.assert_called_once_with(timeout=5)
         self.assertIsNone(monitor.DIAGNOSTICS)

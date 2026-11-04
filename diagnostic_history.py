@@ -59,7 +59,14 @@ class History:
                            'warning' if waveform.get('confirmed') else 'info',
                            (('' if waveform.get('confirmed') else 'Osservazione da confermare: ')+str(waveform.get('message','')))[:600],
                            {k:waveform[k] for k in ('confirmed','estimated_delay_ms','delay_change_ms','channels','rtp',
-                                                   'reference_coverage','confidence') if k in waveform}))
+                                                   'reference_coverage','confidence','channel_mapping','channel_map','capture_timing','workload') if k in waveform}))
+        if waveform.get('timing_observation'):
+            issues.append((name,'probe_timing',str(waveform['timing_observation'])[:100],'info',
+                           str(waveform.get('timing_message','Variazione della misura temporale'))[:600],
+                           {k:waveform[k] for k in ('estimated_delay_ms','delay_change_ms','capture_timing','workload') if k in waveform}))
+        if waveform.get('workload',{}).get('over_budget'):
+            issues.append((name,'probe_runtime','ANALYSIS_COST','info','Costo elevato del worker di analisi spia',
+                           waveform['workload']))
         analog=node.get('analog_return') or {}
         if analog.get('status') in ('missing_return','capture_clipping','audio_while_muted','unexpected_audio'):
             # A recent aligned comparison takes precedence over a stale level meter.

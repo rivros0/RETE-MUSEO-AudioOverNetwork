@@ -50,7 +50,24 @@ class WaveformTests(unittest.TestCase):
 
     def test_swapped_channels(self):
         result=d.compare(self.ref,self.heard[:, ::-1])
-        self.assertEqual(result['status'],'possible_channel_swap',result)
+        self.assertEqual(result['status'],'matched',result)
+        self.assertEqual(result['channel_map'],[1,0])
+        self.assertGreater(min(c['correlation'] for c in result['channels']),.95)
+
+    def test_swapped_return_still_detects_real_dropout(self):
+        heard=self.heard[:,::-1].copy()
+        heard[6400:8000]=0
+        result=d.compare(self.ref,heard)
+        self.assertEqual(result['channel_map'],[1,0])
+        self.assertEqual(result['status'],'dropout',result)
+        self.assertTrue(result['channels'][0]['dropouts'])
+
+    def test_swapped_mapping_survives_silent_channel(self):
+        heard=self.heard[:,::-1].copy()
+        heard[:,1]=0
+        result=d.compare(self.ref,heard,channel_map=[1,0])
+        self.assertEqual(result['channel_map'],[1,0])
+        self.assertEqual(result['status'],'missing_channel',result)
 
     def test_single_missing_channel(self):
         self.heard[:, 1]=0
@@ -145,8 +162,59 @@ class StreamTests(unittest.TestCase):
             diag.analyze(10.25)
             self.assertEqual(diag.snapshot()['status'],'missing_return',diag.snapshot())
             self.assertFalse(diag.snapshot()['confirmed'])
-            diag.analyze(10.5)
+            diag.feed_capture(bytes(32000),now=10.75)
+            diag.analyze(10.75)
             self.assertTrue(diag.snapshot()['confirmed'])
+
+    def test_capture_delivery_jitter_does_not_shift_sample_clock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diag=self.synthetic_stream(directory)
+            raw=(diag.capture[-1][1]*32768).astype('<i2').tobytes()
+            diag.capture.clear();diag.capture_origin=None;diag.capture_frames=0
+            diag.feed_capture(raw[:32000],9.75)
+            diag.feed_capture(raw[32000:],10.30)
+            self.assertAlmostEqual(diag.capture[-1][2],10.25)
+            diag.analyze(10.30)
+            result=diag.snapshot()
+            self.assertEqual(result['status'],'matched',result)
+            self.assertAlmostEqual(result['estimated_delay_ms'],1250,delta=1)
+            self.assertEqual(result['timing_observation'],'capture_delivery_jitter')
+            self.assertEqual(result['capture_timing']['delivery_offset_ms'],50)
+            self.assertFalse(result['confirmed'])
+            self.assertIsNone(diag.pending)
+
+    def test_delay_jump_is_information_not_audio_fault(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diag=self.synthetic_stream(directory)
+            diag.previous_delay=1200;diag.previous_delay_time=9.25
+            diag.analyze(10.25)
+            result=diag.snapshot()
+            self.assertEqual(result['status'],'matched',result)
+            self.assertEqual(result['timing_observation'],'capture_delay_change')
+            self.assertFalse(result['confirmed'])
+            self.assertIsNone(diag.pending)
+
+    def test_same_capture_is_not_confirmed_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diag=self.synthetic_stream(directory)
+            diag.capture[-1][1][:]=0
+            diag.analyze(10.25)
+            diag.analyze(10.5)
+            self.assertFalse(diag.snapshot()['confirmed'])
+            diag.context['roc_warning']='Nuovo contesto senza nuovi campioni'
+            diag.analyze(10.6)
+            self.assertFalse(diag.snapshot()['confirmed'])
+
+    def test_worker_reports_its_cpu_cost_and_stops(self):
+        diag=d.Diagnostics()
+        stop=d.threading.Event()
+        def analyze(): stop.set()
+        with patch.object(diag,'analyze',side_effect=analyze):
+            diag.loop(stop)
+        workload=diag.snapshot()['workload']
+        self.assertIn('analysis_cpu_ms',workload)
+        self.assertIn('analysis_core_percent',workload)
+        self.assertIn('scope',workload)
 
     def test_post_window_saved_even_after_disconnection(self):
         with tempfile.TemporaryDirectory() as directory:

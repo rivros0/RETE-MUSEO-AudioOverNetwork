@@ -847,3 +847,53 @@ tuner e aggiunta del controllo RTCP; cambiare un parametro per volta. FEC è
 utile in presenza di perdita di pacchetti e non risolve da sola un problema
 di clock o scheduling. Riferimento opzioni:
 https://roc-streaming.org/toolkit/docs/manuals/roc_recv.html
+
+## RX-spia: compensazione canali e qualità della misura · v4.31
+
+La spia seleziona la corrispondenza stereo diretta o incrociata confrontando le
+quattro coppie di canali. Una mappa incrociata coerente viene applicata prima
+delle verifiche di contenuto, dropout e canale assente. La mappa rimane stabile
+quando i canali sono simili o uno diventa silenzioso; si azzera al cambio stream.
+`channel_mapping: swapped` è una configurazione compensata, non un guasto e non
+genera evidenze WAV da sola. La dashboard mostra la mappa utilizzata.
+
+Il riferimento temporale ADC usa il conteggio dei campioni a partire dalla prima
+lettura, anziché riassegnare l'ora di consegna del processo ad ogni blocco.
+`capture_timing` riporta lo scarto tra consegna effettiva e questa timeline e
+l'errore di cadenza delle letture. La lettura viene marcata prima dell'import DSP
+iniziale. L'acquisizione richiede periodi ALSA di 20 ms e buffer di 100 ms;
+questi parametri riguardano solo la cattura spia.
+
+Il ritardo RTP → ADC resta una stima comprensiva del buffering iniziale e della
+deriva dei clock: non è una misura certificata della sola riproduzione Roc.
+Per stimarlo occorre correlazione almeno 0,85. Una variazione oltre 20 ms o uno
+scarto di consegna ADC oltre 20 ms produce un'**informazione temporale** separata,
+non un `delay_jump` confermato come difetto audio. Il TX conserva queste
+osservazioni nello storico con origine `probe_timing`; non generano da sole
+allarmi RX o registrazioni WAV. I veri dropout continuano a essere riconosciuti
+dal confronto del contenuto allineato, anche con canali invertiti.
+
+L'analisi esegue un ciclo al secondo, su 1,25 s di ritorno (250 ms sovrapposti)
+e gli ultimi 4 s di riferimento DSP. Rimane il buffer di circa 8 s per le
+evidenze. Due conferme devono usare nuovi campioni; lo stesso blocco non può
+confermare un guasto due volte. Cambiamenti di mute vengono comunque elaborati.
+Le conferme persistenti richiedono quindi normalmente due cicli distinti.
+
+`workload` espone tempo trascorso, tempo CPU del thread, percentuale di un core,
+periodo effettivo e orario della misura. Le metriche comprendono il solo worker
+di analisi, non cattura, processi figli o meter RTP. Oltre 250 ms trascorsi o
+200 ms CPU per ciclo viene registrata l'informazione `probe_runtime/ANALYSIS_COST`.
+Il dato non significa automaticamente che il Raspberry sia saturo o che il
+segnale audio abbia subito un guasto. I costi sono consultabili nella diagnostica
+RX e nei metadati delle evidenze, con l'orario dell'ultima misura completata.
+
+Nel benchmark sintetico locale di confronto, il costo CPU medio è passato da
+circa 20,8 ms per confronto a 8,7 ms, oltre al dimezzamento della frequenza dei
+cicli. Questi numeri non sostituiscono la misura sul Raspberry: usare le metriche
+reali dopo l'aggiornamento per verificare carico e limite termico.
+
+Aggiornare TX e RX-spia per avere sia la nuova analisi sia la visualizzazione
+completa. I ricevitori senza scheda opzionale mantengono l'avvio leggero della
+v4.27: nessun worker DSP, buffer PCM o import NumPy. Non viene cambiata la latenza
+Roc comune impostata dalla v4.30. Non c'è ancora compensazione adattiva del
+sample rate ADC: rimane un possibile limite in presenza di deriva elevata.
