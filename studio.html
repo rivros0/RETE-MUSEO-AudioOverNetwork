@@ -114,6 +114,23 @@
 <h3>Stato sistema</h3>
 <p class="hint">Stato TX/RX, rete, servizi, autodiagnosi e manutenzione.</p>
 </div>
+<details id="debugPanel" class="box" style="margin-top:18px">
+<summary>Debug avanzato · log ed evidenze audio</summary>
+<p>Consultazione su richiesta, senza SSH. Nessuna modifica alla riproduzione. Richiede TX e RX aggiornati alla versione 4.29 o successiva.</p>
+<label>Nodo <select id="debugNode" aria-label="Nodo debug"></select></label>
+<button type="button" id="debugDiscover">Rileva nodi</button>
+<label>Servizio <select id="debugUnit"><option value="roc-museum">Roc / audio</option><option value="roc-museum-monitor">Monitor e cattura diagnostica</option></select></label>
+<label>Intervallo <select id="debugWindow"><option value="15m">Ultimi 15 minuti</option><option value="1h">Ultima ora</option><option value="24h">Ultime 24 ore</option></select></label>
+<button type="button" id="debugJournal">Leggi log</button>
+<button type="button" id="debugEvents">Elenca evidenze salvate</button>
+<p id="debugMessage" role="status" aria-live="polite"></p>
+<p>Il journal mostra tutte le righe disponibili nell’intervallo scelto, fino a 5000 righe / 512 KiB; un taglio viene segnalato. Non viene aggiornato automaticamente.</p>
+<pre id="debugLog" style="max-height:420px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<div id="debugEvidence"></div>
+<p>I WAV possono contenere audio ambientale o annunci. Premi Ascolta per caricarli. I due file hanno tempi di partenza indipendenti: confrontarli usando gli offset dell’analisi. “Confermato” è l’esito del rilevatore, non una diagnosi della causa.</p>
+<div id="debugFiles"></div>
+</details>
+
 <h3>Explorer USB</h3><button id="scanUSB">Rileva pennette</button><label>Dispositivo <select id="usbDevice"></select></label><button id="openUSB">Apri</button><button id="ejectUSB">Espelli</button>
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
@@ -200,6 +217,7 @@ async function refreshAudioMonitor(){
 /* La dashboard tecnica completa vive in Sistema durante la sessione di regia.
    Al logout viene riportata nella sua posizione pubblica originale. */
 function placeDashboard(){
+  if(!authorized&&document.getElementById("debugPanel")){clearDebug();el("debugNode").replaceChildren();el("debugPanel").open=false;}
   var systemHost=el('systemDashboardHost');
   var publicHome=document.getElementById('publicDashboardHome');
   var summary=document.getElementById('summary');
@@ -226,7 +244,7 @@ async function api(path,data){
   var options={cache:'no-store'};
   if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
   var r=await fetch(path,options),d=await r.json();
-  if(!r.ok){if(r.status===401){authorized=false;el('studioTools').hidden=true;await session();}throw new Error(d.message||'Operazione fallita');}
+  if(!r.ok){if(r.status===401){clearDebug();authorized=false;el('studioTools').hidden=true;await session();}throw new Error(d.message||'Operazione fallita');}
   return d;
 }
 async function perform(action){try{await action();}catch(error){message(error.message);}}
@@ -461,5 +479,23 @@ window.addEventListener('DOMContentLoaded',function(){
   setInterval(refreshAudioMonitor,2000);
   setInterval(renderTimeline,250);
 });
+var debugBusy=false,debugGeneration=0;
+function clearDebugFiles(){
+  el('debugFiles').querySelectorAll('audio').forEach(function(audio){audio.pause();audio.removeAttribute('src');audio.load();});
+  el('debugFiles').replaceChildren();
+}
+function clearDebug(){debugGeneration++;el('debugLog').textContent='';el('debugEvidence').replaceChildren();clearDebugFiles();el('debugMessage').textContent='';}
+function debugURL(action,extra){var q=new URLSearchParams(Object.assign({node:el('debugNode').value,action:action},extra||{}));return '/api/diagnostics/debug?'+q.toString();}
+async function debugRead(action,extra){var r=await fetch(debugURL(action,extra),{cache:'no-store'});var d=await r.json();if(!r.ok)throw new Error(d.message||'Diagnostica non disponibile');return d;}
+async function debugRun(task){if(debugBusy||!authorized)return;debugBusy=true;var generation=debugGeneration;el('debugMessage').textContent='Lettura in corso…';try{await task(generation);}catch(error){if(generation===debugGeneration)el('debugMessage').textContent=error.message;}finally{debugBusy=false;}}
+async function debugDiscover(){await debugRun(async function(g){var d=await api('/api/status');if(g!==debugGeneration||!authorized)return;var old=el('debugNode').value;el('debugNode').replaceChildren();d.nodes.forEach(function(n){option(el('debugNode'),n.name,n.name+(n.online?'':' · offline'));});if(d.nodes.some(function(n){return n.name===old;}))el('debugNode').value=old;el('debugMessage').textContent=d.nodes.length?'Seleziona un nodo e una lettura.':'Nessun nodo disponibile.';});}
+el('debugPanel').addEventListener('toggle',function(){if(this.open&&authorized&&!el('debugNode').options.length)debugDiscover();});
+el('logout').addEventListener('click',clearDebug);
+el('debugDiscover').onclick=debugDiscover;
+el('debugNode').onchange=clearDebug;
+el('debugJournal').onclick=function(){debugRun(async function(g){var d=await debugRead('journal',{unit:el('debugUnit').value,window:el('debugWindow').value});if(g!==debugGeneration||!authorized)return;el('debugLog').textContent=d.text||'Nessuna riga disponibile nel journal.';el('debugMessage').textContent=(d.truncated?'LOG TAGLIATO: raggiunto il limite di righe o byte. Riduci l’intervallo. ':'')+'Lettura '+historyTime(d.generated_at);});};
+el('debugEvents').onclick=function(){debugRun(async function(g){var d=await debugRead('events');if(g!==debugGeneration||!authorized)return;el('debugEvidence').replaceChildren();clearDebugFiles();d.events.forEach(function(e){var row=document.createElement('p');row.textContent=historyTime(e.triggered_at||e.saved_at)+' · '+e.status+' ';row.appendChild(button('Apri '+e.id,function(){debugOpenEvent(e.id);}));el('debugEvidence').appendChild(row);});el('debugMessage').textContent=d.events.length+' evidenze disponibili sul nodo (massimo 20; le più vecchie vengono eliminate).';});};
+function debugOpenEvent(id){debugRun(async function(g){var d=await debugRead('file',{event:id,file:'event.json'});if(g!==debugGeneration||!authorized)return;var box=el('debugFiles');clearDebugFiles();var title=document.createElement('h4');title.textContent=id;box.appendChild(title);var pre=document.createElement('pre');pre.style.cssText='max-height:420px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere';pre.textContent=JSON.stringify(d,null,2);box.appendChild(pre);['event.json','reference.wav','return.wav'].forEach(function(file){var url=debugURL('file',{event:id,file:file}),row=document.createElement('p'),link=document.createElement('a');link.href=url;link.download=id+'-'+file;link.textContent='Scarica '+file;row.appendChild(link);if(file.endsWith('.wav')){var audio=document.createElement('audio');audio.controls=true;audio.preload='none';var play=button('Ascolta '+(file==='reference.wav'?'riferimento RTP':'ritorno analogico'),function(){audio.src=url;audio.play().catch(function(){el('debugMessage').textContent='Audio non disponibile: evidenza rimossa, nodo offline o sessione scaduta.';});});audio.onerror=function(){el('debugMessage').textContent='Impossibile leggere il WAV: verificare nodo e sessione.';};row.appendChild(play);row.appendChild(audio);}box.appendChild(row);});el('debugMessage').textContent='Evidenza caricata. Journal dell’evento e dettagli nel JSON.';});}
+
 })();
 </script>
