@@ -114,6 +114,17 @@
 <h3>Stato sistema</h3>
 <p class="hint">Stato TX/RX, rete, servizi, autodiagnosi e manutenzione.</p>
 </div>
+<details id="latencyPanel" class="box" style="margin-top:18px">
+<summary>Latenza comune degli RX</summary>
+<p>Un solo target per tutti i ricevitori. Il TX salva il valore e lo invia anche agli RX che tornano online.</p>
+<form id="fleetLatencyForm">
+<label>Target latenza (ms) <input id="fleetLatencyTarget" type="number" min="20" max="2000" step="1" required aria-label="Target latenza comune in millisecondi"></label>
+<button id="fleetLatencyApply" type="submit">Applica a tutti gli RX</button>
+</form>
+<p>Il cambio riavvia il servizio audio sui ricevitori interessati e causa una breve interruzione. Lo stesso target non garantisce uscite perfettamente sincronizzate.</p>
+<p id="fleetLatencyMessage" role="status" aria-live="polite"></p>
+<ul id="fleetLatencyNodes"></ul>
+</details>
 <details id="debugPanel" class="box" style="margin-top:18px">
 <summary>Debug avanzato · log ed evidenze audio</summary>
 <p>Consultazione su richiesta, senza SSH. Nessuna modifica alla riproduzione. Richiede TX e RX aggiornati alla versione 4.29 o successiva.</p>
@@ -199,7 +210,7 @@ async function refreshAudioMonitor(){
     var html='';
     (data.nodes||[]).forEach(function(node){
       var title=esc(node.name)+' · '+esc((node.role||'').toUpperCase());
-      html+='<article class="card"><div class="head"><strong>'+title+'</strong><span class="badge '+esc(node.state||'OK')+'">'+esc(node.state||'')+'</span></div>';
+      html+='<article class="card'+(isProbe(node)?' probeCard':'')+'">'+probeBadge(node)+'<div class="head"><strong>'+title+'</strong><span class="badge '+esc(node.state||'OK')+'">'+esc(node.state||'')+'</span></div>';
       html+=meterBlock(node);
       if(node.role==='rx'){
         html+=volumeBlock(node);
@@ -479,6 +490,42 @@ window.addEventListener('DOMContentLoaded',function(){
   setInterval(refreshAudioMonitor,2000);
   setInterval(renderTimeline,250);
 });
+
+var latencyPolling=false,latencySaving=false;
+async function refreshFleetLatency(){
+  if(!authorized||!el('latencyPanel').open||latencyPolling)return;
+  latencyPolling=true;
+  try{
+    var data=await api('/api/latency');
+    if(!authorized)return;
+    var field=el('fleetLatencyTarget');
+    if(!field.value&&data.desired)field.value=data.desired.target_ms;
+    var labels={confermato:'Confermato',offline:'Offline: applicazione al rientro',aggiornamento_richiesto:'Aggiornare RX alla 4.30',errore:'Errore',in_attesa:'In attesa di conferma',non_impostata:'Target comune non impostato'};
+    el('fleetLatencyNodes').replaceChildren();
+    data.nodes.forEach(function(n){
+      var li=document.createElement('li');
+      li.textContent=n.name+' · '+labels[n.state]+' · valore riportato: '+(n.current||'n/d')+(n.error?' · '+n.error:'');
+      el('fleetLatencyNodes').appendChild(li);
+    });
+    if(!latencySaving)el('fleetLatencyMessage').textContent=data.desired?'Target comune salvato: '+data.desired.target_ms+' ms. Conferma verificata dai heartbeat di ciascun RX.':'Nessun target comune salvato. Seleziona un valore per iniziare la prova.';
+  }catch(error){el('fleetLatencyMessage').textContent=error.message;}
+  finally{latencyPolling=false;}
+}
+el('latencyPanel').addEventListener('toggle',refreshFleetLatency);
+el('fleetLatencyForm').onsubmit=async function(event){
+  event.preventDefault();
+  if(latencySaving||!authorized||!event.target.reportValidity())return;
+  var target=Number(el('fleetLatencyTarget').value);
+  if(!confirm('Applicare '+target+' ms a tutti gli RX? Il cambio causa una breve interruzione audio sui ricevitori.'))return;
+  latencySaving=true;el('fleetLatencyApply').disabled=true;
+  try{
+    await api('/api/latency',{target_ms:target});
+    el('fleetLatencyMessage').textContent='Target salvato: '+target+' ms. Applicazione agli RX in corso…';
+  }catch(error){el('fleetLatencyMessage').textContent=error.message;}
+  finally{latencySaving=false;el('fleetLatencyApply').disabled=false;}
+};
+setInterval(refreshFleetLatency,5000);
+
 var debugBusy=false,debugGeneration=0;
 function clearDebugFiles(){
   el('debugFiles').querySelectorAll('audio').forEach(function(audio){audio.pause();audio.removeAttribute('src');audio.load();});
