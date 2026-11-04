@@ -811,3 +811,39 @@ timeout evitano letture illimitate.
 consente di recuperare i file dai vecchi RX. Non serve fornire accesso SSH
 all’assistente per le successive consultazioni. Il normale aggiornamento
 iniziale dei dispositivi mantiene il proprio meccanismo di installazione.
+
+### Latenza comune RX e identificazione spie · v4.30
+
+In **Amministrazione → Sistema → Latenza comune degli RX** il TX espone un
+solo target (20–2000 ms), salvato in `/var/lib/roc-museum/fleet-latency.json`.
+La lettura richiede login e la modifica richiede anche CSRF. Il TX invia il
+valore ai ricevitori aggiornati e ne verifica valore e revisione nei heartbeat;
+i nodi offline ricevono il target al rientro. Gli RX precedenti alla 4.30 sono
+indicati come da aggiornare. Non viene applicato automaticamente alcun nuovo
+valore finché l’amministratore non lo salva.
+
+Ogni RX salva la configurazione e riavvia `roc-museum.service` se il valore
+cambia: questo provoca una breve interruzione audio. Un comando duplicato o
+un nuovo salvataggio dello stesso target non riavvia l’audio. Se il riavvio
+fallisce viene ripristinato il file precedente e tentato il recupero del servizio;
+il pannello mostra l’errore. Il TX ritenta al massimo ogni 30 secondi per nodo.
+Un target comune non garantisce sincronizzazione perfetta fra uscite analogiche.
+
+Le card dei nodi con una Scarlett/Focusrite rilevata per la cattura diventano
+viola e mostrano **SPIA · scheda audio esterna**, con stato dell’acquisizione.
+L’indicazione appare anche nel monitor audio del Player. Il nodo spia può
+misurare un altro ricevitore: il collegamento analogico non viene dedotto
+automaticamente. Per esempio, se RX-93 acquisisce RX-92, i dropout misurati
+riguardano uscita RX-92 più percorso di cattura RX-93.
+
+Per una prova comparabile mantenere la stessa sorgente e lo stesso cablaggio,
+annotare l’orario di cambio target, escludere il riavvio iniziale e confrontare
+finestre di pari durata. Una sequenza proposta è 100 → 200 → 300 ms, verificando
+su tutti gli RX il numero di `latency out of bounds` / ricreazioni di sessione
+e sulla spia frequenza e durata dei dropout. L’aumento è un esperimento, non
+una correzione certa. Valutare separatamente raffreddamento, carico di analisi
+sulla spia, regolarità della sorgente TX, buffering ALSA, profilo del latency
+tuner e aggiunta del controllo RTCP; cambiare un parametro per volta. FEC è
+utile in presenza di perdita di pacchetti e non risolve da sola un problema
+di clock o scheduling. Riferimento opzioni:
+https://roc-streaming.org/toolkit/docs/manuals/roc_recv.html
