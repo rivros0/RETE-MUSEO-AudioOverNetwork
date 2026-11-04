@@ -256,7 +256,7 @@ class Diagnostics:
     def snapshot(self):
         with self.lock:
             result = dict(self.result)
-            result.update(rtp=dict(self.stats), events=list(self.events), storage_error=self.storage_error)
+            result.update(rtp=dict(self.stats), events=list(self.events)[-1:], storage_error=self.storage_error)
         return result
 
     def buffers(self, now):
@@ -460,11 +460,12 @@ class Diagnostics:
             with self.lock:
                 self.storage_error = str(error)
 
-    def loop(self):
-        while True:
+    def loop(self, stop_event=None):
+        stop_event = stop_event or threading.Event()
+        while not stop_event.is_set():
             try:
                 self.analyze()
             except Exception as error:
                 with self.lock:
                     self.result = {'status': 'error', 'message': 'Diagnostica: '+str(error)}
-            time.sleep(.5)
+            stop_event.wait(.5)

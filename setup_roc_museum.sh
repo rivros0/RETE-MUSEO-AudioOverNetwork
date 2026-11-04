@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.26
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.27
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.26"
+VERSION="4.27"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.26"
+MONITOR_BUILD="4.27"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -422,11 +422,10 @@ STUDIO=None
 REGISTRY_LOCK=threading.Lock()
 # Installed alongside TX helpers; keep the standalone installer self-contained.
 sys.path.insert(0,"/usr/local/lib/roc-museum")
-try:
-    from rx_diagnostics import Diagnostics
-except ImportError:
-    Diagnostics=None
 DIAGNOSTICS=None
+ANALOG_RETURN=None
+ANALOG_PRESENT=False
+ANALOG_LAST_ATTEMPT=-1e9
 
 # Ultimo campione dei contatori Ethernet per calcolare incrementi recenti.
 NETWORK_COUNTER_SAMPLES={}
@@ -699,10 +698,17 @@ METER=AudioMeter()
 
 class AnalogReturn:
     """Optional Scarlett line return; independent of Roc playback device."""
-    def __init__(self):
+    def __init__(self, device=None):
         self.lock=threading.Lock()
+        self.stop_event=threading.Event()
+        self.analysis_stop=threading.Event()
+        self.analysis_thread=None
+        self.thread=None
+        self.process=None
+        self.diagnostics=None
+        self.analysis_error=""
         self.updated=0
-        self.device=None
+        self.device=device
         self.channels=[]
         self.error="Scarlett non rilevata: ritorno analogico opzionale"
 
@@ -714,7 +720,7 @@ class AnalogReturn:
             rms=math.sqrt(sum(v*v for v in values)/len(values))
             channels.append({"rms_dbfs":round(20*math.log10(max(rms,0.52)/32768),1),
                              "clipped":any(abs(v)>=32760 for v in values)})
-        if DIAGNOSTICS is not None: DIAGNOSTICS.feed_capture(raw)
+        if self.diagnostics is not None and not self.stop_event.is_set(): self.diagnostics.feed_capture(raw)
         with self.lock:
             self.channels=channels;self.updated=time.monotonic();self.error=""
 
@@ -745,45 +751,114 @@ class AnalogReturn:
         result.update(status=status,message=message)
         return result
 
-    def loop(self):
-        while True:
-            process=None
-            try:
-                listing=subprocess.run(["arecord","-l"],capture_output=True,text=True,check=True,timeout=4,
-                                       env={**os.environ,"LC_ALL":"C"}).stdout
-                devices=[]
-                for line in listing.splitlines():
-                    if re.search(r"scarlett|focusrite",line,re.I):
-                        match=re.search(r"card \d+:\s*([^\s\[]+).*device (\d+):",line)
-                        if match: devices.append("plughw:CARD=%s,DEV=%s"%match.groups())
-                devices=list(dict.fromkeys(devices))
-                if len(devices)!=1:
-                    raise OSError("Scarlett non rilevata" if not devices else "Più ingressi Scarlett: selezione automatica ambigua")
-                with self.lock: self.device=devices[0]
-                # stderr goes to the journal; a timer bounds blocked reads/disconnects.
-                process=subprocess.Popen(["arecord","-q","-D",devices[0],"-t","raw","-f","S16_LE",
-                                          "-r","16000","-c","2"],stdout=subprocess.PIPE,bufsize=0)
-                import select
-                buffer=b""
-                while True:
-                    ready,_,_=select.select([process.stdout],[],[],3)
-                    if not ready: raise OSError("Timeout acquisizione Scarlett")
-                    raw=os.read(process.stdout.fileno(),32000-len(buffer))
-                    if not raw: raise OSError("Acquisizione Scarlett terminata: controllare connessione o dispositivo occupato")
-                    buffer+=raw
-                    if len(buffer)==32000: self.feed(buffer);buffer=b""
-            except (OSError,subprocess.SubprocessError) as error:
-                with self.lock:
-                    self.error=str(error);self.updated=0;self.channels=[];self.device=None
-            finally:
-                if process is not None:
-                    if process.poll() is None: process.terminate()
-                    try: process.wait(timeout=2)
-                    except subprocess.TimeoutExpired: process.kill();process.wait()
-                    process.stdout.close()
-            time.sleep(5)
+    def enable_analysis(self):
+        global DIAGNOSTICS
+        if self.stop_event.is_set(): return
+        try:
+            # Load NumPy only after the selected ADC has delivered PCM.
+            from rx_diagnostics import Diagnostics, np
+            if np is None: raise ImportError("NumPy non disponibile")
+            diagnostics=Diagnostics()
+            with self.lock:
+                if self.stop_event.is_set(): return
+                self.diagnostics=diagnostics
+                DIAGNOSTICS=diagnostics
+                self.analysis_thread=threading.Thread(target=diagnostics.loop,args=(self.analysis_stop,),daemon=True)
+                self.analysis_thread.start()
+        except ImportError as error:
+            self.analysis_error="Analisi forme d’onda non disponibile: "+str(error)
 
-ANALOG_RETURN=AnalogReturn()
+    def stop(self):
+        global DIAGNOSTICS
+        with self.lock:
+            self.stop_event.set();self.analysis_stop.set()
+            if DIAGNOSTICS is self.diagnostics: DIAGNOSTICS=None
+            process=self.process
+        if process is not None and process.poll() is None:
+            try: process.terminate()
+            except OSError: pass
+
+    def loop(self):
+        global DIAGNOSTICS
+        process=None
+        try:
+            if not self.device or self.stop_event.is_set(): return
+            process=subprocess.Popen(["arecord","-q","-D",self.device,"-t","raw","-f","S16_LE",
+                                      "-r","16000","-c","2"],stdout=subprocess.PIPE,bufsize=0)
+            with self.lock: self.process=process
+            if self.stop_event.is_set(): return
+            import select
+            buffer=b"";analysis_started=False
+            while not self.stop_event.is_set():
+                ready,_,_=select.select([process.stdout],[],[],3)
+                if not ready: raise OSError("Timeout acquisizione Scarlett")
+                raw=os.read(process.stdout.fileno(),32000-len(buffer))
+                if not raw: raise OSError("Acquisizione Scarlett interrotta o dispositivo occupato")
+                buffer+=raw
+                if len(buffer)==32000:
+                    if not analysis_started:
+                        self.enable_analysis();analysis_started=True
+                    self.feed(buffer);buffer=b""
+        except (OSError,subprocess.SubprocessError) as error:
+            with self.lock:
+                self.error=str(error);self.updated=0;self.channels=[]
+        finally:
+            self.stop()
+            if process is not None:
+                try: process.wait(timeout=2)
+                except subprocess.TimeoutExpired: process.kill();process.wait()
+                process.stdout.close()
+            if self.analysis_thread is not None: self.analysis_thread.join(timeout=5)
+            with self.lock:
+                self.process=None;self.diagnostics=None
+                self.channels=[];self.updated=0
+
+
+def refresh_analog_return(config):
+    """Reuse the existing heartbeat for hotplug discovery; no idle worker."""
+    global ANALOG_RETURN, ANALOG_PRESENT, ANALOG_LAST_ATTEMPT
+    if config.get("ROLE")!="rx": return
+    # Reading procfs is cheap; no ALSA process, import or PCM buffer when absent.
+    ANALOG_PRESENT=bool(re.search("scarlett|focusrite",read_text("/proc/asound/cards"),re.I))
+    capture=ANALOG_RETURN
+    if not ANALOG_PRESENT:
+        if capture is not None:
+            capture.stop()
+            if capture.thread is None or not capture.thread.is_alive(): ANALOG_RETURN=None
+        ANALOG_LAST_ATTEMPT=-1e9
+        return
+    if capture is not None and capture.thread is not None and capture.thread.is_alive(): return
+    now=time.monotonic()
+    if now-ANALOG_LAST_ATTEMPT<30: return
+    ANALOG_LAST_ATTEMPT=now
+    try:
+        listing=subprocess.run(["arecord","-l"],capture_output=True,text=True,check=True,timeout=1,
+                               env={**os.environ,"LC_ALL":"C"}).stdout
+        devices=[]
+        for line in listing.splitlines():
+            if re.search("scarlett|focusrite",line,re.I):
+                match=re.search(r"card \d+:\s*([^\s\[]+).*device (\d+):",line)
+                if match: devices.append("plughw:CARD=%s,DEV=%s"%match.groups())
+        devices=list(dict.fromkeys(devices))
+        if len(devices)!=1: return
+        capture=AnalogReturn(devices[0]);ANALOG_RETURN=capture
+        capture.thread=threading.Thread(target=capture.loop,daemon=True)
+        capture.thread.start()
+    except (OSError,subprocess.SubprocessError):
+        pass
+
+
+def analog_snapshot_fields(meter, muted, roc_error="", roc_warning=""):
+    capture=ANALOG_RETURN
+    if not ANALOG_PRESENT or capture is None: return {}
+    fields={"analog_return":capture.snapshot(meter,muted)}
+    diagnostics=DIAGNOSTICS
+    if diagnostics is not None:
+        diagnostics.update_context(muted,meter,roc_error,roc_warning)
+        fields["waveform_diagnostics"]=diagnostics.snapshot()
+    elif capture.analysis_error:
+        fields["waveform_diagnostics"]={"status":"unavailable","message":capture.analysis_error}
+    return fields
 
 def meter_loop(config):
     group=socket.inet_aton(config.get("MULTICAST_ADDR","239.30.0.1"))
@@ -804,7 +879,8 @@ def meter_loop(config):
                     if length<8 or ihl+length>len(packet): continue
                     audio_packet=packet[ihl+8:ihl+length]
                     METER.feed(audio_packet)
-                    if DIAGNOSTICS is not None: DIAGNOSTICS.feed_rtp(audio_packet)
+                    diagnostics=DIAGNOSTICS
+                    if diagnostics is not None: diagnostics.feed_rtp(audio_packet)
         except OSError as exc:
             with METER.lock: METER.error="Meter non disponibile: "+str(exc)
             time.sleep(5)
@@ -1114,12 +1190,7 @@ def build_snapshot(config):
     if role=="rx" and MUTED: snapshot["volume_percent"]=RESUME_VOLUME
     snapshot["audio_meter"]=meter
     if role=="rx":
-        snapshot["analog_return"]=ANALOG_RETURN.snapshot(meter,MUTED)
-        if DIAGNOSTICS is not None:
-            DIAGNOSTICS.update_context(MUTED,meter,snapshot["roc_last_error"],snapshot["roc_last_warning"])
-            snapshot["waveform_diagnostics"]=DIAGNOSTICS.snapshot()
-        else:
-            snapshot["waveform_diagnostics"]={"status":"unavailable","message":"Modulo diagnostico non installato: rieseguire il setup aggiornato"}
+        snapshot.update(analog_snapshot_fields(meter,MUTED,snapshot["roc_last_error"],snapshot["roc_last_warning"]))
     return snapshot
 
 def heartbeat_loop(config):
@@ -1128,6 +1199,7 @@ def heartbeat_loop(config):
     port=int(config.get("MONITOR_PORT","19090"))
     sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
     while True:
+        refresh_analog_return(config)
         snapshot=build_snapshot(config)
         if role=="tx":
             snapshot["received_at"]=time.time()
@@ -1745,7 +1817,7 @@ class Handler(BaseHTTPRequestHandler):
             UPLOAD_LOCK.release()
 
 def main():
-    global STUDIO, DIAGNOSTICS
+    global STUDIO
     if sys.argv[1:]==["--set-password"]:
         set_password();return
     config=read_config();role=config.get("ROLE","")
@@ -1754,10 +1826,6 @@ def main():
         return
     if role=="rx":
         restore_saved_volume()
-        if Diagnostics is not None:
-            DIAGNOSTICS=Diagnostics()
-            threading.Thread(target=DIAGNOSTICS.loop,daemon=True).start()
-        threading.Thread(target=ANALOG_RETURN.loop,daemon=True).start()
     threading.Thread(target=meter_loop,args=(config,),daemon=True).start()
     heartbeat=threading.Thread(target=heartbeat_loop,args=(config,),daemon=True);heartbeat.start()
     if role=="tx":
@@ -2041,7 +2109,7 @@ class Diagnostics:
     def snapshot(self):
         with self.lock:
             result = dict(self.result)
-            result.update(rtp=dict(self.stats), events=list(self.events), storage_error=self.storage_error)
+            result.update(rtp=dict(self.stats), events=list(self.events)[-1:], storage_error=self.storage_error)
         return result
 
     def buffers(self, now):
@@ -2245,14 +2313,15 @@ class Diagnostics:
             with self.lock:
                 self.storage_error = str(error)
 
-    def loop(self):
-        while True:
+    def loop(self, stop_event=None):
+        stop_event = stop_event or threading.Event()
+        while not stop_event.is_set():
             try:
                 self.analyze()
             except Exception as error:
                 with self.lock:
                     self.result = {'status': 'error', 'message': 'Diagnostica: '+str(error)}
-            time.sleep(.5)
+            stop_event.wait(.5)
 PY_RX_DIAGNOSTICS
     chmod 0644 /usr/local/lib/roc-museum/rx_diagnostics.py
     cat > /usr/local/lib/roc-museum/studio.py <<'PY_STUDIO'

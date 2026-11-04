@@ -70,3 +70,103 @@ class IntegratedDiagnosisTests(unittest.TestCase):
         node['online']=False
         monitor.apply_audio_diagnosis([node])
         self.assertEqual(node['audio_diagnosis']['code'],'NODE_OFFLINE')
+
+class OptionalRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        self.patch=patch
+        self.state=patch.multiple(monitor,ANALOG_RETURN=None,ANALOG_PRESENT=False,
+                                  DIAGNOSTICS=None,ANALOG_LAST_ATTEMPT=-1e9)
+        self.state.start()
+        self.addCleanup(self.state.stop)
+
+    def test_absent_interface_starts_nothing_and_adds_no_payload(self):
+        with self.patch.object(monitor,'read_text',return_value='0 [Headphones]: bcm2835 Headphones'), \
+             self.patch.object(monitor.subprocess,'run') as run, \
+             self.patch.object(monitor.threading,'Thread') as thread:
+            monitor.refresh_analog_return({'ROLE':'rx'})
+            self.assertEqual(monitor.analog_snapshot_fields({'available':True},False),{})
+        run.assert_not_called();thread.assert_not_called()
+        self.assertIsNone(monitor.DIAGNOSTICS)
+        self.assertIsNone(monitor.ANALOG_RETURN)
+
+    def test_tx_does_not_probe_optional_interface(self):
+        with self.patch.object(monitor,'read_text') as read:
+            monitor.refresh_analog_return({'ROLE':'tx'})
+        read.assert_not_called()
+
+    def test_present_interface_starts_capture_only(self):
+        from unittest.mock import Mock
+        listing=Mock(stdout='card 2: USB [Scarlett 2i4 USB], device 0: USB Audio')
+        with self.patch.object(monitor,'read_text',return_value='2 [USB]: USB-Audio - Scarlett 2i4 USB'), \
+             self.patch.object(monitor.subprocess,'run',return_value=listing), \
+             self.patch.object(monitor.threading,'Thread') as thread:
+            monitor.refresh_analog_return({'ROLE':'rx'})
+        self.assertEqual(thread.call_count,1)
+        self.assertEqual(monitor.ANALOG_RETURN.device,'plughw:CARD=USB,DEV=0')
+        self.assertIsNone(monitor.DIAGNOSTICS)
+        self.assertIsNone(monitor.ANALOG_RETURN.diagnostics)
+
+    def test_disconnection_stops_capture_and_removes_payload(self):
+        from unittest.mock import Mock
+        capture=Mock();capture.thread.is_alive.return_value=False
+        monitor.ANALOG_RETURN=capture
+        with self.patch.object(monitor,'read_text',return_value=''), \
+             self.patch.object(monitor.subprocess,'run') as run:
+            monitor.refresh_analog_return({'ROLE':'rx'})
+        capture.stop.assert_called_once()
+        run.assert_not_called()
+        self.assertEqual(monitor.analog_snapshot_fields({},False),{})
+        self.assertIsNone(monitor.ANALOG_RETURN)
+
+    def test_busy_interface_does_not_start_analysis(self):
+        capture=monitor.AnalogReturn('plughw:CARD=USB,DEV=0')
+        with self.patch.object(monitor.subprocess,'Popen',side_effect=OSError('Device busy')), \
+             self.patch.object(capture,'enable_analysis') as enable:
+            capture.loop()
+        enable.assert_not_called()
+        self.assertTrue(capture.stop_event.is_set())
+        self.assertIsNone(monitor.DIAGNOSTICS)
+
+    def test_pcm_enables_analysis_and_capture_exit_stops_it(self):
+        import sys
+        import types
+        from unittest.mock import Mock
+        diagnostics=Mock()
+        module=types.SimpleNamespace(Diagnostics=Mock(return_value=diagnostics),np=object())
+        process=Mock();process.poll.return_value=None
+        capture=monitor.AnalogReturn('plughw:CARD=USB,DEV=0')
+        with self.patch.dict(sys.modules,{'rx_diagnostics':module}), \
+             self.patch.object(monitor.subprocess,'Popen',return_value=process), \
+             self.patch('select.select',return_value=([process.stdout],[],[])), \
+             self.patch.object(monitor.os,'read',side_effect=[bytes(32000),b'']), \
+             self.patch.object(monitor.threading,'Thread') as thread:
+            capture.loop()
+        module.Diagnostics.assert_called_once()
+        diagnostics.feed_capture.assert_called_once_with(bytes(32000))
+        self.assertTrue(capture.analysis_stop.is_set())
+        thread.return_value.join.assert_called_once_with(timeout=5)
+        self.assertIsNone(monitor.DIAGNOSTICS)
+        self.assertIsNone(capture.diagnostics)
+        self.assertIsNone(capture.process)
+
+    def test_capture_failure_retries_are_throttled(self):
+        with self.patch.object(monitor,'read_text',return_value='USB Scarlett'), \
+             self.patch.object(monitor.subprocess,'run',side_effect=OSError('busy')) as run, \
+             self.patch.object(monitor.time,'monotonic',side_effect=[10,15,41]):
+            for _ in range(3): monitor.refresh_analog_return({'ROLE':'rx'})
+        self.assertEqual(run.call_count,2)
+
+    def test_monitor_import_does_not_load_dsp_modules(self):
+        import subprocess
+        import sys
+        from pathlib import Path
+        installer=Path(__file__).resolve().parents[1]/'setup_roc_museum.sh'
+        script="""import sys
+from pathlib import Path
+source=Path(sys.argv[1]).read_text().split(\"<<'PY_MONITOR'\\n\",1)[1].split('\\nPY_MONITOR',1)[0]
+exec(compile(source,'monitor','exec'),{'__name__':'monitor'})
+assert 'numpy' not in sys.modules
+assert 'rx_diagnostics' not in sys.modules
+"""
+        subprocess.run([sys.executable,'-c',script,str(installer)],check=True,capture_output=True)

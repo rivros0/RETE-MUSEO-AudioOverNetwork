@@ -605,9 +605,18 @@ Calendario, ducking e ingresso annunci rimangono indipendenti dalla selezione.
 
 ## Ritorno analogico RX (diagnostica opzionale · v4.26)
 
-Il monitor RX rileva automaticamente un unico ingresso Focusrite/Scarlett tramite
-`arecord -l`, acquisisce stereo a 16 kHz e ritenta ogni 5 secondi in caso di
-assenza, disconnessione o errore. Non cambia il dispositivo di riproduzione Roc.
+Dalla v4.27 il monitor RX verifica la presenza Focusrite/Scarlett leggendo
+`/proc/asound/cards` nell'heartbeat già esistente. Senza scheda non avvia worker,
+processi `arecord`, buffer PCM o import di NumPy; omette anche `analog_return`
+e `waveform_diagnostics` dal payload. Il controllo non apre dispositivi ALSA.
+Quando rileva la scheda, verifica un unico ingresso con `arecord -l` e avvia
+l'acquisizione stereo a 16 kHz. Carica il modulo DSP e avvia l'analisi solo dopo
+il primo blocco PCM acquisito. Se il dispositivo è occupato o l'apertura fallisce,
+non avvia l'analisi e ritenta al massimo ogni 30 secondi finché la scheda è presente.
+Alla disconnessione interrompe acquisizione e analisi, rilascia i buffer e rimuove
+i campi opzionali dall'heartbeat; un successivo collegamento viene rilevato
+automaticamente. NumPy già caricato può restare nella cache degli import, senza
+worker o raccolta PCM attivi. Non cambia il dispositivo di riproduzione Roc.
 Collegare l'uscita analogica RX agli ingressi **line** della Scarlett, con livelli
 compatibili; disattivare direct monitoring e phantom power per questo cablaggio.
 La sola connessione USB non porta alla Scarlett il suono emesso dalla RX.
@@ -716,3 +725,13 @@ ambiguità periodica, gestione RTP, sospensione in mute ed esportazione/rotazion
 Eseguirli con `python3 -m unittest discover -s tests -q` dopo aver installato NumPy.
 Resta necessario il collaudo su Raspberry/Scarlett: verificare CPU, gain,
 stabilità su musica reale e risposta a interruzioni di rete e underrun controllati.
+
+
+### Avvio leggero e hotplug · v4.27
+
+La diagnostica digitale RTP della v4.25 resta attiva come prima. Solo il ritorno
+analogico opzionale segue il ciclo della scheda USB. Il TX non esegue la ricerca
+della scheda né carica il modulo DSP per questa funzione. Le dipendenze restano
+installate per consentire l'attivazione automatica al collegamento, senza
+installazioni o download a runtime. Quando l'analisi è attiva, l'heartbeat riporta
+solo l'ultima evidenza salvata anziché una cronologia di eventi duplicata.
