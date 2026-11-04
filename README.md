@@ -602,3 +602,117 @@ scaletta, senza riprenderla automaticamente al termine. Per ripartire serve
 tra browser; la scaletta attiva viene ripristinata insieme al player al riavvio.
 Nuovi file restano esclusi dopo il primo salvataggio esplicito delle checkbox.
 Calendario, ducking e ingresso annunci rimangono indipendenti dalla selezione.
+
+## Ritorno analogico RX (diagnostica opzionale · v4.26)
+
+Il monitor RX rileva automaticamente un unico ingresso Focusrite/Scarlett tramite
+`arecord -l`, acquisisce stereo a 16 kHz e ritenta ogni 5 secondi in caso di
+assenza, disconnessione o errore. Non cambia il dispositivo di riproduzione Roc.
+Collegare l'uscita analogica RX agli ingressi **line** della Scarlett, con livelli
+compatibili; disattivare direct monitoring e phantom power per questo cablaggio.
+La sola connessione USB non porta alla Scarlett il suono emesso dalla RX.
+Il punto di prelievo determina cosa si verifica: il ritorno elettrico non verifica
+il suono della cassa nell'ambiente (per quello serve un microfono).
+
+Gli heartbeat includono `analog_return` e la diagnostica del nodo mostra lo stato:
+`missing_return`, `capture_clipping`, `audio_while_muted`, `unexpected_audio`,
+`expected_silence`, `reference_unavailable`, `signal_present` o `unavailable`.
+I primi quattro generano ATTENZIONE; l'assenza dell'interfaccia opzionale no.
+Più dispositivi Scarlett producono uno stato non disponibile per evitare una
+selezione ambigua. Errori ALSA sono riportati anche nel journal del monitor.
+
+Il controllo `analog_return` confronta **presenza e livelli**; il nuovo confronto
+`waveform_diagnostics`, descritto sotto, analizza invece i campioni. Nel solo controllo dei livelli:
+`signal_present` non certifica che il contenuto sia corretto. Il riferimento è il
+meter RTP post-fader stimato (finestra 5 s); il ritorno usa finestre di 0,5 s,
+aggiornate nell'heartbeat ogni 5 s. Le transizioni possono dare avvisi temporanei.
+Le soglie iniziali sono -45 dBFS per il riferimento attivo e -55 dBFS per il
+ritorno udibile: gain analogico e cablaggio vanno collaudati sul posto.
+Da solo questo controllo dei livelli non rileva scambi di canale, distorsione,
+brevi dropout o latenza.
+Aggiornare TX e RX per visualizzare il nuovo campo. Nessun aggiornamento remoto
+è eseguito dalla modifica dei sorgenti.
+
+
+### Confronto digitale → uscita analogica RX · v4.26
+
+La v4.26 estende la v4.25: conserva la correlazione digitale TX/RX, i contatori
+Ethernet, le segnalazioni di alimentazione/temperatura e le correzioni updater.
+`transport_diagnosis` mantiene la diagnosi digitale; `audio_diagnosis` aggiunge
+le evidenze del ritorno, senza nascondere gli avvisi digitali già rilevati.
+L'assenza della Scarlett opzionale non cambia lo stato di salute del nodo.
+
+Il setup installa `python3-numpy` e il modulo `rx_diagnostics.py`, incluso anche
+nell'installer autonomo. Il monitor avvia la diagnostica soltanto sulle RX.
+Roc continua a usare il suo dispositivo ALSA; Scarlett è usata come ingresso.
+Non vengono emessi segnali di test e non è necessario cambiare il flusso TX.
+
+- **Riferimento digitale:** copia passiva RTP L16, PT 10 stereo o PT 11 mono a
+  44,1 kHz. Il riferimento viene ricostruito per timestamp RTP, con gestione del
+  wrap, duplicati e riordino; i buchi sono marcati, non considerati audio valido.
+- **Ritorno:** acquisizione Scarlett stereo a 16 kHz. Buffer circolari di circa
+  8 secondi; l'ultimo secondo è confrontato ogni 0,5 secondi, in un worker
+  separato, con filtro passa-basso e ricampionamento diagnostico a 4 kHz.
+- **Confronto:** correlazione normalizzata FFT, allineamento e stima del gain per
+  canale. Riporta correlazione, polarità inversa, guadagno relativo e residuo.
+  La latenza è pubblicata solo con correlazione almeno 0,75, picco non ambiguo
+  e ritardo stimato compreso tra -100 ms e 3 s.
+- **Anomalie:** ritorno differente (`mismatch`), silenzio inatteso
+  (`missing_return`), canale assente (`missing_channel`), possibile scambio L/R,
+  saturazione del ritorno, dropout di almeno 20 ms e salti del ritardo oltre
+  20 ms. I dropout richiedono un riferimento allineato attivo e non ambiguo.
+  Gli altri difetti persistenti richiedono due analisi consecutive; dropout e
+  salti di ritardo possono generare subito un evento. La scomparsa del flusso
+  RTP oltre 2 s e l’interruzione della cattura ADC sono segnalate separatamente. Mute, livello atteso
+  insufficiente o contesto non recente sospendono la diagnosi delle anomalie.
+- **Telemetria:** pacchetti, gap di sequenza provvisori, fuori ordine, duplicati
+  e jitter con smoothing RFC 3550. Un gap non equivale a perdita definitiva:
+  un pacchetto riordinato può colmare il riferimento. Anche la cattura passiva
+  può perdere dati. Copertura RTP sotto il 99,5% rende il confronto non conclusivo.
+- **Deriva:** dopo almeno 30 s di misure affidabili viene stimata la tendenza del
+  ritardo, se la dispersione rispetto alla retta è sotto 2 ms. La stima include
+  variazioni di rete e buffering: non misura direttamente il clock hardware.
+
+La dashboard TX mostra questi risultati nella diagnostica del nodo RX e segnala
+ATTENZIONE per le anomalie confermate. Per visualizzarli aggiornare **TX e RX**.
+Silenzio e contenuti periodici sono esplicitamente indicati come insufficienti o
+ambigui: non certificano né un guasto né un ritardo affidabile.
+
+### Evidenze locali degli eventi
+
+Per ogni evento confermato si salva sulla RX una directory
+`/var/lib/roc-museum/diagnostics/event-<timestamp>` contenente:
+
+- `reference.wav`: riferimento RTP, con eventuali buchi riempiti da zeri;
+- `return.wav`: ritorno Scarlett;
+- `event.json`: trigger, risultato, contatori RTP prima/dopo, stato mute e meter,
+  ultimi avvisi Roc, journal Roc recente (massimo 200 righe / 64 kB), tempi di
+  fine delle finestre e copertura del riferimento.
+
+In regime stabile la finestra copre circa 6 s prima e 2 s dopo il trigger; in
+avvio può essere più corta. Se il segnale si interrompe completamente viene
+salvata l'ultima finestra disponibile, marcando l'assenza del seguito.
+I due WAV hanno timeline indipendenti: non allinearli semplicemente per inizio
+file. La correlazione e i tempi in `event.json` servono per l'allineamento.
+Si conserva al massimo un evento ogni 30 s e gli ultimi 20 eventi, per circa
+40 MB di audio complessivi. I file restano sul dispositivo, senza upload o
+riproduzione dalla dashboard; questa mostra il percorso dell'ultima evidenza.
+
+### Limiti e collaudo
+
+Il ritardo riportato è una **stima dall'arrivo RTP alla cattura ADC**: comprende
+il buffering di cattura e non è una misura assoluta certificata del solo DAC.
+Il residuo non è una misura THD; la banda diagnostica è limitata a circa 2 kHz.
+La correlazione tollera gain diversi; non è ancora presente una calibrazione
+hardware né una compensazione adattiva del clock. Variazioni rapide di volume,
+drift elevato, segnali periodici o rumore possono ridurre la confidenza.
+Ripetizioni e alterazioni del contenuto possono apparire come `mismatch`, senza
+un'attribuzione automatica certa a decoder, buffer, ALSA o DAC. Non viene ancora
+intercettato il PCM interno dopo la decodifica Roc.
+
+I test sintetici verificano allineamento tra sample rate, attenuazione, dropout,
+contenuto errato, silenzio, canale assente, scambio L/R, polarità, clipping,
+ambiguità periodica, gestione RTP, sospensione in mute ed esportazione/rotazione.
+Eseguirli con `python3 -m unittest discover -s tests -q` dopo aver installato NumPy.
+Resta necessario il collaudo su Raspberry/Scarlett: verificare CPU, gain,
+stabilità su musica reale e risposta a interruzioni di rete e underrun controllati.

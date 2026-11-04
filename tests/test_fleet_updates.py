@@ -173,7 +173,7 @@ class PasswordTransportTests(unittest.TestCase):
         first_stdout.channel.recv_exit_status.return_value=1
 
         second_stdout=Mock();second_stderr=Mock();channel=second_stdout.channel
-        channel.recv_ready.side_effect=[True,False]
+        channel.recv_ready.side_effect=[True,False,False]
         channel.recv.side_effect=[b'[sudo] password for pi: ']
         channel.exit_status_ready.side_effect=[False,True]
         channel.recv_exit_status.return_value=0
@@ -182,7 +182,9 @@ class PasswordTransportTests(unittest.TestCase):
             (Mock(),first_stdout,first_stderr),
             (Mock(),second_stdout,second_stderr)
         ]
-        conn.privileged('192.168.1.51','true')
+        with patch('select.select',return_value=([],[],[])) as wait:
+            conn.privileged('192.168.1.51','true')
+        wait.assert_called_once_with([channel],[],[],0.1)
         channel.sendall.assert_called_once_with(b'ssh-secret\n')
         command=conn.client.exec_command.call_args.args[0]
         self.assertIn('sudo -S',command)
