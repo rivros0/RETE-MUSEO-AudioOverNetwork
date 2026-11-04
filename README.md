@@ -774,3 +774,40 @@ scomparsi. Gli RX v4.26/v4.27 sono compatibili; non serve aggiornarli per avere
 lo storico degli heartbeat già trasmessi. Restano i limiti di campionamento:
 anomalie più brevi dell'heartbeat richiedono un'evidenza salvata dalla RX e non
 sono tutte garantite come eventi dello storico centrale.
+
+
+### Debug avanzato dalla dashboard (4.29)
+
+Dopo l’accesso amministratore, aprire **Sistema → Debug avanzato · log ed
+ evidenze audio** (chiuso inizialmente). Selezionare TX o un RX e leggere il
+journal Roc/audio o monitor/cattura degli ultimi 15 minuti, un’ora o 24 ore.
+La risposta comprende tutte le righe disponibili entro il limite di 5000 righe
+/ 512 KiB; la pagina segnala esplicitamente un eventuale taglio. La lettura è
+manuale e non modifica servizi, volume, latenza o riproduzione.
+
+Per gli RX, **Elenca evidenze salvate** mostra fino a 20 cartelle diagnostiche
+locali. **Apri** permette di leggere `event.json` (inclusi journal dell’evento,
+analisi, contesto e statistiche RTP), ascoltare e scaricare `reference.wav` e
+`return.wav`. I WAV sono caricati solo su richiesta, possono contenere annunci
+e hanno timeline indipendenti: utilizzare gli offset della correlazione.
+La durata osservata nello storico non è la durata del dropout; quest’ultima
+è riportata nei dettagli dell’analisi. Gli eventi eliminati dalla retention
+non sono più scaricabili. La confidenza del rilevatore resta visibile nel JSON.
+
+L’API `/api/diagnostics/debug` richiede la sessione amministratore per ogni
+richiesta, compresi i WAV. Il browser parla solo con il TX. Il TX inoltra le
+letture all’IP osservato nel heartbeat del ricevitore, senza accettare host o
+percorsi arbitrari dal browser. Gli RX aggiornati espongono un servizio TCP
+sulla stessa porta numerica `CONTROL_PORT` (default **19091**, distinta dal
+controllo UDP), che accetta soltanto connessioni dall’IPv4 `TX_IP` configurato.
+Non è un servizio cifrato o autenticato con credenziali proprie: va mantenuto
+sulla LAN fidata, senza pubblicazione Internet; eventuali firewall devono
+consentire TCP/19091 dal solo TX. Sono ammessi soltanto due servizi journal e
+i tre file previsti nelle cartelle evento; symlink, file speciali e traversal
+sono rifiutati. Trasferimenti limitati a 16 MiB, tre richieste concorrenti e
+timeout evitano letture illimitate.
+
+**Installazione:** aggiornare TX e RX alla 4.29; la sola modifica del TX non
+consente di recuperare i file dai vecchi RX. Non serve fornire accesso SSH
+all’assistente per le successive consultazioni. Il normale aggiornamento
+iniziale dei dispositivi mantiene il proprio meccanismo di installazione.
