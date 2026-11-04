@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.28
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.29
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.28"
+VERSION="4.29"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,11 +410,12 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.28"
+MONITOR_BUILD="4.29"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
 CONTROL_RESULTS={}
+DEBUG_SLOTS=threading.BoundedSemaphore(3)
 MUTED=False
 RESUME_VOLUME=None
 REGISTRY={}
@@ -1681,7 +1682,42 @@ class Handler(BaseHTTPRequestHandler):
         try: self.json_reply(200,action())
         except (ValueError,TypeError,KeyError,OSError,subprocess.SubprocessError) as error:
             self.json_reply(400,{"message":str(error)})
+    def diagnostic_reply(self):
+        if not self.require_auth(): return
+        if self.config.get("ROLE")!="tx":
+            self.json_reply(404,{"message":"Diagnostica disponibile sul TX"});return
+        query=parse_qs(urlsplit(self.path).query)
+        node_name=query.get("node",[""])[0]
+        action=query.get("action",["events"])[0]
+        request={"action":action}
+        if action=="file":
+            request.update(event=query.get("event",[""])[0],file=query.get("file",[""])[0])
+        elif action=="journal":
+            request.update(window=query.get("window",["15m"])[0],unit=query.get("unit",["roc-museum"])[0])
+        elif action!="events":
+            self.json_reply(400,{"message":"Richiesta non valida"});return
+        if not DEBUG_SLOTS.acquire(blocking=False):
+            self.json_reply(429,{"message":"Diagnostica occupata: riprovare"});return
+        try:
+            import diagnostics_access
+            if node_name==self.config.get("NODE_NAME","TX"):
+                content_type,data=diagnostics_access.collect(request)
+            else:
+                with REGISTRY_LOCK: node=dict(REGISTRY.get(node_name,{}) or {})
+                if node.get("role")!="rx" or not node.get("source_ip"):
+                    self.json_reply(404,{"message":"RX non trovato"});return
+                if time.time()-node.get("received_at",0)>OFFLINE_AFTER:
+                    self.json_reply(503,{"message":"RX offline; le evidenze restano sul ricevitore"});return
+                content_type,data=diagnostics_access.fetch(node["source_ip"],int(self.config.get("CONTROL_PORT","19091")),request)
+            self.reply(200,content_type,data)
+        except (OSError,ValueError,subprocess.SubprocessError) as error:
+            self.json_reply(502,{"message":"Diagnostica non disponibile. Verificare aggiornamento TX/RX e collegamento TCP sulla porta di controllo. "+str(error)[:400]})
+        finally:
+            DEBUG_SLOTS.release()
+
     def do_GET(self):
+        if urlsplit(self.path).path=="/api/diagnostics/debug":
+            self.diagnostic_reply();return
         if urlsplit(self.path).path=="/api/diagnostics/history":
             if HISTORY is None:
                 self.json_reply(503,{"events":[],"error":HISTORY_ERROR or "Storico disponibile sul TX aggiornato"});return
@@ -1892,12 +1928,167 @@ def main():
         server=ThreadingHTTPServer(("0.0.0.0",port),Handler)
         print("Dashboard in ascolto sulla porta "+str(port),flush=True)
         server.serve_forever();return
+    def serve_diagnostics():
+        try:
+            from diagnostics_access import serve
+            serve(config)
+        except Exception as error:
+            print("Accesso diagnostico RX non disponibile: "+str(error),flush=True)
+    threading.Thread(target=serve_diagnostics,daemon=True).start()
     commands=threading.Thread(target=command_listener_loop,args=(config,),daemon=True);commands.start()
     while True: time.sleep(3600)
 if __name__=="__main__": main()
 PY_MONITOR
     chmod 0755 "$MONITOR_TARGET"
     install -d -m 0755 /usr/local/lib/roc-museum /usr/local/share/roc-museum
+    cat > /usr/local/lib/roc-museum/diagnostics_access.py <<'PY_DIAGNOSTICS_ACCESS'
+"""Read-only RX diagnostic transport. The TX is the only accepted LAN peer."""
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import socketserver
+import subprocess
+import threading
+import time
+
+ROOT = Path('/var/lib/roc-museum/diagnostics')
+MAX_BYTES = 16 * 1024 * 1024
+FILES = {'event.json': 'application/json', 'reference.wav': 'audio/wav', 'return.wav': 'audio/wav'}
+EVENT = re.compile(r'event-[0-9]{1,24}\Z')
+SLOTS = threading.BoundedSemaphore(3)
+
+
+def read_artifact(event, filename, root=ROOT):
+    if not isinstance(event, str) or not isinstance(filename, str) or not EVENT.fullmatch(event) or filename not in FILES:
+        raise ValueError('Evidenza non valida')
+    # Open each path component without following links, including the event directory.
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        folder = os.open(event, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        try:
+            fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=folder)
+            with os.fdopen(fd, 'rb') as stream:
+                import stat
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_BYTES:
+                    raise ValueError('File non regolare o troppo grande')
+                return stream.read(MAX_BYTES + 1)
+        finally:
+            os.close(folder)
+    finally:
+        os.close(directory)
+
+
+def collect(request, root=ROOT):
+    action = request.get('action')
+    if action == 'events':
+        events = []
+        if root.exists():
+            for folder in sorted(root.iterdir(), key=lambda p: p.name, reverse=True):
+                if not EVENT.fullmatch(folder.name) or folder.is_symlink() or not folder.is_dir():
+                    continue
+                try:
+                    data = json.loads(read_artifact(folder.name, 'event.json', root))
+                    events.append({'id': folder.name, 'saved_at': data.get('saved_at'),
+                                   'triggered_at': data.get('triggered_at'),
+                                   'status': data.get('analysis', {}).get('status', 'unknown')})
+                except (OSError, ValueError):
+                    continue
+                if len(events) >= 20:
+                    break
+        return 'application/json', json.dumps({'events': events, 'generated_at': time.time()}).encode()
+    if action == 'file':
+        filename = request.get('file', '')
+        data = read_artifact(request.get('event', ''), filename, root)
+        return FILES[filename], data
+    if action == 'journal':
+        window = request.get('window', '15m')
+        unit = request.get('unit', 'roc-museum')
+        if window not in ('15m', '1h', '24h') or unit not in ('roc-museum', 'roc-museum-monitor'):
+            raise ValueError('Intervallo o servizio non valido')
+        result = subprocess.run(['journalctl', '-u', unit + '.service', '--since=-' + window,
+                                 '-n', '5001', '--no-pager', '-o', 'short-iso-precise'],
+                                capture_output=True, timeout=8, check=False)
+        if result.returncode:
+            raise ValueError('Journal non disponibile: ' + result.stderr.decode(errors='replace')[-1000:])
+        lines = result.stdout.splitlines(keepends=True)
+        raw = b''.join(lines[-5000:])
+        truncated = len(lines) > 5000 or len(raw) > 512 * 1024
+        text = raw[-512 * 1024:].decode(errors='replace')
+        return 'application/json', json.dumps({'text': text, 'truncated': truncated,
+            'window': window, 'unit': unit, 'generated_at': time.time(),
+            'limit_lines': 5000, 'limit_bytes': 512 * 1024}).encode()
+    raise ValueError('Richiesta diagnostica non valida')
+
+
+def fetch(host, port, request):
+    with socket.create_connection((host, port), timeout=4) as connection:
+        connection.settimeout(15)
+        connection.sendall(json.dumps(request).encode() + b'\n')
+        with connection.makefile('rb') as stream:
+            header = json.loads(stream.readline(4097))
+            if not header.get('ok'):
+                raise ValueError(header.get('message', 'Diagnostica non disponibile'))
+            length = header.get('length')
+            if type(length) is not int or not 0 <= length <= MAX_BYTES:
+                raise ValueError('Dimensione risposta non valida')
+            if header.get('content_type') not in ('application/json', 'audio/wav'):
+                raise ValueError('Formato risposta non valido')
+            data = stream.read(length)
+            if len(data) != length:
+                raise ValueError('Trasferimento evidenza incompleto')
+            return header['content_type'], data
+
+
+class DiagnosticHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        self.connection.settimeout(15)
+        try:
+            raw = self.rfile.readline(4097)
+            if len(raw) > 4096:
+                raise ValueError('Richiesta troppo grande')
+            request = json.loads(raw)
+            if not isinstance(request, dict):
+                raise ValueError('Richiesta non valida')
+            content_type, data = collect(request)
+            self.wfile.write(json.dumps({'ok': True, 'length': len(data), 'content_type': content_type}).encode() + b'\n')
+            self.wfile.write(data)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.wfile.write(json.dumps({'ok': False, 'message': str(error)[:400]}).encode() + b'\n')
+
+
+class DiagnosticServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def verify_request(self, request, address):
+        return address[0] == self.tx_ip
+
+    def process_request(self, request, address):
+        if not SLOTS.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            SLOTS.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            SLOTS.release()
+
+
+def serve(config):
+    with DiagnosticServer(('0.0.0.0', int(config.get('CONTROL_PORT', '19091'))), DiagnosticHandler) as server:
+        server.tx_ip = config.get('TX_IP', '')
+        server.serve_forever()
+PY_DIAGNOSTICS_ACCESS
+    chmod 0644 /usr/local/lib/roc-museum/diagnostics_access.py
     cat > /usr/local/lib/roc-museum/diagnostic_history.py <<'PY_DIAGNOSTIC_HISTORY'
 """TX-only persistent incident history; never carries PCM or runs on RX."""
 import hashlib
@@ -3485,6 +3676,23 @@ PY_AUDIO_BUS
 <h3>Stato sistema</h3>
 <p class="hint">Stato TX/RX, rete, servizi, autodiagnosi e manutenzione.</p>
 </div>
+<details id="debugPanel" class="box" style="margin-top:18px">
+<summary>Debug avanzato · log ed evidenze audio</summary>
+<p>Consultazione su richiesta, senza SSH. Nessuna modifica alla riproduzione. Richiede TX e RX aggiornati alla versione 4.29 o successiva.</p>
+<label>Nodo <select id="debugNode" aria-label="Nodo debug"></select></label>
+<button type="button" id="debugDiscover">Rileva nodi</button>
+<label>Servizio <select id="debugUnit"><option value="roc-museum">Roc / audio</option><option value="roc-museum-monitor">Monitor e cattura diagnostica</option></select></label>
+<label>Intervallo <select id="debugWindow"><option value="15m">Ultimi 15 minuti</option><option value="1h">Ultima ora</option><option value="24h">Ultime 24 ore</option></select></label>
+<button type="button" id="debugJournal">Leggi log</button>
+<button type="button" id="debugEvents">Elenca evidenze salvate</button>
+<p id="debugMessage" role="status" aria-live="polite"></p>
+<p>Il journal mostra tutte le righe disponibili nell’intervallo scelto, fino a 5000 righe / 512 KiB; un taglio viene segnalato. Non viene aggiornato automaticamente.</p>
+<pre id="debugLog" style="max-height:420px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere"></pre>
+<div id="debugEvidence"></div>
+<p>I WAV possono contenere audio ambientale o annunci. Premi Ascolta per caricarli. I due file hanno tempi di partenza indipendenti: confrontarli usando gli offset dell’analisi. “Confermato” è l’esito del rilevatore, non una diagnosi della causa.</p>
+<div id="debugFiles"></div>
+</details>
+
 <h3>Explorer USB</h3><button id="scanUSB">Rileva pennette</button><label>Dispositivo <select id="usbDevice"></select></label><button id="openUSB">Apri</button><button id="ejectUSB">Espelli</button>
 <p id="usbPath">Nessuna pennetta aperta</p><button id="usbParent">Cartella superiore</button><ul id="usbEntries"></ul>
 <p class="hint">Le nuove pennette sono montate in sola lettura. Importa i brani nella libreria prima di scollegarle.</p>
@@ -3571,6 +3779,7 @@ async function refreshAudioMonitor(){
 /* La dashboard tecnica completa vive in Sistema durante la sessione di regia.
    Al logout viene riportata nella sua posizione pubblica originale. */
 function placeDashboard(){
+  if(!authorized&&document.getElementById("debugPanel")){clearDebug();el("debugNode").replaceChildren();el("debugPanel").open=false;}
   var systemHost=el('systemDashboardHost');
   var publicHome=document.getElementById('publicDashboardHome');
   var summary=document.getElementById('summary');
@@ -3597,7 +3806,7 @@ async function api(path,data){
   var options={cache:'no-store'};
   if(data!==undefined){options.method='POST';options.headers={'Content-Type':'application/json','X-CSRF-Token':csrf};options.body=JSON.stringify(data);}
   var r=await fetch(path,options),d=await r.json();
-  if(!r.ok){if(r.status===401){authorized=false;el('studioTools').hidden=true;await session();}throw new Error(d.message||'Operazione fallita');}
+  if(!r.ok){if(r.status===401){clearDebug();authorized=false;el('studioTools').hidden=true;await session();}throw new Error(d.message||'Operazione fallita');}
   return d;
 }
 async function perform(action){try{await action();}catch(error){message(error.message);}}
@@ -3832,6 +4041,24 @@ window.addEventListener('DOMContentLoaded',function(){
   setInterval(refreshAudioMonitor,2000);
   setInterval(renderTimeline,250);
 });
+var debugBusy=false,debugGeneration=0;
+function clearDebugFiles(){
+  el('debugFiles').querySelectorAll('audio').forEach(function(audio){audio.pause();audio.removeAttribute('src');audio.load();});
+  el('debugFiles').replaceChildren();
+}
+function clearDebug(){debugGeneration++;el('debugLog').textContent='';el('debugEvidence').replaceChildren();clearDebugFiles();el('debugMessage').textContent='';}
+function debugURL(action,extra){var q=new URLSearchParams(Object.assign({node:el('debugNode').value,action:action},extra||{}));return '/api/diagnostics/debug?'+q.toString();}
+async function debugRead(action,extra){var r=await fetch(debugURL(action,extra),{cache:'no-store'});var d=await r.json();if(!r.ok)throw new Error(d.message||'Diagnostica non disponibile');return d;}
+async function debugRun(task){if(debugBusy||!authorized)return;debugBusy=true;var generation=debugGeneration;el('debugMessage').textContent='Lettura in corso…';try{await task(generation);}catch(error){if(generation===debugGeneration)el('debugMessage').textContent=error.message;}finally{debugBusy=false;}}
+async function debugDiscover(){await debugRun(async function(g){var d=await api('/api/status');if(g!==debugGeneration||!authorized)return;var old=el('debugNode').value;el('debugNode').replaceChildren();d.nodes.forEach(function(n){option(el('debugNode'),n.name,n.name+(n.online?'':' · offline'));});if(d.nodes.some(function(n){return n.name===old;}))el('debugNode').value=old;el('debugMessage').textContent=d.nodes.length?'Seleziona un nodo e una lettura.':'Nessun nodo disponibile.';});}
+el('debugPanel').addEventListener('toggle',function(){if(this.open&&authorized&&!el('debugNode').options.length)debugDiscover();});
+el('logout').addEventListener('click',clearDebug);
+el('debugDiscover').onclick=debugDiscover;
+el('debugNode').onchange=clearDebug;
+el('debugJournal').onclick=function(){debugRun(async function(g){var d=await debugRead('journal',{unit:el('debugUnit').value,window:el('debugWindow').value});if(g!==debugGeneration||!authorized)return;el('debugLog').textContent=d.text||'Nessuna riga disponibile nel journal.';el('debugMessage').textContent=(d.truncated?'LOG TAGLIATO: raggiunto il limite di righe o byte. Riduci l’intervallo. ':'')+'Lettura '+historyTime(d.generated_at);});};
+el('debugEvents').onclick=function(){debugRun(async function(g){var d=await debugRead('events');if(g!==debugGeneration||!authorized)return;el('debugEvidence').replaceChildren();clearDebugFiles();d.events.forEach(function(e){var row=document.createElement('p');row.textContent=historyTime(e.triggered_at||e.saved_at)+' · '+e.status+' ';row.appendChild(button('Apri '+e.id,function(){debugOpenEvent(e.id);}));el('debugEvidence').appendChild(row);});el('debugMessage').textContent=d.events.length+' evidenze disponibili sul nodo (massimo 20; le più vecchie vengono eliminate).';});};
+function debugOpenEvent(id){debugRun(async function(g){var d=await debugRead('file',{event:id,file:'event.json'});if(g!==debugGeneration||!authorized)return;var box=el('debugFiles');clearDebugFiles();var title=document.createElement('h4');title.textContent=id;box.appendChild(title);var pre=document.createElement('pre');pre.style.cssText='max-height:420px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere';pre.textContent=JSON.stringify(d,null,2);box.appendChild(pre);['event.json','reference.wav','return.wav'].forEach(function(file){var url=debugURL('file',{event:id,file:file}),row=document.createElement('p'),link=document.createElement('a');link.href=url;link.download=id+'-'+file;link.textContent='Scarica '+file;row.appendChild(link);if(file.endsWith('.wav')){var audio=document.createElement('audio');audio.controls=true;audio.preload='none';var play=button('Ascolta '+(file==='reference.wav'?'riferimento RTP':'ritorno analogico'),function(){audio.src=url;audio.play().catch(function(){el('debugMessage').textContent='Audio non disponibile: evidenza rimossa, nodo offline o sessione scaduta.';});});audio.onerror=function(){el('debugMessage').textContent='Impossibile leggere il WAV: verificare nodo e sessione.';};row.appendChild(play);row.appendChild(audio);}box.appendChild(row);});el('debugMessage').textContent='Evidenza caricata. Journal dell’evento e dettagli nel JSON.';});}
+
 })();
 </script>
 HTML_STUDIO
