@@ -205,17 +205,20 @@ function placeDashboard(){
   var summary=document.getElementById('summary');
   var nodes=document.getElementById('nodes');
   var footer=document.getElementById('footer');
+  var history=document.getElementById('diagnosticHistory');
   if(!systemHost||!publicHome||!summary||!nodes||!footer){return;}
 
   if(authorized){
     if(summary.parentNode!==systemHost){
       systemHost.appendChild(summary);
       systemHost.appendChild(nodes);
+      if(history)systemHost.appendChild(history);
       systemHost.appendChild(footer);
     }
   }else if(summary.parentNode!==publicHome){
     publicHome.appendChild(summary);
     publicHome.appendChild(nodes);
+    if(history)publicHome.appendChild(history);
     publicHome.appendChild(footer);
   }
 }

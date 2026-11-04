@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.27
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.28
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.27"
+VERSION="4.28"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -398,7 +398,7 @@ import tempfile
 import sys
 from pathlib import Path
 from http.cookies import SimpleCookie
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, parse_qs
 import math
 import struct
 from collections import deque
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.27"
+MONITOR_BUILD="4.28"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -419,6 +419,8 @@ MUTED=False
 RESUME_VOLUME=None
 REGISTRY={}
 STUDIO=None
+HISTORY=None
+HISTORY_ERROR=""
 REGISTRY_LOCK=threading.Lock()
 # Installed alongside TX helpers; keep the standalone installer self-contained.
 sys.path.insert(0,"/usr/local/lib/roc-museum")
@@ -1208,6 +1210,7 @@ def heartbeat_loop(config):
             payload=json.dumps(snapshot,separators=(",",":")).encode("utf-8")
             try: sock.sendto(payload,(tx_ip,port))
             except OSError: pass
+        if role=="tx": record_diagnostic_history(config)
         time.sleep(HEARTBEAT_INTERVAL)
 
 def listener_loop(config):
@@ -1517,6 +1520,17 @@ def system_status(config):
     nodes.sort(key=sort_key)
     return {"system":"RETE MUSEO - AudioOverNetwork","generated_at":now,"software_version":config.get("SOFTWARE_VERSION",""),"monitor_build":MONITOR_BUILD,"expected_rx":int(config.get("EXPECTED_RX_COUNT","3")),"nodes":nodes}
 
+def record_diagnostic_history(config):
+    global HISTORY_ERROR
+    if HISTORY is None: return
+    try:
+        HISTORY.observe(system_status(config)["nodes"])
+        HISTORY_ERROR=""
+    except Exception as error:
+        message=str(error)
+        if message!=HISTORY_ERROR: print("Storico diagnostico: "+message,flush=True)
+        HISTORY_ERROR=message
+
 PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RETE MUSEO - AudioOverNetwork</title><style>body{font-family:system-ui,sans-serif;background:#111827;color:#e5e7eb;margin:0;padding:24px}main{max-width:1150px;margin:auto}.titlebar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:6px}h1{margin:0}.versionBadge{display:inline-flex;align-items:center;background:#1d4ed8;color:#dbeafe;border:1px solid #3b82f6;border-radius:999px;padding:7px 12px;font-size:14px;font-weight:800;letter-spacing:.02em;white-space:nowrap}.sub{color:#9ca3af;margin-bottom:22px}.summary,.grid{display:grid;gap:14px}.summary{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:18px}.grid{grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}.box,.card{background:#1f2937;border:1px solid #374151;border-radius:12px;padding:16px}.num{font-size:28px;font-weight:700}.head{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}.badge{font-size:12px;font-weight:700;padding:5px 9px;border-radius:999px}.OK{background:#064e3b;color:#a7f3d0}.ATTENZIONE{background:#78350f;color:#fde68a}.OFFLINE{background:#7f1d1d;color:#fecaca}.row{display:flex;justify-content:space-between;gap:12px;border-top:1px solid #374151;padding:8px 0;font-size:14px}.label{color:#9ca3af}.value{text-align:right}footer{color:#6b7280;margin-top:22px;font-size:13px}code{color:#93c5fd}.volume{border-top:1px solid #374151;padding:12px 0}.volumeHead{display:flex;justify-content:space-between;gap:12px;margin-bottom:8px}.volumeNumber{width:75px;padding:7px;background:#111827;color:#fff;border:1px solid #6b7280;border-radius:5px}.volume button{padding:7px;margin-top:8px;cursor:pointer}.muteButton[aria-pressed=true]{background:#b91c1c;color:white}.volumeMsg{min-height:18px;color:#9ca3af;font-size:12px;margin-top:4px}.diag{border-top:1px solid #374151;padding-top:10px;margin-top:4px}.diag summary{cursor:pointer;color:#9ca3af;font-size:13px}.diagBody{padding-top:8px}.latency{border-top:1px solid #374151;padding:8px 0;font-size:14px}.meter{border-top:1px solid #374151;padding:12px 0}.meter progress{width:100%;height:14px;accent-color:#34d399}.meter.hot progress{accent-color:#fbbf24}.meter.clip progress{accent-color:#f87171}.meter small{display:block;color:#9ca3af;margin-top:6px}.autodiag{border-top:1px solid #374151;padding:12px 0}.autodiag strong{display:block;margin-bottom:7px}.autodiag.ok strong{color:#a7f3d0}.autodiag.warning strong{color:#fde68a}.autodiag.critical strong{color:#fecaca}.autodiag.info strong{color:#bfdbfe}</style></head><body><main><div class="titlebar"><h1>RETE MUSEO - AudioOverNetwork</h1><span id="versionBadge" class="versionBadge">Versione installata: …</span></div><div class="sub">Monitor centrale TX · monitoraggio e controllo RX</div><div id="publicDashboardHome"><div id="summary" class="summary"></div><div id="nodes" class="grid"></div><footer id="footer"></footer></div><script>function esc(value){var text='';if(value!=null){text=String(value);}return text.replace(/[&<>"']/g,function(c){var map={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};return map[c];});}function boolLabel(value,okText,koText){return value?okText:koText;}function multicastLabel(state){var map={sending:'trasmissione attiva',joined:'gruppo agganciato',stopped:'trasmissione ferma',not_joined:'gruppo non agganciato'};return map[state]||state||'n/d';}var drafts={},feedback={},pending={},knownMute={},confirmed={};
 function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
 return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
@@ -1600,6 +1614,17 @@ setInterval(renderTxClock,1000);
 PAGE=PAGE.replace('<script>function esc','<script>'+CLOCK_JS+'function esc',1)
 PAGE=PAGE.replace("var data=await response.json();", "var data=await response.json();syncTxClock(data.generated_at);",1)
 
+HISTORY_UI=r'''<details id="diagnosticHistory" class="box" style="margin-top:18px"><summary>Storico diagnostico · eventi conservati dopo il rientro</summary><p>Orari del TX · durata osservata a campioni, non durata esatta del difetto audio. Ultimi 100 eventi; conservazione 30 giorni / 1000 eventi conclusi.</p><label>Nodo <input id="historyNode" placeholder="Tutti i nodi" aria-label="Filtra storico per nome nodo"></label> <button type="button" id="historyRefresh">Aggiorna storico</button> <a id="historyExport" href="/api/diagnostics/history?limit=1000" download="storico-diagnostico.json">Scarica JSON</a><p id="historyMessage" role="status"></p><div id="historyRows"></div></details>'''
+HISTORY_JS=r'''var historyLast=0,historyBusy=false;
+function historyTime(value){return value==null?'—':new Date(value*1000).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}
+async function loadDiagnosticHistory(force){var panel=document.getElementById('diagnosticHistory');if(!panel||!panel.open||historyBusy||(!force&&Date.now()-historyLast<10000))return;historyBusy=true;try{var node=document.getElementById('historyNode').value.trim();var query=node?'&node='+encodeURIComponent(node):'';document.getElementById('historyExport').href='/api/diagnostics/history?limit=1000'+query;var response=await fetch('/api/diagnostics/history?limit=100'+query,{cache:'no-store'});var data=await response.json();if(!response.ok)throw new Error(data.error||'Storico non disponibile');var html='';(data.events||[]).forEach(function(e){var state=e.active?'In corso':e.resolution==='monitor_restart'?'Monitor riavviato: esito non osservato':e.resolution==='artifact'?'Evidenza salvata':e.resolution==='node_offline'?'Osservazione interrotta: nodo offline':e.resolution==='observation_lost'?'Osservazione interrotta':'Rientrato';html+='<article class="diag"><strong>'+esc(e.node)+' · '+esc(e.summary)+'</strong><div class="row"><span>'+esc(e.source)+' · '+esc(e.code)+'</span><span>'+esc(state)+'</span></div><div>Inizio '+esc(historyTime(e.started_at))+' · ultima osservazione '+esc(historyTime(e.last_seen))+' · fine '+esc(historyTime(e.ended_at))+'</div><div>Durata osservata '+esc(e.observed_duration_seconds)+' s · campioni '+esc(e.observations)+'</div><details><summary>Dettagli ed evidenze</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e.details,null,2))+'</pre></details></article>';});document.getElementById('historyRows').innerHTML=html||'<p>Nessun evento registrato.</p>';document.getElementById('historyMessage').textContent=(data.error?'Errore salvataggio: '+data.error+' · ':'')+'Aggiornato '+new Date().toLocaleTimeString('it-IT');historyLast=Date.now();}catch(error){document.getElementById('historyMessage').textContent='Errore storico: '+error.message;}finally{historyBusy=false;}}
+window.addEventListener('DOMContentLoaded',function(){var panel=document.getElementById('diagnosticHistory');if(!panel)return;panel.addEventListener('toggle',function(){loadDiagnosticHistory(true);});document.getElementById('historyRefresh').onclick=function(){loadDiagnosticHistory(true);};document.getElementById('historyNode').onchange=function(){loadDiagnosticHistory(true);};setInterval(function(){loadDiagnosticHistory(false);},10000);});
+'''
+PAGE=PAGE.replace('<footer id="footer">',HISTORY_UI+'<footer id="footer">',1)
+PAGE=PAGE.replace('<script>function esc','<script>'+HISTORY_JS+'function esc',1)
+# CLOCK_JS may already have been inserted before esc.
+if HISTORY_JS not in PAGE: PAGE=PAGE.replace('<script>','<script>'+HISTORY_JS,1)
+
 def build_tx_page():
     page=PAGE
     # Defensive composition: login must always be present on the TX page.
@@ -1657,6 +1682,22 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError,TypeError,KeyError,OSError,subprocess.SubprocessError) as error:
             self.json_reply(400,{"message":str(error)})
     def do_GET(self):
+        if urlsplit(self.path).path=="/api/diagnostics/history":
+            if HISTORY is None:
+                self.json_reply(503,{"events":[],"error":HISTORY_ERROR or "Storico disponibile sul TX aggiornato"});return
+            try:
+                query=parse_qs(urlsplit(self.path).query)
+                node=query.get("node",[""])[0][:128] or None
+                limit=int(query.get("limit",["100"])[0])
+                if not 1<=limit<=1000: raise ValueError("Limite non valido")
+                result=HISTORY.query(node,limit)
+                result["error"]=HISTORY_ERROR
+                self.json_reply(200,result)
+            except ValueError:
+                self.json_reply(400,{"error":"Parametri non validi"})
+            except Exception as error:
+                self.json_reply(503,{"events":[],"error":str(error)})
+            return
         if self.path=="/api/updates":
             if not self.require_auth(): return
             try: self.json_reply(200,self.update_manager().snapshot())
@@ -1817,7 +1858,7 @@ class Handler(BaseHTTPRequestHandler):
             UPLOAD_LOCK.release()
 
 def main():
-    global STUDIO
+    global STUDIO, HISTORY, HISTORY_ERROR
     if sys.argv[1:]==["--set-password"]:
         set_password();return
     config=read_config();role=config.get("ROLE","")
@@ -1826,6 +1867,13 @@ def main():
         return
     if role=="rx":
         restore_saved_volume()
+    if role=="tx":
+        try:
+            from diagnostic_history import History
+            HISTORY=History()
+        except Exception as error:
+            HISTORY_ERROR=str(error)
+            print("Storico diagnostico non disponibile: "+HISTORY_ERROR,flush=True)
     threading.Thread(target=meter_loop,args=(config,),daemon=True).start()
     heartbeat=threading.Thread(target=heartbeat_loop,args=(config,),daemon=True);heartbeat.start()
     if role=="tx":
@@ -1850,6 +1898,152 @@ if __name__=="__main__": main()
 PY_MONITOR
     chmod 0755 "$MONITOR_TARGET"
     install -d -m 0755 /usr/local/lib/roc-museum /usr/local/share/roc-museum
+    cat > /usr/local/lib/roc-museum/diagnostic_history.py <<'PY_DIAGNOSTIC_HISTORY'
+"""TX-only persistent incident history; never carries PCM or runs on RX."""
+import hashlib
+import json
+from pathlib import Path
+import sqlite3
+import threading
+import time
+
+
+class History:
+    def __init__(self, path='/var/lib/roc-museum/diagnostic-history.sqlite3', limit=1000):
+        self.path=Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.limit=limit
+        self.lock=threading.Lock()
+        self.active={}
+        self.error=''
+        with self.connection() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY, identity TEXT UNIQUE, node TEXT NOT NULL,
+                source TEXT NOT NULL, code TEXT NOT NULL, severity TEXT NOT NULL,
+                summary TEXT NOT NULL, started_at REAL NOT NULL, last_seen REAL NOT NULL,
+                ended_at REAL, observations INTEGER NOT NULL, details TEXT NOT NULL,
+                resolution TEXT NOT NULL DEFAULT '')''')
+            # A restart is a gap in observation, not evidence of recovery.
+            db.execute("UPDATE events SET ended_at=last_seen, resolution='monitor_restart' WHERE ended_at IS NULL")
+
+    def connection(self):
+        # Explicit close as well as commit; sqlite's context manager alone doesn't close.
+        class Transaction:
+            def __enter__(inner):
+                inner.db=sqlite3.connect(self.path,timeout=1)
+                return inner.db
+            def __exit__(inner,kind,error,tb):
+                try:
+                    if kind is None: inner.db.commit()
+                    else: inner.db.rollback()
+                finally: inner.db.close()
+        return Transaction()
+
+    @staticmethod
+    def issues(node):
+        name=str(node.get('name','?'))[:128]
+        if not node.get('online',True):
+            return [(name,'node','OFFLINE','warning','Nodo offline',{})]
+        issues=[]
+        digital=node.get('transport_diagnosis') or node.get('audio_diagnosis') or {}
+        if digital.get('severity') in ('warning','critical') or digital.get('code')=='TX_MONITOR_STALL_UNCONFIRMED':
+            issues.append((name,'transport',str(digital.get('code','UNKNOWN'))[:100],
+                           digital['severity'],str(digital.get('summary',''))[:600],
+                           {'detail':str(digital.get('detail',''))[:1200],
+                            'rtp':node.get('audio_meter',{}).get('integrity',{}),
+                            'power':node.get('throttled'), 'network':node.get('network',{})}))
+        waveform=node.get('waveform_diagnostics') or {}
+        waveform_faults=('dropout','mismatch','missing_return','missing_channel','possible_channel_swap',
+                         'return_clipping','reference_gaps','delay_jump','reference_timeout','capture_interrupted','error')
+        if waveform.get('confirmed') or waveform.get('status') in waveform_faults:
+            issues.append((name,'waveform',str(waveform.get('status','unknown'))[:100],
+                           'warning' if waveform.get('confirmed') else 'info',
+                           (('' if waveform.get('confirmed') else 'Osservazione da confermare: ')+str(waveform.get('message','')))[:600],
+                           {k:waveform[k] for k in ('confirmed','estimated_delay_ms','delay_change_ms','channels','rtp',
+                                                   'reference_coverage','confidence') if k in waveform}))
+        analog=node.get('analog_return') or {}
+        if analog.get('status') in ('missing_return','capture_clipping','audio_while_muted','unexpected_audio'):
+            # A recent aligned comparison takes precedence over a stale level meter.
+            if waveform.get('status') in (None,'unavailable','error') or analog['status'] in ('capture_clipping','audio_while_muted'):
+                issues.append((name,'analog',analog['status'],'warning',str(analog.get('message',''))[:600],
+                               {'channels':analog.get('channels',[])}))
+        for key in ('roc_last_error','roc_last_warning'):
+            message=str(node.get(key) or '')[:1200]
+            if message:
+                code=hashlib.sha256(message.encode()).hexdigest()[:16]
+                issues.append((name,key,code,'warning',message,{}))
+        return issues
+
+    @staticmethod
+    def details(value):
+        encoded=json.dumps(value,ensure_ascii=False,allow_nan=False)
+        # Bound untrusted heartbeat data before storing it.
+        if len(encoded)>6000:
+            encoded=json.dumps({'excerpt':encoded[:5500],'truncated':True},ensure_ascii=False)
+        return encoded
+
+    def observe(self, nodes, now=None):
+        now=time.time() if now is None else now
+        with self.lock:
+            active=dict(self.active)
+            current=set()
+            offline={str(node.get('name','?'))[:128] for node in nodes if not node.get('online',True)}
+            present={str(node.get('name','?'))[:128] for node in nodes}
+            with self.connection() as db:
+                for node in nodes:
+                    for name,source,code,severity,summary,detail in self.issues(node):
+                        key=(name,source,code)
+                        current.add(key)
+                        encoded=self.details(detail)
+                        if key in active:
+                            db.execute('''UPDATE events SET last_seen=?, observations=observations+1, details=?,
+                                       summary=CASE WHEN severity IN ('warning','critical') AND ?='info' THEN summary ELSE ? END,
+                                       severity=CASE WHEN severity='critical' OR (severity='warning' AND ?='info') THEN severity ELSE ? END
+                                       WHERE id=?''',(now,encoded,severity,summary,severity,severity,active[key]))
+                        else:
+                            cursor=db.execute('''INSERT INTO events
+                                (node,source,code,severity,summary,started_at,last_seen,observations,details)
+                                VALUES (?,?,?,?,?,?,?,1,?)''',(name,source,code,severity,summary,now,now,encoded))
+                            active[key]=cursor.lastrowid
+                    # RX sends only its most recent evidence: persist it even if status recovered.
+                    for artifact in (node.get('waveform_diagnostics') or {}).get('events',[])[:1]:
+                        path=str(artifact.get('path',''))[:512]
+                        if not path: continue
+                        name=str(node.get('name','?'))[:128]
+                        identity=hashlib.sha256((name+'\0'+path).encode()).hexdigest()
+                        db.execute('''INSERT OR IGNORE INTO events
+                            (identity,node,source,code,severity,summary,started_at,last_seen,ended_at,observations,details,resolution)
+                            VALUES (?,?,?,?,?,?,?,?,?,1,?,?)''',
+                            (identity,name,'evidence',str(artifact.get('status','unknown'))[:100],'warning',
+                             'Evidenza audio salvata sulla RX',now,now,now,
+                             self.details({'path':path,'rx_triggered_at':artifact.get('triggered_at')}),'artifact'))
+                for key in list(active):
+                    if key not in current:
+                        resolution='node_offline' if key[0] in offline else ('observation_lost' if key[0] not in present else 'recovered')
+                        db.execute('UPDATE events SET ended_at=?, resolution=? WHERE id=?',(now,resolution,active.pop(key)))
+                db.execute('DELETE FROM events WHERE ended_at IS NOT NULL AND ended_at<?',(now-30*86400,))
+                db.execute('''DELETE FROM events WHERE ended_at IS NOT NULL AND id NOT IN
+                    (SELECT id FROM events ORDER BY id DESC LIMIT ?)''',(self.limit,))
+            self.active=active
+            self.error=''
+
+    def query(self, node=None, limit=100):
+        limit=max(1,min(1000,int(limit)))
+        with self.lock, self.connection() as db:
+            db.row_factory=sqlite3.Row
+            where=' WHERE node=?' if node else ''
+            params=(node,limit) if node else (limit,)
+            records=[]
+            for row in db.execute('SELECT * FROM events'+where+' ORDER BY id DESC LIMIT ?',params):
+                record=dict(row);record.pop('identity',None)
+                record['details']=json.loads(record['details'])
+                record['active']=record['ended_at'] is None
+                record['observed_duration_seconds']=round(max(0,(record['ended_at'] or record['last_seen'])-record['started_at']),1)
+                records.append(record)
+            return {'events':records,'retention_days':30,'limit':self.limit,'error':self.error,
+                    'time_basis':'TX observation; durations are sampled, not exact audio fault lengths'}
+PY_DIAGNOSTIC_HISTORY
+    chmod 0644 /usr/local/lib/roc-museum/diagnostic_history.py
     cat > /usr/local/lib/roc-museum/rx_diagnostics.py <<'PY_RX_DIAGNOSTICS'
 """Bounded RX RTP/analog diagnostics. No playback, network or capture ownership."""
 import json
@@ -3382,17 +3576,20 @@ function placeDashboard(){
   var summary=document.getElementById('summary');
   var nodes=document.getElementById('nodes');
   var footer=document.getElementById('footer');
+  var history=document.getElementById('diagnosticHistory');
   if(!systemHost||!publicHome||!summary||!nodes||!footer){return;}
 
   if(authorized){
     if(summary.parentNode!==systemHost){
       systemHost.appendChild(summary);
       systemHost.appendChild(nodes);
+      if(history)systemHost.appendChild(history);
       systemHost.appendChild(footer);
     }
   }else if(summary.parentNode!==publicHome){
     publicHome.appendChild(summary);
     publicHome.appendChild(nodes);
+    if(history)publicHome.appendChild(history);
     publicHome.appendChild(footer);
   }
 }

@@ -735,3 +735,42 @@ della scheda né carica il modulo DSP per questa funzione. Le dipendenze restano
 installate per consentire l'attivazione automatica al collegamento, senza
 installazioni o download a runtime. Quando l'analisi è attiva, l'heartbeat riporta
 solo l'ultima evidenza salvata anziché una cronologia di eventi duplicata.
+
+## Storico diagnostico persistente · v4.28
+
+Il TX registra automaticamente le diagnosi ogni heartbeat, anche senza browser
+aperto, in `/var/lib/roc-museum/diagnostic-history.sqlite3`. Gli RX non caricano
+il modulo storico e il loro heartbeat non cambia rispetto alla v4.27.
+
+Nella dashboard, **Storico diagnostico** mostra gli eventi anche dopo il rientro:
+nodo, codice, origine (RTP, ritorno, Roc, offline o evidenza audio), prima/ultima
+osservazione, fine e numero di campioni. Si può filtrare per nome esatto del nodo
+ed esportare JSON. La sezione segue la dashboard nella scheda Sistema dopo il
+login. A sezione chiusa non vengono richiesti dati storici; se aperta aggiorna
+ogni 10 s, mostrando al massimo 100 eventi (export fino a 1000).
+
+Un errore continuo viene aggiornato nello stesso record, anziché creare una riga
+ogni 5 s. Al rientro il record rimane nello storico; una ricomparsa crea un nuovo
+evento. Il riavvio del monitor chiude le osservazioni precedenti come esito non
+osservato, e un RX offline non viene interpretato come recupero dell'audio.
+Le osservazioni TX non confermate dagli RX e i confronti analogici ancora da
+confermare vengono conservati come informazioni, senza presentarli come guasti
+accertati. Una successiva conferma aggiorna lo stesso incidente.
+Le evidenze audio segnalate dalla RX sono archiviate una sola volta anche se il
+ritorno è già tornato regolare: il percorso si riferisce al file sul ricevitore,
+non a un allegato scaricato sul TX. Gli audio restano soggetti alla rotazione RX.
+
+Conservazione: 30 giorni e fino a 1000 record conclusi, oltre agli eventi ancora
+in corso. I dettagli sono limitati a 6 kB per record. La durata è quella della
+**condizione osservata**, inclusa la finestra del meter RTP, non la lunghezza
+esatta del dropout. Gli orari della lista sono osservazioni del TX; l'orario RX
+del trigger audio è separato nei dettagli. Errori di archiviazione sono visibili
+nello storico e nel journal senza fermare il monitor o la riproduzione.
+
+API di sola lettura: `/api/diagnostics/history?node=RX-51&limit=100`. Come lo stato
+corrente, lo storico è consultabile dalla dashboard pubblica. La registrazione
+parte dall'aggiornamento del **TX**: non recupera retroattivamente gli avvisi
+scomparsi. Gli RX v4.26/v4.27 sono compatibili; non serve aggiornarli per avere
+lo storico degli heartbeat già trasmessi. Restano i limiti di campionamento:
+anomalie più brevi dell'heartbeat richiedono un'evidenza salvata dalla RX e non
+sono tutte garantite come eventi dello storico centrale.
