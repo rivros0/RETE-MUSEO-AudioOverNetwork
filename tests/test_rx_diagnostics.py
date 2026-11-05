@@ -24,7 +24,7 @@ class WaveformTests(unittest.TestCase):
         result=d.compare(self.ref,self.heard)
         self.assertEqual(result['status'],'matched',result)
         for c in result['channels']:
-            self.assertAlmostEqual(c['offset']/4000,2,delta=.001)
+            self.assertAlmostEqual(c['offset']/result['analysis_rate'],2,delta=.001)
             self.assertGreater(c['correlation'],.95)
             self.assertAlmostEqual(c['gain_db'],-7.96,delta=.6)
 
@@ -68,6 +68,15 @@ class WaveformTests(unittest.TestCase):
         result=d.compare(self.ref,heard,channel_map=[1,0])
         self.assertEqual(result['channel_map'],[1,0])
         self.assertEqual(result['status'],'missing_channel',result)
+
+    def test_rate_compensation_matches_an_independent_adc_clock(self):
+        actual_rate=16000/1.0004
+        frames=int(actual_rate*2.5)
+        position=44100+d.np.arange(frames)*44100/actual_rate
+        heard=d.np.stack([d.np.interp(position,d.np.arange(len(self.ref)),self.ref[:,ch]) for ch in range(2)],axis=1)*.4
+        result=d.compare(self.ref,heard,capture_rate=actual_rate)
+        self.assertEqual(result['status'],'matched',result)
+        self.assertGreater(min(c['correlation'] for c in result['channels']),.95)
 
     def test_single_missing_channel(self):
         self.heard[:, 1]=0
@@ -205,6 +214,49 @@ class StreamTests(unittest.TestCase):
             diag.analyze(10.6)
             self.assertFalse(diag.snapshot()['confirmed'])
 
+    def test_known_adc_xrun_does_not_blame_playback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diag=self.synthetic_stream(directory)
+            diag.capture[-1][1][6400:8000]=0
+            diag.update_capture_health({'xrun_events':1,'last_xrun_monotonic':10.2,'last_message':'overrun!!!'})
+            diag.analyze(10.25)
+            result=diag.snapshot()
+            self.assertEqual(result['status'],'capture_unreliable',result)
+            self.assertEqual(result['observed_audio_status'],'dropout')
+            self.assertFalse(result['confirmed'])
+            self.assertIsNone(diag.pending)
+
+    def test_calibrated_adc_clock_removes_large_cumulative_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diag=self.synthetic_stream(directory)
+            count=diag.capture[-1][3]
+            # A prior 250 ppm offset may amount to seconds after hours, while
+            # the current packet/capture alignment is still the same.
+            diag.capture_clock.raw_origin=(count-16000*12000,10.25-12003)
+            diag.capture_clock.fit=(count,10.25,1.00025,0)
+            diag.capture_clock.span=120
+            diag.reference_clock.fit=(176400,10,1,0)
+            diag.analyze(10.25)
+            result=diag.snapshot()
+            self.assertEqual(result['status'],'matched',result)
+            self.assertAlmostEqual(result['estimated_delay_ms'],1250,delta=2)
+            self.assertEqual(result['timing_confidence'],'calibrated_estimate')
+            self.assertAlmostEqual(result['clock_diagnostics']['adc']['raw_offset_ms'],3000,delta=1)
+            self.assertFalse(result['confirmed'])
+
+    def test_out_of_band_audio_is_not_a_missing_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diag=self.synthetic_stream(directory)
+            for _, stamp, data in diag.reference:
+                t=(d.np.arange(len(data))+stamp)/44100
+                data[:]=(.2*d.np.sin(2*d.np.pi*3000*t))[:,None]
+            t=d.np.arange(16000)/16000
+            diag.capture[-1][1][:]=(.2*d.np.sin(2*d.np.pi*3000*t))[:,None]
+            diag.analyze(10.25)
+            result=diag.snapshot()
+            self.assertNotEqual(result['status'],'missing_return',result)
+            self.assertFalse(result['confirmed'])
+
     def test_worker_reports_its_cpu_cost_and_stops(self):
         diag=d.Diagnostics()
         stop=d.threading.Event()
@@ -252,3 +304,43 @@ class ParserTests(unittest.TestCase):
         for packet in (b'',bytes(12),struct.pack('!BBHII',0x90,10,0,0,0),
                        struct.pack('!BBHII',0x80,10,0,0,0)+bytes(3)):
             self.assertIsNone(d.decode_rtp(packet))
+
+class ClockModelTests(unittest.TestCase):
+    def test_known_clock_drift_and_jitter_are_separated(self):
+        clock=d.ClockModel(16000)
+        for i in range(180):
+            seconds=i*.5
+            jitter=.0004*__import__('math').sin(i)
+            clock.observe(i*8000,100+seconds*1.00025+jitter)
+        result=clock.summary(179*8000,100+89.5*1.00025)
+        self.assertTrue(result['fit_valid'],result)
+        self.assertAlmostEqual(result['drift_ppm'],250,delta=5)
+        self.assertLess(abs(result['residual_ms']),1)
+        self.assertGreater(result['raw_offset_ms'],20)
+        self.assertLess(abs(clock.effective_rate-16000/1.00025),.1)
+
+    def test_one_delayed_read_does_not_become_a_clock_step(self):
+        clock=d.ClockModel(16000)
+        for i in range(100): clock.observe(i*8000,100+i*.5)
+        clock.observe(100*8000,150.05)
+        self.assertAlmostEqual(clock.sample_time(100*8000),150,delta=.002)
+        self.assertEqual(clock.steps,0)
+        clock.observe(101*8000,150.5)
+        self.assertTrue(clock.summary(101*8000,150.5)['fit_valid'])
+
+    def test_persistent_delivery_step_starts_new_calibration(self):
+        clock=d.ClockModel(16000)
+        for i in range(100): clock.observe(i*8000,100+i*.5)
+        for i in range(100,103): clock.observe(i*8000,100+i*.5+.08)
+        result=clock.summary(102*8000,151.08)
+        self.assertEqual(result['delivery_steps'],1)
+        self.assertFalse(result['fit_valid'])
+        self.assertAlmostEqual(result['raw_offset_ms'],80,delta=.1)
+
+    def test_short_or_implausible_fit_is_not_certified(self):
+        clock=d.ClockModel(16000)
+        for i in range(30): clock.observe(i*8000,100+i*.5)
+        self.assertFalse(clock.summary(29*8000,114.5)['fit_valid'])
+        clock=d.ClockModel(16000)
+        for i in range(120): clock.observe(i*8000,100+i*.5*1.01)
+        self.assertFalse(clock.summary(119*8000,100+59.5*1.01)['fit_valid'])

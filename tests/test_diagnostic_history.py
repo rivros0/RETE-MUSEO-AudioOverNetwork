@@ -142,6 +142,20 @@ class MonitorHistoryTests(unittest.TestCase):
             monitor.record_diagnostic_history({'ROLE':'tx'})
             self.assertEqual(monitor.HISTORY_ERROR,'disk full')
 
+    def test_probe_report_is_read_only_and_keeps_node_filter(self):
+        handler=object.__new__(monitor.Handler);handler.json_reply=Mock()
+        handler.path='/api/diagnostics/report?node=RX-93'
+        history=Mock();history.query.return_value={'events':[]}
+        status={'generated_at':100,'software_version':'4.32','nodes':[{'name':'RX-91'},{'name':'RX-93'}]}
+        with patch.object(monitor,'HISTORY',history),patch.object(monitor,'HISTORY_ERROR',''),patch.object(monitor,'system_status',return_value=status):
+            handler.do_GET()
+        code,payload=handler.json_reply.call_args.args
+        self.assertEqual(code,200)
+        self.assertEqual(payload['nodes'],[{'name':'RX-93'}])
+        self.assertEqual(payload['schema_version'],2)
+        history.query.assert_called_once_with('RX-93',20)
+        history.observe.assert_not_called()
+
     def test_endpoint_filter_and_invalid_limit(self):
         handler=object.__new__(monitor.Handler)
         handler.json_reply=Mock()

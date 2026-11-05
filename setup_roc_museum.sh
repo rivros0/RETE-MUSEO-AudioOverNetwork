@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.31
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.32
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.31"
+VERSION="4.32"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.31"
+MONITOR_BUILD="4.32"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -711,6 +711,8 @@ class AnalogReturn:
         self.process=None
         self.diagnostics=None
         self.analysis_error=""
+        self.capture_health={"xrun_events":0,"stderr_messages":0}
+        self.stderr_buffer=""
         self.updated=0
         self.device=device
         self.channels=[]
@@ -725,7 +727,9 @@ class AnalogReturn:
             rms=math.sqrt(sum(v*v for v in values)/len(values))
             channels.append({"rms_dbfs":round(20*math.log10(max(rms,0.52)/32768),1),
                              "clipped":any(abs(v)>=32760 for v in values)})
-        if self.diagnostics is not None and not self.stop_event.is_set(): self.diagnostics.feed_capture(raw,received_at)
+        if self.diagnostics is not None and not self.stop_event.is_set():
+            self.diagnostics.update_capture_health(self.capture_health)
+            self.diagnostics.feed_capture(raw,received_at)
         with self.lock:
             self.channels=channels;self.updated=received_at;self.error=""
 
@@ -755,6 +759,23 @@ class AnalogReturn:
                 status,message="expected_silence","Riferimento e ritorno silenziosi o sotto soglia"
         result.update(status=status,message=message)
         return result
+
+    def note_stderr(self, raw):
+        text=raw.decode("utf-8",errors="replace")
+        self.stderr_buffer=(self.stderr_buffer+text)[-4096:]
+        lines=self.stderr_buffer.split("\n")
+        self.stderr_buffer=lines.pop()
+        for line in lines:
+            if not line.strip(): continue
+            self.capture_health["stderr_messages"]+=1
+            self.capture_health["last_message"]=line[-600:]
+            self.capture_health["last_message_at"]=time.time()
+            if re.search(r"\b(?:overruns?|underruns?|xruns?)\b",line,re.I):
+                self.capture_health["xrun_events"]+=1
+                self.capture_health["last_xrun_monotonic"]=time.monotonic()
+                self.capture_health["last_xrun_at"]=time.time()
+            print("Acquisizione spia: "+line[-600:],flush=True)
+        if self.diagnostics is not None: self.diagnostics.update_capture_health(self.capture_health)
 
     def enable_analysis(self):
         global DIAGNOSTICS
@@ -789,14 +810,20 @@ class AnalogReturn:
         try:
             if not self.device or self.stop_event.is_set(): return
             process=subprocess.Popen(["arecord","-q","-D",self.device,"-t","raw","-f","S16_LE",
-                                      "-r","16000","-c","2","--period-time=20000","--buffer-time=100000"],stdout=subprocess.PIPE,bufsize=0)
+                                      "-r","16000","-c","2","--period-time=20000","--buffer-time=100000"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0)
             with self.lock: self.process=process
             if self.stop_event.is_set(): return
             import select
             buffer=b"";analysis_started=False
+            readers=[process.stdout,process.stderr]
             while not self.stop_event.is_set():
-                ready,_,_=select.select([process.stdout],[],[],3)
+                ready,_,_=select.select(readers,[],[],3)
                 if not ready: raise OSError("Timeout acquisizione Scarlett")
+                if process.stderr in ready:
+                    message=os.read(process.stderr.fileno(),4096)
+                    if message: self.note_stderr(message)
+                    else: readers.remove(process.stderr)
+                if process.stdout not in ready: continue
                 raw=os.read(process.stdout.fileno(),32000-len(buffer))
                 if not raw: raise OSError("Acquisizione Scarlett interrotta o dispositivo occupato")
                 received_at=time.monotonic()
@@ -807,13 +834,15 @@ class AnalogReturn:
                     self.feed(buffer,received_at);buffer=b""
         except (OSError,subprocess.SubprocessError) as error:
             with self.lock:
-                self.error=str(error);self.updated=0;self.channels=[]
+                self.error=str(error)+(": "+self.capture_health["last_message"] if self.capture_health.get("last_message") else "");self.updated=0;self.channels=[]
         finally:
+            if self.stderr_buffer: self.note_stderr(b"\n")
             self.stop()
             if process is not None:
                 try: process.wait(timeout=2)
                 except subprocess.TimeoutExpired: process.kill();process.wait()
                 process.stdout.close()
+                process.stderr.close()
             if self.analysis_thread is not None: self.analysis_thread.join(timeout=5)
             with self.lock:
                 self.process=None;self.diagnostics=None
@@ -1551,7 +1580,7 @@ PAGE=r'''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="
 function volumeBlock(n){if(n.role!=='rx')return '';if(confirmed[n.name]&&Date.now()<confirmed[n.name].until){n=Object.assign({},n,confirmed[n.name]);}var value=Object.prototype.hasOwnProperty.call(drafts,n.name)?drafts[n.name]:(n.volume_percent==null?'':n.volume_percent);knownMute[n.name]=!!n.muted;
 return '<div class="volume"><form class="volumeForm" data-node="'+esc(n.name)+'"><label>Volume uscita (%) <input class="volumeNumber" type="number" min="0" max="100" step="1" required value="'+esc(value)+'" aria-label="Volume '+esc(n.name)+'" '+(!n.online?'disabled':'')+'></label> <button '+(!n.online||pending[n.name]?'disabled':'')+'>Applica</button> <button type="button" class="muteButton" aria-pressed="'+!!n.muted+'" '+(!n.online||pending[n.name]?'disabled':'')+'>'+(n.muted?'Riattiva audio':'Mute')+'</button></form><div role="status" aria-live="polite" class="volumeMsg" id="vol-msg-'+esc(n.name)+'">'+(feedback[n.name]||'')+'</div></div>';}
 function latencyBlock(n){if(n.role!=='rx'){return '';}var target=n.target_latency||'n/d';var rtt=(n.network_rtt_ms==null)?'n/d':esc(n.network_rtt_ms)+' ms';return '<div class="latency"><div class="row"><span class="label">Latenza Roc target</span><span class="value">'+esc(target)+'</span></div><div class="row"><span class="label">RTT rete verso TX</span><span class="value">'+rtt+'</span></div></div>';}function audioDiagnosisBlock(n){var d=n.audio_diagnosis||{};var m=n.audio_meter||{};var i=m.integrity||{};var p=n.throttled||{};if(!d.summary)return '';var html='<section class="autodiag '+esc(d.severity||'info')+'"><strong>Autodiagnosi audio · '+esc(d.summary)+'</strong><small>'+esc(d.detail||'')+'</small>';if(i.window_seconds){html+='<div class="row"><span class="label">RTP ultimi '+esc(i.window_seconds)+' s</span><span class="value">'+esc(i.packets_window||0)+' pacchetti</span></div><div class="row"><span class="label">Pacchetti mancanti/ritardati</span><span class="value">'+esc(i.missing_packets||0)+' · gap max '+esc(i.max_sequence_gap||0)+'</span></div><div class="row"><span class="label">Fuori ordine / duplicati</span><span class="value">'+esc(i.out_of_order_packets||0)+' / '+esc(i.duplicate_packets||0)+'</span></div><div class="row"><span class="label">Pause RTP >40 ms</span><span class="value">'+esc(i.transport_stalls||0)+' · max '+esc(i.max_transport_gap_ms||0)+' ms</span></div><div class="row"><span class="label">Jitter stimato</span><span class="value">'+esc(i.jitter_ms||0)+' ms</span></div>';}if(p.raw){var power='OK';if(p.active){power='ATTIVO: '+(p.current_flags||[]).join(', ');}else if(p.historical){power='OK ora · storico: '+(p.historical_flags||[]).join(', ');}html+='<div class="row"><span class="label">Alimentazione/termica</span><span class="value">'+esc(power)+' · '+esc(p.raw)+'</span></div>';}var net=n.network||{};var delta=(net.rx_errors_delta||0)+(net.rx_dropped_delta||0)+(net.tx_errors_delta||0)+(net.tx_dropped_delta||0);var total=(net.rx_errors||0)+(net.rx_dropped||0)+(net.tx_errors||0)+(net.tx_dropped||0);html+='<div class="row"><span class="label">Ethernet errori/drop</span><span class="value">nuovi '+esc(delta)+' · totale '+esc(total)+'</span></div>';html+='</section>';return html;}
-function diagnosticsBlock(n){var body='';var d=n.waveform_diagnostics;if(d){if(d.channel_mapping){body+='<div class="row"><span class="label">Mappa ritorno</span><span class="value">'+(d.channel_mapping==='swapped'?'L/R invertiti · compensazione attiva':'L/R diretti')+'</span></div>';}if(d.timing_observation){body+='<div class="row"><span class="label">Misura temporale · informazione</span><span class="value">'+esc(d.timing_message)+'</span></div>';}if(d.capture_timing){body+='<div class="row"><span class="label">Scarto consegna ADC / campioni</span><span class="value">'+esc(d.capture_timing.delivery_offset_ms)+' ms</span></div>';}if(d.workload){body+='<div class="row"><span class="label">Analisi spia · solo worker</span><span class="value">'+esc(d.workload.analysis_wall_ms)+' ms · CPU '+esc(d.workload.analysis_core_percent)+'% di un core'+(d.workload.over_budget?' · costo elevato':'')+'</span></div>';}body+='<div class="row"><span class="label">Confronto forme d’onda · '+esc(d.status)+'</span><span class="value">'+esc(d.message)+' · confidenza '+esc(d.confidence||'n/d')+'</span></div>';if(d.estimated_delay_ms!=null){body+='<div class="row"><span class="label">Ritardo stimato RTP → ADC</span><span class="value">'+esc(d.estimated_delay_ms)+' ms · variazione '+esc(d.delay_change_ms)+' ms</span></div>';}if(d.delay_trend_ms_per_minute!=null){body+='<div class="row"><span class="label">Deriva del ritardo stimato</span><span class="value">'+esc(d.delay_trend_ms_per_minute)+' ms/min</span></div>';}if(d.rtp){body+='<div class="row"><span class="label">RTP · jitter / gap / fuori ordine</span><span class="value">'+esc(Number(d.rtp.jitter_ms).toFixed(2))+' ms / '+esc(d.rtp.sequence_gaps)+' / '+esc(d.rtp.out_of_order)+'</span></div>';}if(d.channels){d.channels.forEach(function(c){body+='<div class="row"><span class="label">Canale '+esc(c.channel+1)+'</span><span class="value">'+esc(c.status)+' · correlazione '+esc(c.correlation)+' · gain '+esc(c.gain_db)+' dB · residuo '+esc(c.residual_db)+' dB</span></div>';});}if(d.events&&d.events.length){var e=d.events[d.events.length-1];body+='<div class="row"><span class="label">Ultima evidenza su RX</span><span class="value">'+esc(e.status)+' · '+esc(e.path)+'</span></div>';}if(d.storage_error){body+='<div class="row"><span class="label">Errore archivio diagnostico</span><span class="value">'+esc(d.storage_error)+'</span></div>';}}if(n.analog_return){body+='<div class="row"><span class="label">Ritorno analogico · '+esc(n.analog_return.status)+'</span><span class="value">'+esc(n.analog_return.message)+'</span></div>';}if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc e ritorno analogico</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
+function diagnosticsBlock(n){var body='';var d=n.waveform_diagnostics;if(d){if(d.channel_mapping){body+='<div class="row"><span class="label">Mappa ritorno</span><span class="value">'+(d.channel_mapping==='swapped'?'L/R invertiti · compensazione attiva':'L/R diretti')+'</span></div>';}if(d.timing_observation){body+='<div class="row"><span class="label">Misura temporale · informazione</span><span class="value">'+esc(d.timing_message)+'</span></div>';}if(d.capture_timing){body+='<div class="row"><span class="label">Scarto cumulativo ADC · non è la latenza</span><span class="value">'+esc(d.capture_timing.delivery_offset_ms)+' ms</span></div>';}if(d.clock_diagnostics){var a=d.clock_diagnostics.adc||{},r=d.clock_diagnostics.rtp||{};body+='<div class="row"><span class="label">Clock ADC / RTP</span><span class="value">'+esc(a.drift_ppm)+' / '+esc(r.drift_ppm)+' ppm · '+(a.fit_valid&&r.fit_valid?'stima calibrata':'calibrazione in corso')+'</span></div><div class="row"><span class="label">Residuo consegna ADC</span><span class="value">'+esc(a.residual_ms)+' ms · '+esc(d.timing_confidence)+'</span></div>';}if(d.capture_health&&d.capture_health.xrun_events){body+='<div class="row"><span class="label">Overrun/xrun cattura spia</span><span class="value">'+esc(d.capture_health.xrun_events)+' · '+esc(d.capture_health.last_message)+'</span></div>';}if(d.workload){body+='<div class="row"><span class="label">Analisi spia · solo worker</span><span class="value">'+esc(d.workload.analysis_wall_ms)+' ms · periodo '+esc(d.workload.analysis_target_period_seconds)+' s · CPU '+esc(d.workload.analysis_core_percent)+'% di un core'+(d.workload.over_budget?' · costo elevato':'')+'</span></div>';}body+='<div class="row"><span class="label">Confronto forme d’onda · '+esc(d.status)+'</span><span class="value">'+esc(d.message)+' · confidenza '+esc(d.confidence||'n/d')+'</span></div>';if(d.estimated_delay_ms!=null){body+='<div class="row"><span class="label">Ritardo stimato RTP → ADC</span><span class="value">'+esc(d.estimated_delay_ms)+' ms · variazione '+esc(d.delay_change_ms)+' ms</span></div>';}if(d.delay_trend_ms_per_minute!=null){body+='<div class="row"><span class="label">Deriva del ritardo stimato</span><span class="value">'+esc(d.delay_trend_ms_per_minute)+' ms/min</span></div>';}if(d.rtp){body+='<div class="row"><span class="label">RTP · jitter / gap / fuori ordine</span><span class="value">'+esc(Number(d.rtp.jitter_ms).toFixed(2))+' ms / '+esc(d.rtp.sequence_gaps)+' / '+esc(d.rtp.out_of_order)+'</span></div>';}if(d.workload&&d.workload.stage_cpu_ms){body+='<div class="row"><span class="label">CPU filtro / confronto / buffer</span><span class="value">'+esc(d.workload.stage_cpu_ms.resample)+' / '+esc(d.workload.stage_cpu_ms.compare)+' / '+esc(d.workload.stage_cpu_ms.buffers)+' ms</span></div>';}if(d.channels){d.channels.forEach(function(c){body+='<div class="row"><span class="label">Canale '+esc(c.channel+1)+'</span><span class="value">'+esc(c.status)+' · correlazione '+esc(c.correlation)+' · gain '+esc(c.gain_db)+' dB · residuo '+esc(c.residual_db)+' dB</span></div>';});}if(d.events&&d.events.length){var e=d.events[d.events.length-1];body+='<div class="row"><span class="label">Ultima evidenza su RX</span><span class="value">'+esc(e.status)+' · '+esc(e.path)+'</span></div>';}if(d.storage_error){body+='<div class="row"><span class="label">Errore archivio diagnostico</span><span class="value">'+esc(d.storage_error)+'</span></div>';}}if(n.analog_return){body+='<div class="row"><span class="label">Ritorno analogico · '+esc(n.analog_return.status)+'</span><span class="value">'+esc(n.analog_return.message)+'</span></div>';}if(n.roc_last_error){body+='<div class="row"><span class="label">Ultimo errore Roc</span><span class="value">'+esc(n.roc_last_error)+'</span></div>';}if(n.roc_last_warning){body+='<div class="row"><span class="label">Ultimo avviso Roc</span><span class="value">'+esc(n.roc_last_warning)+'</span></div>';}if(!body){body='<div class="row"><span class="label">Roc</span><span class="value">nessun errore recente</span></div>';}return '<details class="diag"><summary>Diagnostica Roc e ritorno analogico</summary><div class="diagBody">'+body+'</div></details>';}function meterBlock(n){
 var m=n.audio_meter;var rx=n.role==='rx';var title=rx?'Uscita RX':'Trasmissione TX · microfono + musica';
 if(!n.online||!m||!m.available){return '<section class="meter"><strong>'+title+'</strong><small>'+esc(!n.online?'Nodo offline':m?m.error:'Aggiornare il monitor del nodo')+'</small></section>';}
 var age=rx?m.input_clip_age_seconds:m.clip_age_seconds;var clipped=age!=null&&age<30;
@@ -1632,10 +1661,10 @@ setInterval(renderTxClock,1000);
 PAGE=PAGE.replace('<script>function esc','<script>'+CLOCK_JS+'function esc',1)
 PAGE=PAGE.replace("var data=await response.json();", "var data=await response.json();syncTxClock(data.generated_at);",1)
 
-HISTORY_UI=r'''<details id="diagnosticHistory" class="box" style="margin-top:18px"><summary>Storico diagnostico · eventi conservati dopo il rientro</summary><p>Orari del TX · durata osservata a campioni, non durata esatta del difetto audio. Ultimi 100 eventi; conservazione 30 giorni / 1000 eventi conclusi.</p><label>Nodo <input id="historyNode" placeholder="Tutti i nodi" aria-label="Filtra storico per nome nodo"></label> <button type="button" id="historyRefresh">Aggiorna storico</button> <a id="historyExport" href="/api/diagnostics/history?limit=1000" download="storico-diagnostico.json">Scarica JSON</a><p id="historyMessage" role="status"></p><div id="historyRows"></div></details>'''
+HISTORY_UI=r'''<details id="diagnosticHistory" class="box" style="margin-top:18px"><summary>Storico diagnostico · eventi conservati dopo il rientro</summary><p>Orari del TX · durata osservata a campioni, non durata esatta del difetto audio. Ultimi 100 eventi; conservazione 30 giorni / 1000 eventi conclusi.</p><label>Nodo <input id="historyNode" placeholder="Tutti i nodi" aria-label="Filtra storico per nome nodo"></label> <button type="button" id="historyRefresh">Aggiorna storico</button> <a id="historyExport" href="/api/diagnostics/history?limit=1000" download="storico-diagnostico.json">Scarica JSON</a> · <a id="historyReport" href="/api/diagnostics/report" download="rapporto-spia.json">Scarica rapporto spia</a><p id="historyMessage" role="status"></p><div id="historyRows"></div></details>'''
 HISTORY_JS=r'''var historyLast=0,historyBusy=false;
 function historyTime(value){return value==null?'—':new Date(value*1000).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}
-async function loadDiagnosticHistory(force){var panel=document.getElementById('diagnosticHistory');if(!panel||!panel.open||historyBusy||(!force&&Date.now()-historyLast<10000))return;historyBusy=true;try{var node=document.getElementById('historyNode').value.trim();var query=node?'&node='+encodeURIComponent(node):'';document.getElementById('historyExport').href='/api/diagnostics/history?limit=1000'+query;var response=await fetch('/api/diagnostics/history?limit=100'+query,{cache:'no-store'});var data=await response.json();if(!response.ok)throw new Error(data.error||'Storico non disponibile');var html='';(data.events||[]).forEach(function(e){var state=e.active?'In corso':e.resolution==='monitor_restart'?'Monitor riavviato: esito non osservato':e.resolution==='artifact'?'Evidenza salvata':e.resolution==='node_offline'?'Osservazione interrotta: nodo offline':e.resolution==='observation_lost'?'Osservazione interrotta':'Rientrato';html+='<article class="diag"><strong>'+esc(e.node)+' · '+esc(e.summary)+'</strong><div class="row"><span>'+esc(e.source)+' · '+esc(e.code)+'</span><span>'+esc(state)+'</span></div><div>Inizio '+esc(historyTime(e.started_at))+' · ultima osservazione '+esc(historyTime(e.last_seen))+' · fine '+esc(historyTime(e.ended_at))+'</div><div>Durata osservata '+esc(e.observed_duration_seconds)+' s · campioni '+esc(e.observations)+'</div><details><summary>Dettagli ed evidenze</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e.details,null,2))+'</pre></details></article>';});document.getElementById('historyRows').innerHTML=html||'<p>Nessun evento registrato.</p>';document.getElementById('historyMessage').textContent=(data.error?'Errore salvataggio: '+data.error+' · ':'')+'Aggiornato '+new Date().toLocaleTimeString('it-IT');historyLast=Date.now();}catch(error){document.getElementById('historyMessage').textContent='Errore storico: '+error.message;}finally{historyBusy=false;}}
+async function loadDiagnosticHistory(force){var panel=document.getElementById('diagnosticHistory');if(!panel||!panel.open||historyBusy||(!force&&Date.now()-historyLast<10000))return;historyBusy=true;try{var node=document.getElementById('historyNode').value.trim();var query=node?'&node='+encodeURIComponent(node):'';document.getElementById('historyExport').href='/api/diagnostics/history?limit=1000'+query;document.getElementById('historyReport').href='/api/diagnostics/report'+(node?'?node='+encodeURIComponent(node):'');var response=await fetch('/api/diagnostics/history?limit=100'+query,{cache:'no-store'});var data=await response.json();if(!response.ok)throw new Error(data.error||'Storico non disponibile');var html='';(data.events||[]).forEach(function(e){var state=e.active?'In corso':e.resolution==='monitor_restart'?'Monitor riavviato: esito non osservato':e.resolution==='artifact'?'Evidenza salvata':e.resolution==='node_offline'?'Osservazione interrotta: nodo offline':e.resolution==='observation_lost'?'Osservazione interrotta':'Rientrato';html+='<article class="diag"><strong>'+esc(e.node)+' · '+esc(e.summary)+'</strong><div class="row"><span>'+esc(e.source)+' · '+esc(e.code)+'</span><span>'+esc(state)+'</span></div><div>Inizio '+esc(historyTime(e.started_at))+' · ultima osservazione '+esc(historyTime(e.last_seen))+' · fine '+esc(historyTime(e.ended_at))+'</div><div>Durata osservata '+esc(e.observed_duration_seconds)+' s · campioni '+esc(e.observations)+'</div><details><summary>Dettagli ed evidenze</summary><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(JSON.stringify(e.details,null,2))+'</pre></details></article>';});document.getElementById('historyRows').innerHTML=html||'<p>Nessun evento registrato.</p>';document.getElementById('historyMessage').textContent=(data.error?'Errore salvataggio: '+data.error+' · ':'')+'Aggiornato '+new Date().toLocaleTimeString('it-IT');historyLast=Date.now();}catch(error){document.getElementById('historyMessage').textContent='Errore storico: '+error.message;}finally{historyBusy=false;}}
 window.addEventListener('DOMContentLoaded',function(){var panel=document.getElementById('diagnosticHistory');if(!panel)return;panel.addEventListener('toggle',function(){loadDiagnosticHistory(true);});document.getElementById('historyRefresh').onclick=function(){loadDiagnosticHistory(true);};document.getElementById('historyNode').onchange=function(){loadDiagnosticHistory(true);};setInterval(function(){loadDiagnosticHistory(false);},10000);});
 '''
 PAGE=PAGE.replace('<footer id="footer">',HISTORY_UI+'<footer id="footer">',1)
@@ -1733,6 +1762,25 @@ class Handler(BaseHTTPRequestHandler):
             DEBUG_SLOTS.release()
 
     def do_GET(self):
+        if urlsplit(self.path).path=="/api/diagnostics/report":
+            try:
+                query=parse_qs(urlsplit(self.path).query)
+                node=query.get("node",[""])[0][:128] or None
+                status=system_status(self.config)
+                nodes=[item for item in status["nodes"] if node is None or item.get("name")==node]
+                if node is not None and not nodes:
+                    self.json_reply(404,{"error":"Nodo non presente nel registro TX"});return
+                history=HISTORY.query(node,20) if HISTORY is not None else {"events":[]}
+                self.json_reply(200,{"schema_version":2,"generated_at":status["generated_at"],
+                    "software_version":status["software_version"],"nodes":nodes,
+                    "recent_history":history,"history_error":HISTORY_ERROR,
+                    "notes":["Orari e durate sono osservazioni campionate del TX",
+                             "La stima dei clock usa timestamp software: può includere effetti di acquisizione",
+                             "workload misura il solo worker, non tutta la CPU del Raspberry",
+                             "Nessun PCM audio è incluso nel rapporto"]})
+            except Exception as error:
+                self.json_reply(503,{"error":"Rapporto non disponibile: "+str(error)})
+            return
         if self.path=="/api/latency":
             if not self.require_auth(): return
             if LATENCY_FLEET is None:
@@ -2321,11 +2369,11 @@ class History:
                            'warning' if waveform.get('confirmed') else 'info',
                            (('' if waveform.get('confirmed') else 'Osservazione da confermare: ')+str(waveform.get('message','')))[:600],
                            {k:waveform[k] for k in ('confirmed','estimated_delay_ms','delay_change_ms','channels','rtp',
-                                                   'reference_coverage','confidence','channel_mapping','channel_map','capture_timing','workload') if k in waveform}))
+                                                   'reference_coverage','confidence','channel_mapping','channel_map','capture_timing','workload','clock_diagnostics','capture_health','timing_confidence','observed_audio_status') if k in waveform}))
         if waveform.get('timing_observation'):
             issues.append((name,'probe_timing',str(waveform['timing_observation'])[:100],'info',
                            str(waveform.get('timing_message','Variazione della misura temporale'))[:600],
-                           {k:waveform[k] for k in ('estimated_delay_ms','delay_change_ms','capture_timing','workload') if k in waveform}))
+                           {k:waveform[k] for k in ('estimated_delay_ms','delay_change_ms','capture_timing','workload','clock_diagnostics','capture_health','timing_confidence','observed_audio_status') if k in waveform}))
         if waveform.get('workload',{}).get('over_budget'):
             issues.append((name,'probe_runtime','ANALYSIS_COST','info','Costo elevato del worker di analisi spia',
                            waveform['workload']))
@@ -2416,6 +2464,7 @@ PY_DIAGNOSTIC_HISTORY
 """Bounded RX RTP/analog diagnostics. No playback, network or capture ownership."""
 import json
 import math
+import statistics
 from pathlib import Path
 import struct
 import subprocess
@@ -2428,6 +2477,86 @@ try:
     import numpy as np
 except ImportError:
     np = None
+
+
+ANALYSIS_RATE=2000
+
+
+class ClockModel:
+    """Bounded affine sample-counter/host fit, not a hardware timestamp source."""
+    def __init__(self, rate):
+        self.rate=rate
+        self.points=deque(maxlen=240)
+        self.raw_origin=None
+        self.fit=None
+        self.span=0.
+        self.scatter=None
+        self.step_hits=0
+        self.steps=0
+        self.last_step=None
+
+    def observe(self, count, now):
+        if self.raw_origin is None: self.raw_origin=(count,now)
+        if self.points and (count<=self.points[-1][0] or now-self.points[-1][1]<.4): return
+        if self.fit is not None:
+            residual=now-self.sample_time(count)
+            if abs(residual)>.020:
+                self.step_hits=self.step_hits+1 if self.last_step is not None and residual*self.last_step[0]>0 else 1
+                self.last_step=(residual,now)
+                if self.step_hits>=3:
+                    self.steps+=1;self.points.clear();self.fit=None;self.span=0.;self.scatter=None;self.step_hits=0
+            else: self.step_hits=0
+        self.points.append((count,now))
+        if len(self.points)<20: return
+        self.span=(self.points[-1][0]-self.points[0][0])/self.rate
+        if self.span<30: return
+        base_count,base_time=self.points[0]
+        points=[((c-base_count)/self.rate,t-base_time) for c,t in self.points]
+        def fit(values):
+            mx=sum(x for x,y in values)/len(values);my=sum(y for x,y in values)/len(values)
+            variance=sum((x-mx)**2 for x,y in values)
+            slope=sum((x-mx)*(y-my) for x,y in values)/max(variance,1e-12)
+            return slope,my-slope*mx
+        slope,intercept=fit(points)
+        residuals=[y-(slope*x+intercept) for x,y in points]
+        center=statistics.median(residuals)
+        mad=statistics.median(abs(v-center) for v in residuals)
+        keep=[point for point,residual in zip(points,residuals) if abs(residual-center)<=max(.002,4*mad)]
+        if len(keep)<max(20,len(points)*.75): self.fit=None;return
+        slope,intercept=fit(keep)
+        residuals=sorted(abs(y-(slope*x+intercept)) for x,y in keep)
+        self.scatter=residuals[min(len(residuals)-1,int(len(residuals)*.9))]
+        # A fit outside 0.2% is not explained as normal clock drift.
+        self.fit=(base_count,base_time,slope,intercept) if .998<=slope<=1.002 and self.scatter<.010 else None
+
+    def sample_time(self, count):
+        if self.fit is not None:
+            base_count,base_time,slope,intercept=self.fit
+            return base_time+intercept+slope*(count-base_count)/self.rate
+        if self.points:
+            base_count,base_time=self.points[0]
+            return base_time+(count-base_count)/self.rate
+        return None
+
+    @property
+    def effective_rate(self):
+        return self.rate/self.fit[2] if self.fit is not None else self.rate
+
+    def summary(self, count, now):
+        raw=None if self.raw_origin is None else now-(self.raw_origin[1]+(count-self.raw_origin[0])/self.rate)
+        predicted=self.sample_time(count)
+        return {'fit_valid':self.fit is not None,'nominal_rate':self.rate,
+                'effective_rate':round(self.effective_rate,5),
+                'drift_ppm':None if self.fit is None else round((self.fit[2]-1)*1e6,2),
+                'raw_offset_ms':None if raw is None else round(raw*1000,2),
+                'residual_ms':None if predicted is None else round((now-predicted)*1000,2),
+                'fit_jitter_ms':None if self.scatter is None else round(self.scatter*1000,2),
+                'fit_span_seconds':round(self.span,2),'points':len(self.points),'delivery_steps':self.steps,
+                'last_step_ms':None if self.last_step is None else round(self.last_step[0]*1000,2),
+                'last_step_monotonic':None if self.last_step is None else self.last_step[1],
+                'nominal_elapsed_seconds':None if self.raw_origin is None else round((count-self.raw_origin[0])/self.rate,3),
+                'host_elapsed_seconds':None if self.raw_origin is None else round(now-self.raw_origin[1],3),
+                'time_basis':'software delivery timestamps; rate estimate may include acquisition effects'}
 
 
 def decode_rtp(packet):
@@ -2454,18 +2583,25 @@ def decode_rtp(packet):
     return seq, stamp, ssrc, channels, packet[offset:end]
 
 
-def resample(samples, rate, target=4000):
-    """Low-pass before interpolation; only diagnostic copies are resampled."""
-    taps = 81
-    x = np.arange(taps) - taps // 2
-    cutoff = 0.45 * target / rate
-    kernel = 2 * cutoff * np.sinc(2 * cutoff * x) * np.hamming(taps)
-    kernel /= kernel.sum()
-    filtered = np.stack([np.convolve(samples[:, ch], kernel, mode='same')
-                         for ch in range(samples.shape[1])], axis=1)
-    positions = np.arange(int(len(samples) * target / rate)) * rate / target
-    return np.stack([np.interp(positions, np.arange(len(samples)), filtered[:, ch])
-                     for ch in range(samples.shape[1])], axis=1)
+def resample(samples, rate, target=ANALYSIS_RATE):
+    """Two-stage antialias filtering; only diagnostic copies are resampled."""
+    if rate/target>=7.5:
+        x=np.arange(17)-8
+        kernel=2*.1125*np.sinc(2*.1125*x)*np.hamming(17)
+        kernel/=kernel.sum()
+        samples=np.stack([np.convolve(samples[:,ch],kernel,mode='same')[::4]
+                          for ch in range(samples.shape[1])],axis=1)
+        rate/=4
+    taps=max(17,int(16*rate/target)|1)
+    x=np.arange(taps)-taps//2
+    cutoff=.45*target/rate
+    kernel=2*cutoff*np.sinc(2*cutoff*x)*np.hamming(taps)
+    kernel/=kernel.sum()
+    filtered=np.stack([np.convolve(samples[:,ch],kernel,mode='same')
+                       for ch in range(samples.shape[1])],axis=1)
+    positions=np.arange(int(len(samples)*target/rate))*rate/target
+    return np.stack([np.interp(positions,np.arange(len(samples)),filtered[:,ch])
+                     for ch in range(samples.shape[1])],axis=1)
 
 
 def match_channel(reference, observed):
@@ -2488,7 +2624,7 @@ def match_channel(reference, observed):
     score = float(scores[index])
     # Similar peaks at substantially different delays make latency ambiguous.
     alternatives = np.abs(scores).copy()
-    alternatives[max(0, index-80):index+81] = 0
+    alternatives[max(0, index-int(.020*ANALYSIS_RATE)):index+int(.020*ANALYSIS_RATE)+1] = 0
     ambiguous = bool(alternatives.max(initial=0) > max(0.7, abs(score) * .95))
     segment = reference[index:index+size]
     segment = segment - segment.mean()
@@ -2500,24 +2636,27 @@ def match_channel(reference, observed):
             'residual_db': round(residual_db, 2)}
 
 
-def compare(reference, observed, reference_rate=44100, capture_rate=16000, channel_map=None):
+def compare(reference, observed, reference_rate=44100, capture_rate=16000, channel_map=None, probe_mapping=True):
     """Compare a history reference to the last second of analog audio."""
     if len(reference)/reference_rate < .25 or len(observed)/capture_rate < .25:
         return {'status': 'warming_up', 'message': 'Accumulo delle finestre di confronto'}
+    started=time.thread_time()
     ref = resample(reference, reference_rate)
     heard = resample(observed, capture_rate)
-    if len(heard) < 1000 or len(ref) < len(heard):
+    resample_cpu=(time.thread_time()-started)*1000
+    correlation_started=time.thread_time()
+    if len(heard) < ANALYSIS_RATE//4 or len(ref) < len(heard):
         return {'status': 'warming_up', 'message': 'Accumulo delle finestre di confronto'}
     count = min(2, ref.shape[1], heard.shape[1])
     mapping = list(channel_map) if channel_map is not None and len(channel_map)==count else list(range(count))
     if sorted(mapping) != list(range(count)): mapping=list(range(count))
-    pairs = [[match_channel(ref[:, source], heard[:, channel]) for source in range(count)]
-             for channel in range(count)]
-    if count == 2:
+    pairs = [[match_channel(ref[:, source], heard[:, channel]) if probe_mapping or source==mapping[channel] else None
+              for source in range(count)] for channel in range(count)]
+    if count == 2 and probe_mapping:
         def mapping_score(order):
             chosen=[pairs[ch][source] for ch,source in enumerate(order)]
             if not all(item is not None and abs(item['correlation']) >= .5 for item in chosen): return None
-            if abs(chosen[0]['offset']-chosen[1]['offset']) > 20: return None
+            if abs(chosen[0]['offset']-chosen[1]['offset']) > .005*ANALYSIS_RATE: return None
             return sum(abs(item['correlation']) for item in chosen)/2
         direct, crossed=mapping_score([0,1]),mapping_score([1,0])
         if crossed is not None and crossed >= .75 and crossed > (direct or 0)+.05:
@@ -2539,7 +2678,7 @@ def compare(reference, observed, reference_rate=44100, capture_rate=16000, chann
         expected = ref[start:start+len(heard), source]
         actual = heard[:, channel]
         gain = 10 ** (result['gain_db'] / 20)
-        block = 40
+        block = ANALYSIS_RATE//100
         length = len(actual) // block * block
         erms = np.sqrt(np.mean(expected[:length].reshape(-1, block) ** 2, axis=1))
         arms = np.sqrt(np.mean(actual[:length].reshape(-1, block) ** 2, axis=1))
@@ -2565,7 +2704,7 @@ def compare(reference, observed, reference_rate=44100, capture_rate=16000, chann
             if result['status'] == 'insufficient_signal':
                 start = aligned['offset']
                 expected = ref[start:start+len(heard), mapping[channel]]
-                if float(np.mean(expected**2)) > 10**(-45/10):
+                if float(np.mean(expected**2)) > 10**(-45/10) and float(np.mean(observed[:,channel]**2)) < 10**(-55/10):
                     result['status'] = 'missing_channel'
     usable = [r for r in results if 'correlation' in r]
     status = 'matched'
@@ -2578,13 +2717,19 @@ def compare(reference, observed, reference_rate=44100, capture_rate=16000, chann
         status, message = 'dropout', 'Interruzione nel ritorno rispetto al riferimento allineato'
     elif any(r['status'] == 'mismatch' for r in usable):
         status, message = 'mismatch', 'Ritorno poco correlato: contenuto alterato o allineamento non affidabile'
+    elif any(r['status']=='insufficient_signal' for r in results):
+        status, message = 'partial_match', 'Solo parte dei canali è valutabile nella banda diagnostica'
     elif any(r['ambiguous'] for r in usable):
         status, message = 'ambiguous', 'Audio correlato ma ritardo ambiguo: contenuto ripetitivo'
     clipped = np.mean(np.abs(observed) >= 32760/32768, axis=0)
     if bool(np.any(clipped > .0001)):
         status, message = 'return_clipping', 'Saturazione rilevata nel ritorno acquisito: controllare anche il gain ADC'
-    return {'status': status, 'message': message, 'channels': results, 'analysis_rate': 4000,
+    return {'status': status, 'message': message, 'channels': results, 'analysis_rate': ANALYSIS_RATE,
+            'stage_cpu_ms':{'resample':round(resample_cpu,2),
+                            'compare':round((time.thread_time()-correlation_started)*1000,2)},
             'clipped_fraction': [round(float(v), 6) for v in clipped],
+            'diagnostic_band_hz': [0,900],
+            'full_band_return_active':bool(np.any(np.mean(observed**2,axis=0)>10**(-55/10))),
             'channel_map': mapping, 'channel_mapping': 'swapped' if mapping==[1,0] else 'direct'}
 
 
@@ -2619,10 +2764,19 @@ class Diagnostics:
         self.channel_map = None
         self.capture_origin = None
         self.capture_frames = 0
+        self.capture_blocks = 0
         self.capture_timing = {}
         self.workload = {}
         self.last_analyzed_capture = None
         self.last_analyzed_context = None
+        self.capture_clock=ClockModel(16000)
+        self.reference_clock=ClockModel(44100)
+        self.capture_health={}
+        self.buffer_clock={}
+        self.last_mapping_check=-1e9
+        self.analysis_interval=1.0
+        self.clock_epoch=0
+        self.clock_reset_reason='startup'
 
     def feed_rtp(self, packet, now=None):
         decoded = decode_rtp(packet)
@@ -2640,6 +2794,9 @@ class Diagnostics:
                 self.previous_delay = None; self.previous_delay_time = None; self.delay_history.clear()
                 self.last_buffers = None
                 self.channel_map = None; self.capture_origin = None; self.capture_frames = 0
+                self.capture_clock=ClockModel(16000);self.reference_clock=ClockModel(44100)
+                self.last_analyzed_capture=None;self.last_mapping_check=-1e9
+                self.clock_epoch+=1;self.clock_reset_reason='rtp_stream_change'
             if self.high_seq is None:
                 extended_seq = seq
                 extended_stamp = stamp
@@ -2665,6 +2822,7 @@ class Diagnostics:
                     self.stats['jitter_ms'] += (delta-self.stats['jitter_ms']) / 16
                 self.transit = transit
                 self.high_seq = extended_seq; self.high_stamp = extended_stamp
+                self.reference_clock.observe(extended_stamp+len(samples),now)
             self.reference.append((now, extended_stamp, samples))
             while self.reference and self.reference[0][0] < now-self.HISTORY:
                 self.reference.popleft()
@@ -2678,18 +2836,32 @@ class Diagnostics:
             previous=self.capture[-1][0] if self.capture else None
             if previous is not None and now-previous > 1:
                 self.capture.clear(); self.capture_origin=None; self.capture_frames=0
+                self.capture_clock=ClockModel(16000)
+                self.clock_epoch+=1;self.clock_reset_reason='capture_delivery_gap'
                 self.previous_delay=None; self.previous_delay_time=None; self.delay_history.clear()
             if self.capture_origin is None:
                 self.capture_origin=now-len(samples)/16000
             self.capture_frames+=len(samples)
-            sample_end=self.capture_origin+self.capture_frames/16000
+            self.capture_blocks+=1
+            self.capture_clock.observe(self.capture_frames,now)
+            sample_end=self.capture_clock.sample_time(self.capture_frames)
+            clock=self.capture_clock.summary(self.capture_frames,now)
             self.capture_timing={
-                'delivery_offset_ms': round((now-sample_end)*1000,2),
+                'delivery_offset_ms': clock['raw_offset_ms'],
+                'captured_frames':self.capture_frames,'captured_blocks':self.capture_blocks,
                 'delivery_interval_error_ms': None if previous is None else round((now-previous-len(samples)/16000)*1000,2),
-                'clock_basis': 'sample_count_anchored_first_read'}
-            self.capture.append((now, samples, sample_end))
+                'clock_basis': 'sample_count_with_robust_rate_fit'}
+            self.capture.append((now, samples, sample_end, self.capture_frames))
             while self.capture and self.capture[0][0] < now-self.HISTORY:
                 self.capture.popleft()
+
+    def update_capture_health(self, health):
+        with self.lock:
+            if health.get('xrun_events',0)>self.capture_health.get('xrun_events',0):
+                self.capture_clock=ClockModel(16000)
+                self.clock_epoch+=1;self.clock_reset_reason='capture_xrun'
+                self.previous_delay=None;self.previous_delay_time=None;self.delay_history.clear()
+            self.capture_health=dict(health)
 
     def update_context(self, muted, reference, roc_error='', roc_warning=''):
         with self.lock:
@@ -2700,7 +2872,7 @@ class Diagnostics:
     def snapshot(self):
         with self.lock:
             result = dict(self.result)
-            result.update(workload=dict(self.workload), capture_timing=dict(self.capture_timing), rtp=dict(self.stats), events=list(self.events)[-1:], storage_error=self.storage_error)
+            result.update(capture_health=dict(self.capture_health), schema_version=2, workload=dict(self.workload), capture_timing=dict(self.capture_timing), rtp=dict(self.stats), events=list(self.events)[-1:], storage_error=self.storage_error)
         return result
 
     def buffers(self, now):
@@ -2710,6 +2882,13 @@ class Diagnostics:
             stats = dict(self.stats)
             context = dict(self.context)
             context_age = now-self.last_context
+            if packets and captures:
+                capture_end=self.capture_clock.sample_time(captures[-1][3])
+                if capture_end is None: capture_end=captures[-1][2]
+                self.buffer_clock={'epoch':self.clock_epoch,'reset_reason':self.clock_reset_reason,
+                                   'capture_rate':self.capture_clock.effective_rate,
+                                   'reference_rate':self.reference_clock.effective_rate,
+                                   'adc':self.capture_clock.summary(captures[-1][3],captures[-1][0])}
         if not packets or not captures or now-packets[-1][0] > 2 or now-captures[-1][0] > 1:
             return None
         # RTP timestamps define sample positions, not packet arrival intervals.
@@ -2725,8 +2904,10 @@ class Diagnostics:
         observed = np.concatenate([chunk[1] for chunk in captures])
         # End arrival time anchors an approximate delay; ADC/kernel buffering remains included.
         last_packet = max(packets, key=lambda p: p[1]+len(p[2]))
-        reference_end_time = last_packet[0]
-        return reference, observed, coverage, reference_end_time, captures[-1][2], stats, context, context_age
+        with self.lock:
+            reference_end_time=self.reference_clock.sample_time(end) if self.reference_clock.fit is not None else last_packet[0]
+            self.buffer_clock['rtp']=self.reference_clock.summary(end,last_packet[0])
+        return reference, observed, coverage, reference_end_time, capture_end, stats, context, context_age
 
     def analyze(self, now=None):
         now = time.monotonic() if now is None else now
@@ -2734,7 +2915,9 @@ class Diagnostics:
             with self.lock:
                 self.result = {'status': 'unavailable', 'message': 'NumPy non disponibile: reinstallare il setup aggiornato'}
             return
+        buffers_started=time.thread_time()
         buffers = self.buffers(now)
+        buffers_cpu=(time.thread_time()-buffers_started)*1000
         if buffers is None:
             if self.pending and now >= self.pending['due']:
                 self.pending['post_capture_unavailable'] = True
@@ -2770,21 +2953,29 @@ class Diagnostics:
         if not fresh_capture and context == self.last_analyzed_context: return
         self.last_analyzed_capture=capture_end
         self.last_analyzed_context=context
-        tail = observed[-20000:]
-        analysis_reference=reference[-4*44100:]
-        result = compare(analysis_reference, tail, channel_map=self.channel_map)
+        capture_rate=self.buffer_clock['capture_rate'];reference_rate=self.buffer_clock['reference_rate']
+        window=max(1.25,self.analysis_interval+.25)
+        tail=observed[-int(window*capture_rate):]
+        analysis_reference=reference[-int(max(4,window+1.5)*reference_rate):]
+        mapping_due=self.channel_map is None or now-self.last_mapping_check>=30
+        result=compare(analysis_reference,tail,reference_rate,capture_rate,self.channel_map,mapping_due)
+        if mapping_due: self.last_mapping_check=now
         if 'channel_map' in result: self.channel_map=result['channel_map']
-        result['analysis_reference_start_monotonic']=ref_end-len(analysis_reference)/44100
+        result.setdefault('stage_cpu_ms',{})['buffers']=round(buffers_cpu,2)
+        result['analysis_reference_start_monotonic']=ref_end-len(analysis_reference)/reference_rate
         result['capture_timing']=dict(self.capture_timing)
+        result['clock_diagnostics']=dict(self.buffer_clock)
+        result['capture_health']=dict(self.capture_health)
         result['workload']=dict(self.workload)
+        result['analysis_window_seconds']=round(len(tail)/capture_rate,3)
         result['updated_at'] = time.time()
         result['reference_coverage'] = round(float(coverage.mean()), 5)
         result['context_age_seconds'] = round(context_age, 1)
-        result['delay_basis'] = 'RTP arrival to sample-count ADC timeline; includes initial capture buffering and clock drift'
+        result['delay_basis'] = 'software-fitted RTP/ADC sample timelines; includes delivery-buffer uncertainty'
         usable = [c for c in result.get('channels', []) if 'offset' in c]
         delays = []
         for channel in usable:
-            delay = capture_end - len(tail)/16000 - (ref_end-len(analysis_reference)/44100+channel['offset']/4000)
+            delay = capture_end-len(tail)/capture_rate-(ref_end-len(analysis_reference)/reference_rate+channel['offset']/ANALYSIS_RATE)
             if result['status']=='matched' and abs(channel['correlation']) >= .85 and not channel['ambiguous'] and -0.1 <= delay <= 3:
                 delays.append(delay*1000)
         if delays:
@@ -2812,14 +3003,14 @@ class Diagnostics:
             result.update(status='suspended', message='Confronto sospeso: mute o riferimento post-fader non disponibile')
         elif all(c.get('rms_dbfs', -96) < -55 for c in context['reference_meter'].get('channels', [])):
             result.update(status='suspended', message='Confronto sospeso: livello di uscita atteso insufficiente')
-        if result['status'] == 'insufficient_signal' and context_age <= 12 and not context.get('muted'):
+        if result['status'] == 'insufficient_signal' and not result.get('full_band_return_active') and context_age <= 12 and not context.get('muted'):
             levels = context.get('reference_meter', {})
             # A 5-second meter can remain active after a legitimate pause. Check
             # the actual aligned reference before calling a silent return faulty.
             if self.previous_delay is not None and self.previous_delay_time is not None and now-self.previous_delay_time < 10:
-                start = int((capture_end-len(tail)/16000-self.previous_delay/1000-
-                             (ref_end-len(reference)/44100))*44100)
-                expected = reference[max(0,start):max(0,start)+int(len(tail)/16000*44100)]
+                start = int((capture_end-len(tail)/capture_rate-self.previous_delay/1000-
+                             (ref_end-len(reference)/reference_rate))*reference_rate)
+                expected = reference[max(0,start):max(0,start)+int(len(tail)/capture_rate*reference_rate)]
             else:
                 expected = reference[-3*44100:]
             blocks = len(expected)//441
@@ -2832,10 +3023,26 @@ class Diagnostics:
         if result['status'] == 'matched' and abs(result.get('delay_change_ms', 0)) > 20:
             result['timing_observation']='capture_delay_change'
             result['timing_message']='Variazione della stima RTP → ADC oltre 20 ms; non prova di un dropout audio'
-        if abs(result['capture_timing'].get('delivery_offset_ms',0)) > 20:
+        if abs(self.buffer_clock['adc'].get('residual_ms') or 0)>20:
             result['timing_observation']='capture_delivery_jitter'
-            result['timing_message']='Consegna PCM ritardata rispetto al conteggio campioni: stima temporale da verificare'
-        result['confidence'] = 'high' if result['status'] == 'matched' and delays and not result.get('timing_observation') else 'limited'
+            result['timing_message']='Consegna PCM irregolare rispetto al clock stimato; non prova di un difetto in uscita'
+        adc_clock=self.buffer_clock['adc']
+        if adc_clock['delivery_steps'] and now-(adc_clock.get('last_step_monotonic') or -1e9)<5:
+            result['timing_observation']='capture_delivery_step'
+            result['timing_message']='Salto persistente nella consegna ADC: nuova calibrazione, causa non attribuita alla riproduzione'
+        capture_error_age=now-self.capture_health.get('last_xrun_monotonic',-1e9)
+        if capture_error_age<5:
+            result['observed_audio_status']=result['status']
+            result.update(status='capture_unreliable',message='Overrun/xrun della cattura spia: confronto di uscita non conclusivo')
+            result['timing_observation']='capture_xrun'
+            result['timing_message']='Errore ADC acquisito nello stderr arecord; verificare carico e cattura'
+        clocks=result['clock_diagnostics']
+        adc=clocks['adc'];rtp_clock=clocks['rtp']
+        result['timing_confidence']='calibrated_estimate' if adc['fit_valid'] and rtp_clock['fit_valid'] and abs(adc['residual_ms'] or 0)<20 and abs(rtp_clock['residual_ms'] or 0)<20 else 'uncalibrated'
+        if not result.get('timing_observation') and adc['fit_valid'] and abs(adc.get('drift_ppm') or 0)>100:
+            result['timing_observation']='clock_drift_compensated'
+            result['timing_message']='Deriva del contatore ADC stimata e compensata; lo scarto cumulativo non è ritardo di uscita'
+        result['confidence']='high' if result['status']=='matched' and usable and all(abs(c['correlation'])>=.85 and not c['ambiguous'] for c in usable) else 'limited'
         fault = result['status'] in ('dropout', 'mismatch', 'reference_gaps', 'missing_return', 'missing_channel', 'return_clipping')
         if fault and self.candidate == result['status']:
             self.hits += int(fresh_capture)
@@ -2919,6 +3126,7 @@ class Diagnostics:
     def loop(self, stop_event=None):
         stop_event = stop_event or threading.Event()
         previous_start=None
+        cpu_average=None
         while not stop_event.is_set():
             started=time.perf_counter()
             cpu_started=time.thread_time()
@@ -2930,16 +3138,21 @@ class Diagnostics:
             elapsed=time.perf_counter()-started
             cpu=time.thread_time()-cpu_started
             period=1.0 if previous_start is None else max(.001,started-previous_start)
+            cpu_average=cpu if cpu_average is None else .8*cpu_average+.2*cpu
+            self.analysis_interval=max(1.0,min(2.5,cpu_average/.15))
             with self.lock:
-                self.workload={'analysis_wall_ms':round(elapsed*1000,2),
+                self.workload={'stage_cpu_ms':dict(self.result.get('stage_cpu_ms',{})),
+                               'analysis_target_period_seconds':round(self.analysis_interval,3),
+                               'analysis_gap_seconds':round(max(0,period-self.result.get('analysis_window_seconds',1.25)),3),
+                               'analysis_wall_ms':round(elapsed*1000,2),
                                'analysis_cpu_ms':round(cpu*1000,2),
                                'analysis_core_percent':round(cpu/period*100,1),
                                'analysis_period_seconds':round(period,2),
-                               'over_budget':elapsed>.25 or cpu>.2,
+                               'over_budget':cpu/period>.20 or elapsed/period>.5,
                                'sampled_at':time.time(),
                                'scope':'analysis worker only; excludes capture and RTP processing'}
             previous_start=started
-            stop_event.wait(max(.05,1.0-elapsed))
+            stop_event.wait(max(.05,self.analysis_interval-elapsed))
 PY_RX_DIAGNOSTICS
     chmod 0644 /usr/local/lib/roc-museum/rx_diagnostics.py
     cat > /usr/local/lib/roc-museum/studio.py <<'PY_STUDIO'

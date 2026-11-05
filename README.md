@@ -897,3 +897,70 @@ completa. I ricevitori senza scheda opzionale mantengono l'avvio leggero della
 v4.27: nessun worker DSP, buffer PCM o import NumPy. Non viene cambiata la latenza
 Roc comune impostata dalla v4.30. Non c'è ancora compensazione adattiva del
 sample rate ADC: rimane un possibile limite in presenza di deriva elevata.
+
+## Diagnosi clock e cattura: aggiornamento v4.32
+
+La v4.32 aggiunge una stima separata dei clock ADC e RTP rispetto al tempo del
+sistema. Ogni modello usa fino a 240 osservazioni, distanziate di almeno 0,4 s,
+con almeno 30 s di supporto. La regressione esclude letture isolate in ritardo;
+una stima fuori ±2000 ppm o troppo irregolare resta non calibrata. Tre consegne
+consecutive oltre 20 ms rispetto al modello avviano una nuova calibrazione.
+Questo non identifica automaticamente un guasto del DAC o del flusso Roc.
+
+Il rapporto distingue:
+
+- scarto cumulativo nominale e contatori dei frame/blocchi acquisiti;
+- rate effettivo stimato, deriva in ppm, residuo e dispersione della stima;
+- salti di consegna, riavvii della calibrazione e qualità temporale;
+- overrun/underrun/xrun letti direttamente dallo stderr di `arecord`, con
+  contatore, ultimo messaggio e orario;
+- tempo CPU delle fasi buffer, filtro/ricampionamento e confronto, oltre al
+  costo totale del worker e agli intervalli eventualmente non coperti.
+
+Il rate stimato viene usato nel confronto delle copie diagnostiche dei campioni;
+non modifica il flusso riprodotto. La misura resta basata su timestamp software:
+una deriva può includere effetti della cattura e non certifica lo scarto del
+quarzo hardware. Scarto cumulativo e residuo sono sempre entrambi consultabili,
+così la compensazione non nasconde il dato originale. Un xrun ADC recente
+rende il confronto `capture_unreliable`; l'eventuale anomalia del contenuto viene
+riportata in `observed_audio_status`, senza attribuirla automaticamente all'uscita.
+
+Per ridurre il costo sul Raspberry il DSP usa ora 2 kHz, banda indicativa fino
+a 900 Hz, filtro antialias a due stadi e ricontrollo della mappa L/R ogni 30 s.
+La mappa attiva resta applicata ad ogni analisi. I segnali presenti solo fuori
+banda non vengono classificati come ritorno assente: questo confronto non è una
+misura di distorsione o integrità di tutta la banda udibile.
+
+Il periodo si adatta tra 1 e 2,5 s mirando a circa il 15% di un core per il solo
+worker. La finestra audio si estende con il periodo, mantenendo 250 ms di
+sovrapposizione. `analysis_gap_seconds` evidenzia eventuali intervalli scoperti
+per elaborazione/I/O troppo lenti. Il limite non garantisce il consumo CPU:
+controllare `analysis_core_percent`, `over_budget` e i tempi delle singole fasi
+sull'hardware reale. Le metriche escludono altri thread e il processo `arecord`.
+Nel benchmark sintetico locale, a parità di finestra, il confronto passa da
+circa 12,9 ms CPU (v4.31) a 5,0 ms in inseguimento (v4.32); non è una misura Pi.
+
+### Raccolta del rapporto e aggiornamento
+
+**Storico diagnostico → Scarica rapporto spia** esporta stato corrente, clock,
+errori di cattura e ultimi 20 eventi. Il filtro Nodo si applica anche al rapporto.
+API di sola lettura: `/api/diagnostics/report?node=RX-93`. Il file non contiene
+PCM; le registrazioni WAV restano disponibili dalla diagnostica RX già esistente.
+Le API mantengono la visibilità dello stato/storico esistenti, senza nuove porte.
+Nessun dato viene caricato su servizi esterni.
+
+1. Salvare un rapporto prima dell'aggiornamento per conservare il confronto.
+2. Aggiornare TX e RX-spia con l'installer v4.32; l'installazione riavvia i servizi
+   e può interrompere brevemente l'audio, quindi scegliere una finestra adatta.
+3. Attendere almeno 30 s di acquisizione continua, preferibilmente 1–2 minuti.
+4. Verificare mappa L/R, `fit_valid`, deriva, residuo ADC, contatori xrun e CPU.
+   Un grande scarto cumulativo con residuo piccolo è compatibile con una deriva
+   regolare; non va interpretato come equivalente ritardo dell'audio in uscita.
+5. Esportare il rapporto dopo un'anomalia e associare le eventuali evidenze WAV.
+
+I modelli ripartono dopo disconnessione, cambio stream o xrun noto. Lo storico
+SQLite e le evidenze precedenti rimangono soggetti ai limiti di conservazione già
+previsti. Gli RX senza scheda opzionale conservano l'avvio leggero: nessun nuovo
+worker o import NumPy; nessun polling ALSA aggiuntivo quando la scheda è assente.
+La latenza Roc comune e i controlli di volume/mute della v4.30 restano gestiti
+come prima. Non viene eseguito alcun aggiornamento automatico dei Raspberry.

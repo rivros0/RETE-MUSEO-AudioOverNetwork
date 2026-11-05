@@ -151,6 +151,15 @@ class OptionalRuntimeTests(unittest.TestCase):
         self.assertIsNone(capture.diagnostics)
         self.assertIsNone(capture.process)
 
+    def test_capture_stderr_counts_split_xrun_lines(self):
+        capture=monitor.AnalogReturn('plughw:CARD=USB,DEV=0')
+        with self.patch('builtins.print'):
+            capture.note_stderr(b'over')
+            self.assertEqual(capture.capture_health['xrun_events'],0)
+            capture.note_stderr(b'run!!! (at least 10 ms)\n')
+        self.assertEqual(capture.capture_health['xrun_events'],1)
+        self.assertIn('overrun',capture.capture_health['last_message'])
+
     def test_capture_failure_retries_are_throttled(self):
         with self.patch.object(monitor,'read_text',return_value='USB Scarlett'), \
              self.patch.object(monitor.subprocess,'run',side_effect=OSError('busy')) as run, \
