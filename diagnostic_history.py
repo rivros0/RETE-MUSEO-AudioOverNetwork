@@ -52,13 +52,13 @@ class History:
                             'rtp':node.get('audio_meter',{}).get('integrity',{}),
                             'power':node.get('throttled'), 'network':node.get('network',{})}))
         waveform=node.get('waveform_diagnostics') or {}
-        waveform_faults=('dropout','mismatch','missing_return','missing_channel','possible_channel_swap',
+        waveform_faults=('dropout','dropout_candidate','mismatch','missing_return','missing_channel','possible_channel_swap',
                          'return_clipping','reference_gaps','delay_jump','reference_timeout','capture_interrupted','error')
         if waveform.get('confirmed') or waveform.get('status') in waveform_faults:
             issues.append((name,'waveform',str(waveform.get('status','unknown'))[:100],
                            'warning' if waveform.get('confirmed') else 'info',
                            (('' if waveform.get('confirmed') else 'Osservazione da confermare: ')+str(waveform.get('message','')))[:600],
-                           {k:waveform[k] for k in ('confirmed','estimated_delay_ms','delay_change_ms','channels','rtp',
+                           {k:waveform[k] for k in ('confirmed','estimated_delay_ms','delay_change_ms','channels','stereo_dropout_overlap_ms','rtp',
                                                    'reference_coverage','confidence','channel_mapping','channel_map','capture_timing','workload','clock_diagnostics','capture_health','timing_confidence','observed_audio_status') if k in waveform}))
         if waveform.get('timing_observation'):
             issues.append((name,'probe_timing',str(waveform['timing_observation'])[:100],'info',

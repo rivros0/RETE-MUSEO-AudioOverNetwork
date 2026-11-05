@@ -34,6 +34,19 @@ class WaveformTests(unittest.TestCase):
         self.assertEqual(result['status'],'dropout',result)
         self.assertTrue(any(x['duration_ms']>=80 for x in result['channels'][0]['dropouts']))
 
+    def test_stereo_dropout_overlap(self):
+        self.heard[6400:8000,0] = 0
+        self.heard[7200:8800,1] = 0
+        result = d.compare(self.ref, self.heard)
+        self.assertEqual(result['status'], 'dropout')
+        self.assertGreaterEqual(result['stereo_dropout_overlap_ms'], 30)
+
+    def test_dropout_at_window_edge_is_inconclusive(self):
+        self.heard[:1600] = 0
+        result = d.compare(self.ref, self.heard)
+        self.assertEqual(result['status'], 'dropout_candidate')
+        self.assertIsNone(result['channels'][0]['dropouts'][0]['flank_correlations'][0])
+
     def test_wrong_signal(self):
         heard=d.np.random.default_rng(9).normal(0,.1,self.heard.shape)
         self.assertEqual(d.compare(self.ref,heard)['status'],'mismatch')

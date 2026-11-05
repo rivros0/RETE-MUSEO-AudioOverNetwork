@@ -173,6 +173,34 @@ def match_channel(reference, observed):
             'residual_db': round(residual_db, 2)}
 
 
+def dropout_evidence(run, expected, actual, raw, raw_rate, correlation):
+    """Check the same alignment on each flank and verify attenuation in raw PCM."""
+    start = run['start_ms']
+    end = start + run['duration_ms']
+    duration = len(actual) * 1000 // ANALYSIS_RATE
+    flanks = [(max(0, start-100), start), (end, min(duration, end+100))]
+    scores = []
+    levels = []
+    for left, right in flanks:
+        if right-left < 40:
+            scores.append(None)
+            continue
+        window = slice(left*ANALYSIS_RATE//1000, right*ANALYSIS_RATE//1000)
+        x, y = expected[window], actual[window]
+        power = float(np.linalg.norm(x)*np.linalg.norm(y))
+        score = float(np.dot(x,y))/power if power else 0
+        scores.append(round(score if correlation >= 0 else -score, 3))
+        samples = raw[left*raw_rate//1000:right*raw_rate//1000]
+        levels.append(float(np.mean(samples**2)))
+    gap = raw[start*raw_rate//1000:end*raw_rate//1000]
+    contrast = None
+    if len(levels) == 2 and min(levels) > 0:
+        contrast = round(10*float(np.log10(max(float(np.mean(gap**2)), 1e-12)/min(levels))), 1)
+    return {'flank_correlations': scores, 'raw_level_change_db': contrast,
+            'corroborated': all(score is not None and score >= .6 for score in scores)
+                            and contrast is not None and contrast <= -15}
+
+
 def compare(reference, observed, reference_rate=44100, capture_rate=16000, channel_map=None, probe_mapping=True):
     """Compare a history reference to the last second of analog audio."""
     if len(reference)/reference_rate < .25 or len(observed)/capture_rate < .25:
@@ -231,8 +259,12 @@ def compare(reference, observed, reference_rate=44100, capture_rate=16000, chann
                     runs.append({'start_ms': begin * 10, 'duration_ms': (i-begin) * 10})
                 begin = None
         result['dropouts'] = runs
-        if runs and abs(result['correlation']) >= .5 and not result['ambiguous']:
-            result['status'] = 'dropout'
+        for run in runs:
+            run.update(dropout_evidence(run, expected, actual, observed[:, channel],
+                                        capture_rate, result['correlation']))
+        if runs:
+            verified = abs(result['correlation']) >= .5 and not result['ambiguous']
+            result['status'] = 'dropout' if verified and any(r['corroborated'] for r in runs) else 'dropout_candidate'
         results.append(result)
     # A silent channel can only be checked at a delay established by the other channel.
     aligned = next((r for r in results if abs(r.get('correlation', 0)) >= .75 and not r.get('ambiguous')), None)
@@ -252,16 +284,27 @@ def compare(reference, observed, reference_rate=44100, capture_rate=16000, chann
         status, message = 'missing_channel', 'Un canale del ritorno è assente mentre il riferimento è attivo'
     elif any(r['status'] == 'dropout' for r in usable):
         status, message = 'dropout', 'Interruzione nel ritorno rispetto al riferimento allineato'
+    elif any(r['status'] == 'dropout_candidate' for r in usable):
+        status, message = 'dropout_candidate', 'Calo rilevato con riscontro insufficiente nel PCM o nell’allineamento locale'
     elif any(r['status'] == 'mismatch' for r in usable):
         status, message = 'mismatch', 'Ritorno poco correlato: contenuto alterato o allineamento non affidabile'
     elif any(r['status']=='insufficient_signal' for r in results):
         status, message = 'partial_match', 'Solo parte dei canali è valutabile nella banda diagnostica'
     elif any(r['ambiguous'] for r in usable):
         status, message = 'ambiguous', 'Audio correlato ma ritardo ambiguo: contenuto ripetitivo'
+    stereo_overlap_ms = 0
+    if len(results) == 2 and all(r['status'] == 'dropout' for r in results):
+        for left in results[0]['dropouts']:
+            for right in results[1]['dropouts']:
+                if left['corroborated'] and right['corroborated']:
+                    overlap = min(left['start_ms']+left['duration_ms'], right['start_ms']+right['duration_ms'])
+                    overlap -= max(left['start_ms'], right['start_ms'])
+                    stereo_overlap_ms = max(stereo_overlap_ms, overlap)
     clipped = np.mean(np.abs(observed) >= 32760/32768, axis=0)
     if bool(np.any(clipped > .0001)):
         status, message = 'return_clipping', 'Saturazione rilevata nel ritorno acquisito: controllare anche il gain ADC'
     return {'status': status, 'message': message, 'channels': results, 'analysis_rate': ANALYSIS_RATE,
+            'stereo_dropout_overlap_ms': stereo_overlap_ms,
             'stage_cpu_ms':{'resample':round(resample_cpu,2),
                             'compare':round((time.thread_time()-correlation_started)*1000,2)},
             'clipped_fraction': [round(float(v), 6) for v in clipped],
@@ -499,6 +542,7 @@ class Diagnostics:
         if mapping_due: self.last_mapping_check=now
         if 'channel_map' in result: self.channel_map=result['channel_map']
         result.setdefault('stage_cpu_ms',{})['buffers']=round(buffers_cpu,2)
+        result['analysis_capture_start_monotonic']=capture_end-len(tail)/capture_rate
         result['analysis_reference_start_monotonic']=ref_end-len(analysis_reference)/reference_rate
         result['capture_timing']=dict(self.capture_timing)
         result['clock_diagnostics']=dict(self.buffer_clock)
@@ -613,8 +657,12 @@ class Diagnostics:
                 self.save_event(buffers)
 
     def save_event(self, buffers):
-        reference, observed, coverage, _, _, stats, context, _ = buffers
         event = self.pending
+        _, _, _, _, _, stats, context, _ = buffers
+        if self.trigger_buffers is not None:
+            buffers = self.trigger_buffers
+            event['wav_snapshot'] = 'trigger'
+        reference, observed, coverage, _, _, _, _, _ = buffers
         self.pending = None
         self.trigger_buffers = None
         try:
