@@ -76,7 +76,7 @@ class Studio:
             self._ensure_audio()
         except Exception as error:
             self.error=str(error)
-            try: self._live(clear_resume=False)
+            try: self._live(clear_resume=False,reason='startup_audio_error',detail=str(error))
             except Exception as fallback:
                 self.error=str(error)+' · fallback live: '+str(fallback)
         self.thread=threading.Thread(target=self._worker,daemon=True);self.thread.start()
@@ -138,6 +138,30 @@ class Studio:
     def _store_setting(self,key,value):
         self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,json.dumps(value)));self.db.commit()
 
+    def _record_player_stop(self,reason,detail=''):
+        """Persist the reason why manual/scheduled music left the playing state."""
+        record={
+            'time':time.time(),
+            'reason':reason,
+            'detail':str(detail or '')[:500],
+            'previous_status':self.status,
+            'track':self.track,
+            'origin':self.origin,
+            'loop':bool(self.loop),
+            'playlist_active':bool(self.playlist_active)
+        }
+        self._store_setting('player_last_stop',record)
+
+    def _record_player_start(self):
+        record={
+            'time':time.time(),
+            'track':self.track,
+            'origin':self.origin,
+            'loop':bool(self.loop),
+            'playlist_active':bool(self.playlist_active)
+        }
+        self._store_setting('player_last_start',record)
+
     def _clear_playback_resume(self):
         self._store_setting('resume_playback',None)
         self.resume_saved=0.
@@ -171,6 +195,7 @@ class Studio:
                 if loop:
                     position=0.
                 else:
+                    self._record_player_stop('resume_state_finished','Stato salvato già alla fine della traccia')
                     self._clear_playback_resume()
                     return False
             self.playlist_active=bool(state.get('playlist_active',False))
@@ -182,6 +207,7 @@ class Studio:
             return True
         except (OSError,ValueError,subprocess.SubprocessError) as error:
             self.error='Ripristino player non riuscito: '+str(error)
+            self._record_player_stop('resume_failed',str(error))
             self._clear_playback_resume()
             return False
 
@@ -195,7 +221,9 @@ class Studio:
         self.encoder=None
         if self.error_log: self.error_log.close();self.error_log=None
 
-    def _live(self,clear_resume=True):
+    def _live(self,clear_resume=True,reason=None,detail=''):
+        if reason:
+            self._record_player_stop(reason,detail)
         self._terminate();self.plan=None;self.playlist_active=False
         if not self.bus or not self.bus.snapshot()['active']:
             if self.bus: self.bus.close();self.bus=None
@@ -250,9 +278,10 @@ class Studio:
             self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','s16le','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log,bufsize=0)
             self.bus.attach(self.encoder.stdout,position,deadline)
         except Exception:
-            self._live();raise
+            self._live(reason='play_start_failed');raise
         self.track=name;self.duration=info['duration'];self.position=position;self.started=time.monotonic()
         self.status='playing';self.origin=origin;self.loop=loop;self.error=''
+        self._record_player_start()
         if persist and origin=='manual': self._save_playback_resume(force=True)
 
     def _position(self):
@@ -273,12 +302,12 @@ class Studio:
     def _advance_playlist(self,step=1):
         names=[f['name'] for f in self.library()];selected=self.playlist()
         if not selected:
-            self._live();return
+            self._live(reason='playlist_empty',detail='Nessuna traccia selezionata nella scaletta');return
         index=names.index(self.track) if self.track in names else (-1 if step>0 else len(names))
         candidates=[name for name in selected if (names.index(name)-index)*step>0]
         name=(candidates[0] if step>0 else candidates[-1]) if candidates else None
         if name is None and self._setting('playlist_loop'): name=selected[0] if step>0 else selected[-1]
-        if name is None: self._live();return
+        if name is None: self._live(reason='playlist_finished',detail='Fine scaletta con loop disattivato');return
         self._play(name,origin='manual');self._save_playback_resume(force=True)
 
     def command(self,data):
@@ -327,12 +356,12 @@ class Studio:
             elif command=='automation':
                 enabled=data.get('enabled')
                 if type(enabled) is not bool: raise ValueError('Stato calendario non valido')
-                if enabled and self.manual_hold: self._live()
+                if enabled and self.manual_hold: self._live(reason='automation_resumed',detail='Ripresa programmazione automatica')
                 self._store_setting('enabled',enabled);self.manual_hold=False
                 if not enabled:
                     self.queue=[]
                     if self.plan or self.origin.startswith('calendar:'):
-                        self._cancel_plan('suspended');self._live()
+                        self._cancel_plan('suspended');self._live(reason='automation_disabled',detail='Programmazione automatica disabilitata')
             elif command=='play':
                 # Validate before interrupting an existing programme.
                 self.info(data.get('name'))
@@ -367,14 +396,14 @@ class Studio:
                     self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
                     self._save_playback_resume(force=True)
             elif command=='stop':
-                self._cancel_plan('suspended');self._live();self.manual_hold=True
+                self._cancel_plan('suspended');self._live(reason='manual_stop',detail='Stop premuto dalla regia');self.manual_hold=True
             else: raise ValueError('Comando player non valido')
             return self.snapshot()
 
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'last_stop':self._setting('player_last_stop','null'),'last_start':self._setting('player_last_start','null'),'resume_state':self._setting('resume_playback','null'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -439,14 +468,14 @@ class Studio:
             self.db.execute('INSERT OR REPLACE INTO schedules VALUES(?,?)',(event_id,json.dumps(event)));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
             if self.plan and self.plan['event']['id']==event_id:
-                self._cancel_plan('interrupted');self._live()
+                self._cancel_plan('interrupted');self._live(reason='event_modified',detail='Evento attivo modificato')
             return event
 
     def delete_event(self,event_id):
         if not isinstance(event_id,str) or not re_id(event_id): raise ValueError('Identificativo evento non valido')
         with self.lock:
             if self.plan and self.plan['event']['id']==event_id:
-                self._cancel_plan('cancelled');self._live()
+                self._cancel_plan('cancelled');self._live(reason='event_deleted',detail='Evento attivo eliminato')
             self.db.execute('DELETE FROM schedules WHERE id=?',(event_id,));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
 
@@ -500,7 +529,7 @@ class Studio:
         plan['index']+=1
         if plan['index']>=len(plan['tracks']):
             if plan['repetitions'] and plan['cycle']>=plan['repetitions']:
-                self._record(plan['event'],plan['occurrence'],'completed');self._live();return
+                self._record(plan['event'],plan['occurrence'],'completed');self._live(reason='scheduled_group_completed',detail='Gruppo programmato completato');return
             plan['index']=0;plan['cycle']+=1
             if plan['interval_seconds']:
                 self._terminate();self.status='live';self.track=None;self.duration=0;self.position=0
@@ -512,27 +541,27 @@ class Studio:
             now=now or dt.datetime.now(dt.timezone.utc)
             if self.bus and not self.bus.snapshot()['active']:
                 self.error=self.bus.snapshot()['error'] or 'Bus audio non disponibile'
-                self._cancel_plan('failed');self._live()
+                self._cancel_plan('failed');self._live(reason='audio_bus_error',detail=self.error)
             if self.plan and self.plan['end_at'] is not None and now.timestamp()>=self.plan['end_at']:
-                self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live()
+                self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live(reason='scheduled_window_end',detail='Fine fascia programmata')
             if self.plan and self.plan['next_at'] is not None and now.timestamp()>=self.plan['next_at']:
                 self.plan['next_at']=None
                 try: self._play(self.plan['tracks'][self.plan['index']],origin='calendar:'+self.plan['event_id'],deadline=self.plan['end_at'])
                 except (OSError,ValueError,subprocess.SubprocessError) as error:
-                    self.error=str(error);self._cancel_plan('failed');self._live()
+                    self.error=str(error);self._cancel_plan('failed');self._live(reason='scheduled_start_failed',detail=str(error))
             if self.status=='playing' and self.bus and self.bus.snapshot()['music_eof'] and self.encoder and self.encoder.poll() is not None:
                 if self.encoder.returncode!=0:
-                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live()
+                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live(reason='decoder_error',detail='FFmpeg ha terminato con errore')
                 elif self.plan:
                     try: self._next_track(now)
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
-                        self.error=str(error);self._cancel_plan('failed');self._live()
+                        self.error=str(error);self._cancel_plan('failed');self._live(reason='scheduled_next_failed',detail=str(error))
                 elif self.playlist_active:
                     try: self._advance_playlist()
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
-                        self.error=str(error);self._live()
+                        self.error=str(error);self._live(reason='playlist_advance_failed',detail=str(error))
                 elif self.loop: self._play(self.track,origin=self.origin,loop=True)
-                else: self._live()
+                else: self._live(reason='track_finished',detail='Fine naturale della traccia con riproduzione continua disattivata')
             self._save_playback_resume()
             if not self._setting('enabled'): return
             for event in sorted(self.events(),key=lambda e:(e['start'],e['id'])):
