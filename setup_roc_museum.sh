@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.33
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.34
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.33"
+VERSION="4.34"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.33"
+MONITOR_BUILD="4.34"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -3282,7 +3282,7 @@ class Studio:
             self._ensure_audio()
         except Exception as error:
             self.error=str(error)
-            try: self._live(clear_resume=False)
+            try: self._live(clear_resume=False,reason='startup_audio_error',detail=str(error))
             except Exception as fallback:
                 self.error=str(error)+' · fallback live: '+str(fallback)
         self.thread=threading.Thread(target=self._worker,daemon=True);self.thread.start()
@@ -3344,6 +3344,30 @@ class Studio:
     def _store_setting(self,key,value):
         self.db.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,json.dumps(value)));self.db.commit()
 
+    def _record_player_stop(self,reason,detail=''):
+        """Persist the reason why manual/scheduled music left the playing state."""
+        record={
+            'time':time.time(),
+            'reason':reason,
+            'detail':str(detail or '')[:500],
+            'previous_status':self.status,
+            'track':self.track,
+            'origin':self.origin,
+            'loop':bool(self.loop),
+            'playlist_active':bool(self.playlist_active)
+        }
+        self._store_setting('player_last_stop',record)
+
+    def _record_player_start(self):
+        record={
+            'time':time.time(),
+            'track':self.track,
+            'origin':self.origin,
+            'loop':bool(self.loop),
+            'playlist_active':bool(self.playlist_active)
+        }
+        self._store_setting('player_last_start',record)
+
     def _clear_playback_resume(self):
         self._store_setting('resume_playback',None)
         self.resume_saved=0.
@@ -3377,6 +3401,7 @@ class Studio:
                 if loop:
                     position=0.
                 else:
+                    self._record_player_stop('resume_state_finished','Stato salvato già alla fine della traccia')
                     self._clear_playback_resume()
                     return False
             self.playlist_active=bool(state.get('playlist_active',False))
@@ -3388,6 +3413,7 @@ class Studio:
             return True
         except (OSError,ValueError,subprocess.SubprocessError) as error:
             self.error='Ripristino player non riuscito: '+str(error)
+            self._record_player_stop('resume_failed',str(error))
             self._clear_playback_resume()
             return False
 
@@ -3401,7 +3427,9 @@ class Studio:
         self.encoder=None
         if self.error_log: self.error_log.close();self.error_log=None
 
-    def _live(self,clear_resume=True):
+    def _live(self,clear_resume=True,reason=None,detail=''):
+        if reason:
+            self._record_player_stop(reason,detail)
         self._terminate();self.plan=None;self.playlist_active=False
         if not self.bus or not self.bus.snapshot()['active']:
             if self.bus: self.bus.close();self.bus=None
@@ -3456,9 +3484,10 @@ class Studio:
             self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','s16le','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log,bufsize=0)
             self.bus.attach(self.encoder.stdout,position,deadline)
         except Exception:
-            self._live();raise
+            self._live(reason='play_start_failed');raise
         self.track=name;self.duration=info['duration'];self.position=position;self.started=time.monotonic()
         self.status='playing';self.origin=origin;self.loop=loop;self.error=''
+        self._record_player_start()
         if persist and origin=='manual': self._save_playback_resume(force=True)
 
     def _position(self):
@@ -3479,12 +3508,12 @@ class Studio:
     def _advance_playlist(self,step=1):
         names=[f['name'] for f in self.library()];selected=self.playlist()
         if not selected:
-            self._live();return
+            self._live(reason='playlist_empty',detail='Nessuna traccia selezionata nella scaletta');return
         index=names.index(self.track) if self.track in names else (-1 if step>0 else len(names))
         candidates=[name for name in selected if (names.index(name)-index)*step>0]
         name=(candidates[0] if step>0 else candidates[-1]) if candidates else None
         if name is None and self._setting('playlist_loop'): name=selected[0] if step>0 else selected[-1]
-        if name is None: self._live();return
+        if name is None: self._live(reason='playlist_finished',detail='Fine scaletta con loop disattivato');return
         self._play(name,origin='manual');self._save_playback_resume(force=True)
 
     def command(self,data):
@@ -3533,12 +3562,12 @@ class Studio:
             elif command=='automation':
                 enabled=data.get('enabled')
                 if type(enabled) is not bool: raise ValueError('Stato calendario non valido')
-                if enabled and self.manual_hold: self._live()
+                if enabled and self.manual_hold: self._live(reason='automation_resumed',detail='Ripresa programmazione automatica')
                 self._store_setting('enabled',enabled);self.manual_hold=False
                 if not enabled:
                     self.queue=[]
                     if self.plan or self.origin.startswith('calendar:'):
-                        self._cancel_plan('suspended');self._live()
+                        self._cancel_plan('suspended');self._live(reason='automation_disabled',detail='Programmazione automatica disabilitata')
             elif command=='play':
                 # Validate before interrupting an existing programme.
                 self.info(data.get('name'))
@@ -3573,14 +3602,14 @@ class Studio:
                     self._cancel_plan('suspended');self.manual_hold=True;self.origin='manual'
                     self._save_playback_resume(force=True)
             elif command=='stop':
-                self._cancel_plan('suspended');self._live();self.manual_hold=True
+                self._cancel_plan('suspended');self._live(reason='manual_stop',detail='Stop premuto dalla regia');self.manual_hold=True
             else: raise ValueError('Comando player non valido')
             return self.snapshot()
 
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'last_stop':self._setting('player_last_stop','null'),'last_start':self._setting('player_last_start','null'),'resume_state':self._setting('resume_playback','null'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -3645,14 +3674,14 @@ class Studio:
             self.db.execute('INSERT OR REPLACE INTO schedules VALUES(?,?)',(event_id,json.dumps(event)));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
             if self.plan and self.plan['event']['id']==event_id:
-                self._cancel_plan('interrupted');self._live()
+                self._cancel_plan('interrupted');self._live(reason='event_modified',detail='Evento attivo modificato')
             return event
 
     def delete_event(self,event_id):
         if not isinstance(event_id,str) or not re_id(event_id): raise ValueError('Identificativo evento non valido')
         with self.lock:
             if self.plan and self.plan['event']['id']==event_id:
-                self._cancel_plan('cancelled');self._live()
+                self._cancel_plan('cancelled');self._live(reason='event_deleted',detail='Evento attivo eliminato')
             self.db.execute('DELETE FROM schedules WHERE id=?',(event_id,));self.db.commit()
             self.queue=[e for e in self.queue if e['id']!=event_id]
 
@@ -3706,7 +3735,7 @@ class Studio:
         plan['index']+=1
         if plan['index']>=len(plan['tracks']):
             if plan['repetitions'] and plan['cycle']>=plan['repetitions']:
-                self._record(plan['event'],plan['occurrence'],'completed');self._live();return
+                self._record(plan['event'],plan['occurrence'],'completed');self._live(reason='scheduled_group_completed',detail='Gruppo programmato completato');return
             plan['index']=0;plan['cycle']+=1
             if plan['interval_seconds']:
                 self._terminate();self.status='live';self.track=None;self.duration=0;self.position=0
@@ -3718,27 +3747,27 @@ class Studio:
             now=now or dt.datetime.now(dt.timezone.utc)
             if self.bus and not self.bus.snapshot()['active']:
                 self.error=self.bus.snapshot()['error'] or 'Bus audio non disponibile'
-                self._cancel_plan('failed');self._live()
+                self._cancel_plan('failed');self._live(reason='audio_bus_error',detail=self.error)
             if self.plan and self.plan['end_at'] is not None and now.timestamp()>=self.plan['end_at']:
-                self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live()
+                self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live(reason='scheduled_window_end',detail='Fine fascia programmata')
             if self.plan and self.plan['next_at'] is not None and now.timestamp()>=self.plan['next_at']:
                 self.plan['next_at']=None
                 try: self._play(self.plan['tracks'][self.plan['index']],origin='calendar:'+self.plan['event_id'],deadline=self.plan['end_at'])
                 except (OSError,ValueError,subprocess.SubprocessError) as error:
-                    self.error=str(error);self._cancel_plan('failed');self._live()
+                    self.error=str(error);self._cancel_plan('failed');self._live(reason='scheduled_start_failed',detail=str(error))
             if self.status=='playing' and self.bus and self.bus.snapshot()['music_eof'] and self.encoder and self.encoder.poll() is not None:
                 if self.encoder.returncode!=0:
-                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live()
+                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live(reason='decoder_error',detail='FFmpeg ha terminato con errore')
                 elif self.plan:
                     try: self._next_track(now)
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
-                        self.error=str(error);self._cancel_plan('failed');self._live()
+                        self.error=str(error);self._cancel_plan('failed');self._live(reason='scheduled_next_failed',detail=str(error))
                 elif self.playlist_active:
                     try: self._advance_playlist()
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
-                        self.error=str(error);self._live()
+                        self.error=str(error);self._live(reason='playlist_advance_failed',detail=str(error))
                 elif self.loop: self._play(self.track,origin=self.origin,loop=True)
-                else: self._live()
+                else: self._live(reason='track_finished',detail='Fine naturale della traccia con riproduzione continua disattivata')
             self._save_playback_resume()
             if not self._setting('enabled'): return
             for event in sorted(self.events(),key=lambda e:(e['start'],e['id'])):
@@ -4089,6 +4118,36 @@ PY_AUDIO_BUS
 #rxAudioHost{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px;margin-top:12px}
 #systemDashboardHost{margin-top:16px}
 @media(max-width:600px){.regia-tabs{display:grid;grid-template-columns:repeat(3,1fr)}#studioTools .regia-tab{padding:9px 6px;font-size:13px}}
+
+/* Player v4.34: interfaccia essenziale per distinguere chiaramente stato e causa di arresto. */
+.simple-player{border:1px solid #475569;border-radius:12px;background:#151d29;padding:18px;margin:18px 0}
+.simple-player-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.simple-player-head h3{margin:0!important}
+.player-badge{font-size:12px;font-weight:800;border-radius:999px;padding:6px 10px;background:#334155;color:#e2e8f0}
+.player-badge.playing{background:#064e3b;color:#a7f3d0}.player-badge.paused{background:#78350f;color:#fde68a}.player-badge.live{background:#374151;color:#d1d5db}
+.simple-player-grid{display:grid;grid-template-columns:minmax(220px,2fr) minmax(180px,1fr);gap:14px;align-items:end}
+.simple-player-grid label{display:block}
+.simple-player-grid select{width:100%;margin-left:0!important}
+.player-now{margin:14px 0;padding:14px;border:1px solid #334155;border-radius:9px;background:#0f172a}
+.player-now strong{display:block;font-size:1.1rem;margin-bottom:5px;overflow-wrap:anywhere}
+.player-now p{margin:4px 0}
+.player-last-stop{color:#fbbf24!important;font-size:13px}
+.player-controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:12px 0}
+#studioTools .player-main-button{font-weight:800;padding:10px 18px;margin:0}
+#studioTools .player-stop-button{font-weight:750;padding:10px 18px;margin:0;border-color:#f87171}
+.player-continuous{display:inline-flex!important;align-items:center;gap:7px;font-weight:750;padding:8px 10px;border:1px solid #4b5563;border-radius:8px;background:#111827}
+.player-continuous input{width:20px;height:20px;margin:0!important;accent-color:#22c55e}
+.simple-timeline{display:grid;grid-template-columns:55px 1fr 55px;gap:10px;align-items:center;margin:10px 0;font-variant-numeric:tabular-nums}
+.simple-timeline input{width:100%!important;margin:0!important;padding:0!important}
+.simple-volume{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0}
+.simple-volume input{min-width:180px;flex:1;margin:0!important;padding:0!important}
+.player-meta{display:flex;gap:12px;flex-wrap:wrap;color:#94a3b8;font-size:12px;border-top:1px solid #334155;padding-top:10px}
+.player-advanced{margin-top:16px;border-top:1px solid #334155;padding-top:12px}
+.player-advanced>summary{cursor:pointer;font-weight:700;color:#cbd5e1}
+.player-advanced-body{padding-top:12px}
+.automation-master{display:flex!important;align-items:center;gap:10px;padding:13px 14px;margin:12px 0;border:1px solid #4b5563;border-radius:9px;background:#111827;font-weight:800}
+.automation-master input{width:22px;height:22px;margin:0!important;accent-color:#22c55e}
+@media(max-width:680px){.simple-player-grid{grid-template-columns:1fr}.simple-timeline{grid-template-columns:48px 1fr 48px}.player-controls>*{flex:1 1 auto}.player-continuous{flex-basis:100%}}
 </style>
 <h2>Regia audio TX</h2>
 <p class="hint">Un solo programma per tutti gli RX. Il microfono degli annunci rimane sempre udibile, anche durante musica, pausa e intervalli.</p>
@@ -4098,33 +4157,81 @@ PY_AUDIO_BUS
 <button type="button" class="regia-tab" id="tabSystem" role="tab" aria-selected="false" aria-controls="regiaSystem" data-regia-tab="system">Sistema</button>
 </nav>
 <section id="regiaPlayer" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabPlayer">
-<details id="playerPanel" open>
-<summary><span class="vlc-mark" aria-hidden="true">▲</span><span class="vlc-summary-copy"><strong>Lettore multimediale</strong><small id="playerSummary">Nessuna traccia in riproduzione</small></span></summary>
-<div id="vlcPlayer" tabindex="0" aria-label="Lettore audio TX">
-<div class="vlc-screen">
-<svg class="vlc-cone" viewBox="0 0 80 100" aria-hidden="true"><path fill="#ef8c28" d="M35 5h10l22 76H13z"/><path fill="#f8f5e8" d="M31 20h18l4 14H27zm-9 30h36l5 16H17z"/><path fill="#e67c1c" d="M12 81h56l9 11H3z"/><path fill="#ffac48" d="M13 81h54l5 5H8z"/></svg>
-<p id="nowPlaying">Nessuna traccia in riproduzione</p><p id="playerState" aria-live="polite">Collegamento al TX…</p>
+<section id="playerPanel" class="simple-player" aria-labelledby="playerTitle">
+<div class="simple-player-head">
+<h3 id="playerTitle">Player</h3>
+<span id="playerStateBadge" class="player-badge live">FERMO</span>
 </div>
-<div class="vlc-bottom">
-<div class="vlc-timeline"><span id="elapsedTime" class="vlc-time">00:00</span><input id="playerSeek" class="vlc-range" type="range" min="0" max="1" step="0.1" value="0" disabled aria-label="Posizione riproduzione"><span id="totalTime" class="vlc-time">00:00</span></div>
-<div class="vlc-toolbar">
-<div class="vlc-transport">
-<button type="button" id="playerToggle" class="vlc-button vlc-play" aria-label="Riproduci" title="Riproduci / pausa (Spazio)">▶</button>
-<button type="button" data-player="stop" class="vlc-button" aria-label="Ferma musica" title="Ferma la musica; il microfono rimane attivo">■</button>
-<button type="button" id="playerPrevious" class="vlc-button" aria-label="Traccia precedente" title="Traccia precedente / ricomincia">⏮</button>
-<button type="button" id="playerBack" class="vlc-button" aria-label="Indietro 10 secondi" title="Indietro 10 secondi">↶</button>
-<button type="button" id="playerForward" class="vlc-button" aria-label="Avanti 10 secondi" title="Avanti 10 secondi">↷</button>
-<button type="button" id="playerNext" class="vlc-button" aria-label="Traccia successiva" title="Riproduci traccia successiva">⏭</button>
+
+<div class="simple-player-grid">
+<label>Traccia
+<select id="trackSelect" aria-label="Traccia da riprodurre"></select>
+</label>
+<div>
+<span class="hint">Destinazione</span>
+<div id="playerSource">TX · tutti gli RX</div>
 </div>
-<div class="vlc-options"><button type="button" id="playlistToggle" class="vlc-button" aria-label="Mostra o nascondi playlist" aria-pressed="true" title="Playlist">☷</button><button type="button" id="repeatToggle" class="vlc-button" aria-label="Ripeti traccia" aria-pressed="false" title="Ripeti la traccia corrente">↻ Loop brano: OFF</button><button type="button" id="playlistLoop" class="vlc-button" aria-pressed="false">↻ Loop scaletta: OFF</button><input type="checkbox" id="playerLoop" hidden></div>
-<div class="vlc-volume"><button type="button" id="musicMute" class="vlc-button" aria-label="Silenzia musica" aria-pressed="false" title="Silenzia solo la musica">◖))</button><input id="musicVolume" class="vlc-range" type="range" min="0" max="100" step="1" value="100" aria-label="Volume musica"><output id="musicVolumeLabel" for="musicVolume">100%</output></div>
 </div>
-<div class="vlc-statusbar"><span id="playerSource">TX · solo microfono</span><span id="groupState"></span><span id="playlistCount">0 tracce</span></div>
+
+<div class="player-now">
+<strong id="nowPlaying">Nessuna traccia selezionata</strong>
+<p id="playerState" aria-live="polite">Collegamento al TX…</p>
+<p id="playerStopReason" class="player-last-stop"></p>
+</div>
+
+<div class="player-controls">
+<button type="button" id="playerToggle" class="player-main-button">▶ Riproduci</button>
+<button type="button" data-player="stop" class="player-stop-button">■ Stop</button>
+<label class="player-continuous"><input type="checkbox" id="playerLoop"> Riproduzione continua</label>
+</div>
+
+<div class="simple-timeline">
+<span id="elapsedTime">00:00</span>
+<input id="playerSeek" type="range" min="0" max="1" step="0.1" value="0" disabled aria-label="Posizione riproduzione">
+<span id="totalTime">00:00</span>
+</div>
+
+<div class="simple-volume">
+<button type="button" id="musicMute" aria-pressed="false">Mute musica</button>
+<label>Volume musica</label>
+<input id="musicVolume" type="range" min="0" max="100" step="1" value="100" aria-label="Volume musica">
+<output id="musicVolumeLabel" for="musicVolume">100%</output>
+</div>
+
+<div class="player-meta">
+<span id="groupState"></span>
+<span id="playlistCount">0 tracce in libreria</span>
+</div>
 <p id="playerMessage" role="status"></p>
-<details class="vlc-precise"><summary>Vai a un tempo preciso</summary><form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form></details>
+
+<details class="player-advanced">
+<summary>Funzioni avanzate · scaletta, spostamento e libreria</summary>
+<div class="player-advanced-body">
+<div class="player-controls">
+<button type="button" id="playerPrevious">⏮ Precedente</button>
+<button type="button" id="playerBack">−10 s</button>
+<button type="button" id="playerForward">+10 s</button>
+<button type="button" id="playerNext">Successiva ⏭</button>
 </div>
-<div id="playerPlaylist" class="vlc-library"><div class="vlc-library-heading"><h4>Playlist · libreria TX</h4><input id="playlistSearch" type="search" placeholder="Cerca una traccia…" aria-label="Cerca nella playlist"></div><select id="trackSelect" hidden aria-label="Traccia selezionata"></select><button type="button" id="playlistStart">▶ Avvia scaletta</button><p id="playlistStatus" role="status"></p><div id="playlistImport"></div><div id="playlistHost"></div><p class="vlc-notice">Spunta i brani da includere nella scaletta, in ordine di libreria. Un doppio clic avvia un brano singolo e interrompe la scaletta; per ripartire usa Avvia scaletta. Volume e mute agiscono solo sulla musica; gli annunci rimangono udibili.</p></div>
-</div></details>
+
+<details>
+<summary>Vai a un tempo preciso</summary>
+<form id="seekForm"><label>Posizione (secondi) <input id="seekPosition" type="number" min="0" step="0.1" required></label><button>Vai</button><span id="positionText"></span></form>
+</details>
+
+<h4>Scaletta</h4>
+<button type="button" id="playlistStart">▶ Avvia scaletta</button>
+<button type="button" id="playlistLoop" aria-pressed="false">Loop scaletta: OFF</button>
+<p id="playlistStatus" role="status"></p>
+
+<div id="playerPlaylist">
+<label>Cerca nella libreria <input id="playlistSearch" type="search" placeholder="Cerca una traccia…"></label>
+<div id="playlistImport"></div>
+<div id="playlistHost"></div>
+</div>
+</div>
+</details>
+</section>
 <h3>Annunci dal microfono · ducking</h3>
 <p id="microphoneState" role="status"></p>
 <form id="duckingForm"><label><input name="enabled" type="checkbox" checked> Abbassa automaticamente la musica durante gli annunci</label>
@@ -4137,12 +4244,14 @@ PY_AUDIO_BUS
 </section>
 </section>
 <section id="regiaEvents" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabEvents" hidden>
+<label class="automation-master"><input id="automationToggle" type="checkbox"> Programmazione eventi attiva</label>
+<p id="automationState"></p>
+<p class="hint">Se la casella non è selezionata, nessun evento programmato verrà avviato. Se il player manuale sospende la programmazione, selezionala nuovamente per riprenderla.</p>
+
 <details id="scheduledEventsPanel" class="scheduledPanel" open>
 <summary><span>Eventi programmati</span><span id="scheduledEventsMeta" class="scheduledMeta">caricamento…</span></summary>
 <div class="scheduledBody">
-<h3>Calendario · Europe/Rome</h3><p id="automationState"></p>
-<button id="enableAuto">Abilita / riprendi programma</button><button id="disableAuto">Disabilita programma</button>
-<p class="hint">I comandi manuali sospendono il calendario fino a “Riprendi programma”. Una fascia ancora attiva riparte dall’inizio del gruppo. Il microfono resta sempre disponibile.</p>
+<h3>Calendario · Europe/Rome</h3>
 <p id="nextEvents"></p>
 <form id="eventForm"><input type="hidden" name="id"><fieldset><legend id="eventLegend">Nuovo evento</legend>
 <label>Titolo <input name="name" required maxlength="100"></label>
@@ -4341,31 +4450,109 @@ function filterTracks(){var query=el('playlistSearch').value.toLocaleLowerCase('
 function timeLabel(seconds){seconds=Math.max(0,Math.floor(Number(seconds)||0));var h=Math.floor(seconds/3600),m=Math.floor(seconds%3600/60),s=seconds%60;return (h?h+':':'')+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');}
 function playerPosition(){var s=playerSnapshot;if(!s)return 0;var elapsed=s.status==='playing'?Math.min(3,(performance.now()-playerSampleTime)/1000):0;return Math.min(s.duration,s.position+elapsed);}
 function renderTimeline(){var s=playerSnapshot;if(!s||scrubbing)return;var pos=playerPosition();el('playerSeek').value=pos;el('elapsedTime').textContent=timeLabel(pos);}
+function stopReasonText(stop){
+  if(!stop)return '';
+  var labels={
+    manual_stop:'Stop manuale dalla regia',
+    track_finished:'Fine naturale della traccia',
+    playlist_finished:'Fine della scaletta',
+    playlist_empty:'Scaletta vuota',
+    decoder_error:'Errore decoder FFmpeg',
+    audio_bus_error:'Errore bus audio',
+    play_start_failed:'Avvio riproduzione fallito',
+    playlist_advance_failed:'Passaggio traccia fallito',
+    startup_audio_error:'Errore audio all’avvio',
+    resume_failed:'Ripristino automatico fallito',
+    resume_state_finished:'Stato salvato già a fine traccia',
+    automation_resumed:'Programmazione automatica ripresa',
+    automation_disabled:'Programmazione automatica disabilitata',
+    scheduled_window_end:'Fine fascia programmata',
+    scheduled_group_completed:'Gruppo programmato completato',
+    scheduled_start_failed:'Avvio evento programmato fallito',
+    scheduled_next_failed:'Passaggio evento programmato fallito',
+    event_modified:'Evento attivo modificato',
+    event_deleted:'Evento attivo eliminato'
+  };
+  var when='';
+  if(stop.time){
+    when=new Date(stop.time*1000).toLocaleString('it-IT',{timeZone:'Europe/Rome'});
+  }
+  var text=labels[stop.reason]||stop.reason||'Motivo non disponibile';
+  if(stop.detail)text+=' · '+stop.detail;
+  if(when)text+=' · '+when;
+  return text;
+}
+
 function renderPlayer(){
-  var s=playerSnapshot,active=!!s&&['playing','paused'].includes(s.status),selection=el('trackSelect').value;
-  var different=active&&selection!==s.track;
-  el('playerToggle').disabled=playerBusy||!selection;el('musicMute').disabled=el('musicVolume').disabled=!s||playerBusy;
-  var pausing=active&&s.status==='playing'&&!different;
-  el('playerToggle').textContent=pausing?'❚❚':'▶';el('playerToggle').setAttribute('aria-label',pausing?'Pausa musica':active&&s.status==='paused'&&!different?'Riprendi traccia':'Riproduci selezione');
-  el('nowPlaying').textContent=active?s.track:selection||'Nessuna traccia in riproduzione';
-  el('playerSummary').textContent=(active?(s.status==='playing'?'In riproduzione':'In pausa'):'Pronto')+' · '+(active?s.track:selection||'nessuna traccia');
-  el('playerSource').textContent=active?(s.origin.startsWith('calendar:')?'Calendario · tutti gli RX':'Regia manuale · tutti gli RX'):'TX · solo microfono';
-  el('playerSeek').disabled=!active||playerBusy;el('playerSeek').max=active?Math.max(0,s.duration-.01):1;
-  el('playerBack').disabled=el('playerForward').disabled=!active||playerBusy;
-  var index=mediaFiles.findIndex(function(f){return f.name===selection;});el('playerPrevious').disabled=playerBusy||(!active&&index<=0);el('playerNext').disabled=playerBusy||index<0||index>=mediaFiles.length-1;
+  var s=playerSnapshot;
+  var active=!!s&&['playing','paused'].includes(s.status);
+  var selection=el('trackSelect').value;
+  var sameTrack=active&&selection===s.track;
+  var playing=s&&s.status==='playing'&&sameTrack;
+  var paused=s&&s.status==='paused'&&sameTrack;
+
+  el('playerToggle').disabled=playerBusy||!selection;
+  el('playerToggle').textContent=playing?'❚❚ Pausa':paused?'▶ Riprendi':'▶ Riproduci';
+
+  el('nowPlaying').textContent=active?s.track:(selection||'Nessuna traccia selezionata');
+
+  var badge=el('playerStateBadge');
+  badge.className='player-badge '+(s?s.status:'live');
+  badge.textContent=s?(s.status==='playing'?'IN RIPRODUZIONE':s.status==='paused'?'IN PAUSA':'FERMO'):'IN ATTESA';
+
+  var stateText='Solo microfono / ingresso mixer';
+  if(s&&s.status==='playing')stateText='Musica in riproduzione';
+  if(s&&s.status==='paused')stateText='Musica in pausa';
+  if(s&&s.error)stateText+=' · ERRORE: '+s.error;
+  el('playerState').textContent=stateText;
+
+  var reason='';
+  if(s&&s.status==='live'&&s.last_stop){
+    reason='Ultimo arresto: '+stopReasonText(s.last_stop);
+  }else if(s&&s.status==='playing'){
+    reason='Riproduzione continua: '+(s.track_loop?'ATTIVA':'DISATTIVA')+' · ripristino automatico '+(s.resume_state?'salvato':'non salvato');
+  }else if(s&&s.status==='paused'){
+    reason='Player in pausa · stato salvato per il ripristino automatico';
+  }
+  el('playerStopReason').textContent=reason;
+
+  el('playerSource').textContent=s&&s.playlist_active?'Scaletta · tutti gli RX':s&&s.origin&&s.origin.startsWith('calendar:')?'Evento programmato · tutti gli RX':'Regia manuale · tutti gli RX';
+
+  el('playerSeek').disabled=!active||playerBusy;
+  el('playerSeek').max=active?Math.max(0,s.duration-.01):1;
   el('totalTime').textContent=timeLabel(s?s.duration:0);
-  if(!volumeEditing&&s){el('musicVolume').value=s.music_volume;el('musicVolumeLabel').textContent=s.music_volume+'%';}
-  if(s){el('musicMute').setAttribute('aria-pressed',s.music_muted?'true':'false');el('musicMute').textContent=s.music_muted?'◖×':'◖))';el('musicMute').setAttribute('aria-label',s.music_muted?'Riattiva musica':'Silenzia musica');}
-  var trackLoop=!!s&&s.track_loop,playlistLoop=!!s&&s.playlist_loop;
-  el('playerLoop').checked=trackLoop;
-  el('repeatToggle').setAttribute('aria-pressed',String(trackLoop));el('repeatToggle').textContent='↻ Loop brano: '+(trackLoop?'ON':'OFF');el('repeatToggle').setAttribute('aria-label','Loop brano: '+(trackLoop?'ON':'OFF'));
-  el('playlistLoop').setAttribute('aria-pressed',String(playlistLoop));el('playlistLoop').textContent='↻ Loop scaletta: '+(playlistLoop?'ON':'OFF');
-  el('repeatToggle').disabled=el('playlistLoop').disabled=playerBusy||!s;
-  document.querySelectorAll('.playlist-check').forEach(function(c){c.checked=!!s&&s.playlist_tracks.includes(c.dataset.name);c.disabled=playerBusy||!s;});
+
+  if(!volumeEditing&&s){
+    el('musicVolume').value=s.music_volume;
+    el('musicVolumeLabel').textContent=s.music_volume+'%';
+  }
+  el('musicVolume').disabled=!s||playerBusy;
+  el('musicMute').disabled=!s||playerBusy;
+  if(s){
+    el('musicMute').setAttribute('aria-pressed',String(!!s.music_muted));
+    el('musicMute').textContent=s.music_muted?'Riattiva musica':'Mute musica';
+    el('playerLoop').checked=!!s.track_loop;
+  }
+  el('playerLoop').disabled=playerBusy||!s||!!(s&&s.playlist_active);
+
+  var index=mediaFiles.findIndex(function(f){return f.name===selection;});
+  el('playerPrevious').disabled=playerBusy||(!active&&index<=0);
+  el('playerNext').disabled=playerBusy||index<0||index>=mediaFiles.length-1;
+  el('playerBack').disabled=el('playerForward').disabled=!active||playerBusy;
+
+  var playlistLoop=!!s&&s.playlist_loop;
+  el('playlistLoop').setAttribute('aria-pressed',String(playlistLoop));
+  el('playlistLoop').textContent='Loop scaletta: '+(playlistLoop?'ON':'OFF');
+  el('playlistLoop').disabled=playerBusy||!s;
+  document.querySelectorAll('.playlist-check').forEach(function(box){
+    box.checked=!!s&&s.playlist_tracks.includes(box.dataset.name);
+    box.disabled=playerBusy||!s;
+  });
   el('playlistStart').disabled=playerBusy||!s||!s.playlist_tracks.length;
-  el('playlistStatus').textContent=s?(s.playlist_active?'Scaletta in esecuzione':'Scaletta ferma')+' · '+s.playlist_tracks.length+' brani selezionati'+(s.playlist_loop?' · ripetizione continua':' · un passaggio'):'';
-  if(s&&s.playlist_active){el('playerSource').textContent='Scaletta · tutti gli RX';el('playerNext').disabled=el('playerPrevious').disabled=playerBusy;}
-  renderTimeline();markTracks();
+  el('playlistStatus').textContent=s?(s.playlist_active?'Scaletta in esecuzione':'Scaletta ferma')+' · '+s.playlist_tracks.length+' brani selezionati'+(s.playlist_loop?' · loop continuo':''):'';
+
+  renderTimeline();
+  markTracks();
 }
 async function playerCommand(data){if(playerBusy)return;playerBusy=true;playerRevision++;renderPlayer();try{var result=await api('/api/player',data);playerSnapshot=result;playerSampleTime=performance.now();message('');await update();}finally{playerBusy=false;renderPlayer();}}
 function playSelected(){perform(async function(){await playerCommand({command:'play',name:el('trackSelect').value,loop:el('playerLoop').checked});selectionDirty=false;});}
@@ -4385,13 +4572,14 @@ async function update(){
   try{
     var revision=playerRevision,s=await api('/api/studio'),bus=s.audio_bus;if(revision!==playerRevision)return;
     if(!selectionDirty&&s.track&&mediaFiles.some(function(f){return f.name===s.track;}))el('trackSelect').value=s.track;playerSnapshot=s;playerSampleTime=performance.now();
-    el('playerState').textContent=({live:'Solo microfono / ingresso mixer',playing:'In riproduzione',paused:'Musica in pausa'}[s.status]||s.status)+(s.track?' · '+s.track:'')+' · origine: '+(s.origin==='manual'?'regia':s.origin.startsWith('calendar:')?'calendario':'ingresso')+(s.error?' · Errore: '+s.error:'');
+    /* Stato principale e motivo dell'ultimo arresto vengono resi da renderPlayer(). */
     el('positionText').textContent=s.position.toFixed(1)+' / '+s.duration.toFixed(1)+' s';el('seekPosition').max=Math.max(0,s.duration-0.01);
     if(s.status!=='live')el('playerLoop').checked=s.loop;renderPlayer();
     el('groupState').textContent=s.plan?'Gruppo: traccia '+(s.plan.index+1)+'/'+s.plan.tracks.length+' · passaggio '+s.plan.cycle+'/'+(s.plan.repetitions||'fino a fine fascia')+(s.plan.next_at?' · prossimo passaggio '+new Date(s.plan.next_at*1000).toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'}):''):'';
     el('microphoneState').textContent=bus?(bus.microphone_online?'Microfono collegato':'ATTENZIONE: '+bus.microphone_error)+' · ingresso '+bus.microphone_dbfs+' dBFS · musica '+bus.music_gain_db+' dB'+(bus.ducking_active?' · DUCKING ATTIVO':''):'Ingresso diretto: il bus annunci si avvia con la regia.';
     if(!duckInitialized){var duck=el('duckingForm');duck.elements.namedItem('enabled').checked=s.ducking.enabled;duck.elements.namedItem('threshold_db').value=s.ducking.threshold_db;duck.elements.namedItem('reduction_db').value=s.ducking.reduction_db;duckInitialized=true;}
-    el('automationState').textContent=(s.automation_enabled?'Calendario abilitato':'Calendario disabilitato')+(s.manual_hold?' · sospeso dalla regia manuale':'')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');
+    el('automationToggle').checked=!!s.automation_enabled&&!s.manual_hold;
+    el('automationState').textContent=(s.automation_enabled&&!s.manual_hold?'Programmazione attiva':s.manual_hold?'Programmazione sospesa dal player manuale':'Programmazione disattivata')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');
     el('nextEvents').textContent='Prossimi eventi: '+(s.next_events||[]).map(function(e){return e.name+' · '+new Date(e.at).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}).join(' | ');
     currentEvents=s.events;renderEvents();el('eventHistory').replaceChildren();
     el('scheduledEventsMeta').textContent=currentEvents.length+' '+(currentEvents.length===1?'evento':'eventi')+' · '+(s.automation_enabled?'programma attivo':'programma disabilitato');
@@ -4416,28 +4604,90 @@ function renderEvents(){
     tr.appendChild(actions);el('eventRows').appendChild(tr);
   });
 }
-document.querySelectorAll('[data-player]').forEach(function(b){b.onclick=function(){perform(function(){return playerCommand({command:b.dataset.player});});};});
+document.querySelectorAll('[data-player]').forEach(function(b){
+  b.onclick=function(){perform(function(){return playerCommand({command:b.dataset.player});});};
+});
 el('playerToggle').onclick=togglePlayback;
-el('playlistStart').onclick=function(){selectionDirty=false;perform(function(){return playerCommand({command:'playlist_start'});});};
-el('playlistLoop').onclick=function(){perform(function(){return playerCommand({command:'playlist_loop',enabled:!playerSnapshot.playlist_loop});});};
-el('playerNext').onclick=function(){if(playerSnapshot&&playerSnapshot.playlist_active){perform(function(){return playerCommand({command:'playlist_next'});});return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}};
-el('playerPrevious').onclick=function(){if(playerSnapshot&&playerSnapshot.playlist_active){perform(function(){return playerCommand({command:'playlist_previous'});});return;}if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){seekPlayer(0);return;}var index=mediaFiles.findIndex(function(f){return f.name===el('trackSelect').value;});if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}else if(playerSnapshot&&playerSnapshot.track)seekPlayer(0);};
-el('playerBack').onclick=function(){seekPlayer(playerPosition()-10);};el('playerForward').onclick=function(){seekPlayer(playerPosition()+10);};
-el('playerSeek').oninput=function(){scrubbing=true;el('elapsedTime').textContent=timeLabel(this.value);};
-el('playerSeek').onchange=function(){var target=Number(this.value);scrubbing=false;seekPlayer(target);};
-el('playerSeek').addEventListener('pointercancel',function(){scrubbing=false;renderTimeline();});
-el('repeatToggle').onclick=function(){el('playerLoop').checked=!el('playerLoop').checked;renderPlayer();perform(function(){return playerCommand({command:'loop',enabled:el('playerLoop').checked});});};
-el('playlistToggle').onclick=function(){var hidden=!el('playerPlaylist').hidden;el('playerPlaylist').hidden=hidden;this.setAttribute('aria-pressed',hidden?'false':'true');};
+el('trackSelect').onchange=function(){selectionDirty=true;markTracks();renderPlayer();};
+
+el('playerLoop').onchange=function(){
+  var enabled=this.checked;
+  perform(function(){return playerCommand({command:'loop',enabled:enabled});});
+};
+
+el('playlistStart').onclick=function(){
+  selectionDirty=false;
+  perform(function(){return playerCommand({command:'playlist_start'});});
+};
+el('playlistLoop').onclick=function(){
+  perform(function(){return playerCommand({command:'playlist_loop',enabled:!playerSnapshot.playlist_loop});});
+};
+el('playerNext').onclick=function(){
+  if(playerSnapshot&&playerSnapshot.playlist_active){
+    perform(function(){return playerCommand({command:'playlist_next'});});
+    return;
+  }
+  var index=mediaFiles.findIndex(function(file){return file.name===el('trackSelect').value;});
+  if(index<mediaFiles.length-1){selectTrack(mediaFiles[index+1].name);playSelected();}
+};
+el('playerPrevious').onclick=function(){
+  if(playerSnapshot&&playerSnapshot.playlist_active){
+    perform(function(){return playerCommand({command:'playlist_previous'});});
+    return;
+  }
+  if(playerSnapshot&&playerPosition()>3&&playerSnapshot.track===el('trackSelect').value){
+    seekPlayer(0);
+    return;
+  }
+  var index=mediaFiles.findIndex(function(file){return file.name===el('trackSelect').value;});
+  if(index>0){selectTrack(mediaFiles[index-1].name);playSelected();}
+  else if(playerSnapshot&&playerSnapshot.track){seekPlayer(0);}
+};
+el('playerBack').onclick=function(){seekPlayer(playerPosition()-10);};
+el('playerForward').onclick=function(){seekPlayer(playerPosition()+10);};
+
+el('playerSeek').oninput=function(){
+  scrubbing=true;
+  el('elapsedTime').textContent=timeLabel(this.value);
+};
+el('playerSeek').onchange=function(){
+  var target=Number(this.value);
+  scrubbing=false;
+  seekPlayer(target);
+};
+el('playerSeek').addEventListener('pointercancel',function(){
+  scrubbing=false;
+  renderTimeline();
+});
+
 el('playlistSearch').oninput=filterTracks;
-el('musicVolume').oninput=function(){volumeEditing=true;el('musicVolumeLabel').textContent=this.value+'%';};
-el('musicVolume').onchange=function(){var value=Number(this.value);perform(async function(){try{await playerCommand({command:'music_volume',value:value});}finally{volumeEditing=false;renderPlayer();}});};
-el('musicMute').onclick=function(){perform(function(){return playerCommand({command:'music_muted',enabled:!playerSnapshot.music_muted});});};
-el('seekForm').onsubmit=function(e){e.preventDefault();seekPlayer(Number(el('seekPosition').value));};
-el('playerPanel').addEventListener('toggle',function(){try{localStorage.setItem('museum.player.open',this.open?'yes':'no');}catch(error){}});
-el('vlcPlayer').addEventListener('keydown',function(e){if(/INPUT|SELECT|TEXTAREA|BUTTON|SUMMARY/.test(e.target.tagName))return;if(e.code==='Space'){e.preventDefault();togglePlayback();}else if(e.key==='ArrowLeft'){e.preventDefault();seekPlayer(playerPosition()-10);}else if(e.key==='ArrowRight'){e.preventDefault();seekPlayer(playerPosition()+10);}});
+el('musicVolume').oninput=function(){
+  volumeEditing=true;
+  el('musicVolumeLabel').textContent=this.value+'%';
+};
+el('musicVolume').onchange=function(){
+  var value=Number(this.value);
+  perform(async function(){
+    try{await playerCommand({command:'music_volume',value:value});}
+    finally{volumeEditing=false;renderPlayer();}
+  });
+};
+el('musicMute').onclick=function(){
+  perform(function(){return playerCommand({command:'music_muted',enabled:!playerSnapshot.music_muted});});
+};
+el('seekForm').onsubmit=function(event){
+  event.preventDefault();
+  seekPlayer(Number(el('seekPosition').value));
+};
+
 el('duckingForm').onsubmit=function(e){e.preventDefault();var f=e.target;perform(async function(){await api('/api/player',{command:'ducking',enabled:f.elements.namedItem('enabled').checked,threshold_db:Number(f.elements.namedItem('threshold_db').value),reduction_db:Number(f.elements.namedItem('reduction_db').value)});message('Impostazioni ducking salvate');await update();});};
-el('enableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:true});await update();});};
-el('disableAuto').onclick=function(){perform(async function(){await api('/api/player',{command:'automation',enabled:false});await update();});};
+el('automationToggle').onchange=function(){
+  var enabled=this.checked;
+  perform(async function(){
+    await api('/api/player',{command:'automation',enabled:enabled});
+    await update();
+  });
+};
 el('addEventTrack').onclick=function(){var name=el('eventTrack').value;if(!name)return;if(eventTracks.length>=100){message('Massimo 100 tracce per gruppo');return;}eventTracks.push(name);renderPlaylist();};
 el('cancelEvent').onclick=function(){el('eventForm').reset();el('eventForm').elements.namedItem('id').value='';eventTracks=[];renderPlaylist();el('eventLegend').textContent='Nuovo evento';};
 el('eventForm').onsubmit=function(e){
@@ -4534,7 +4784,6 @@ window.addEventListener('DOMContentLoaded',function(){
 
   var initialTab='player';
   try{
-    el('playerPanel').open=localStorage.getItem('museum.player.open')!=='no';
     initialTab=localStorage.getItem('museum.regia.tab')||'player';
   }catch(error){}
   activateRegiaTab(initialTab,false);
