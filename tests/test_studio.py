@@ -222,6 +222,43 @@ class PlayerTests(StudioCase):
         self.engine.status='playing';self.engine.track='test.wav';self.engine.loop=True;self.engine.encoder=self.process(0);self.engine.bus.eof=True
         with patch.object(self.engine,'_play') as play: self.engine.tick();play.assert_called_once_with('test.wav',origin='mixer',loop=True)
 
+    def test_natural_end_records_stop_reason(self):
+        self.engine._ensure_audio()
+        self.engine.status='playing'
+        self.engine.origin='manual'
+        self.engine.track='test.wav'
+        self.engine.duration=1
+        self.engine.loop=False
+        self.engine.encoder=self.process(0)
+        self.engine.bus.eof=True
+        self.engine.tick()
+        snapshot=self.engine.snapshot()
+        self.assertEqual(snapshot['status'],'live')
+        self.assertEqual(snapshot['last_stop']['reason'],'track_finished')
+        self.assertEqual(snapshot['last_stop']['track'],'test.wav')
+        self.assertFalse(snapshot['last_stop']['loop'])
+
+    def test_manual_stop_records_reason(self):
+        encoder=self.process()
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio.subprocess,'Popen',return_value=encoder):
+            self.engine.command({'command':'play','name':'test.wav','loop':True})
+            self.engine.command({'command':'stop'})
+        snapshot=self.engine.snapshot()
+        self.assertEqual(snapshot['last_stop']['reason'],'manual_stop')
+        self.assertEqual(snapshot['last_stop']['track'],'test.wav')
+        self.assertTrue(snapshot['last_stop']['loop'])
+        self.assertIsNone(snapshot['resume_state'])
+
+    def test_snapshot_exposes_resume_diagnostics(self):
+        encoder=self.process()
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio.subprocess,'Popen',return_value=encoder):
+            self.engine.command({'command':'play','name':'test.wav','loop':True})
+        snapshot=self.engine.snapshot()
+        self.assertIsNotNone(snapshot['last_start'])
+        self.assertEqual(snapshot['last_start']['track'],'test.wav')
+        self.assertIsNotNone(snapshot['resume_state'])
+        self.assertEqual(snapshot['resume_state']['track'],'test.wav')
+
     def test_resume_program_releases_manual_source(self):
         self.engine.manual_hold=True;self.engine.status='paused'
         with patch.object(studio,'run'): self.engine.command({'command':'automation','enabled':True})
