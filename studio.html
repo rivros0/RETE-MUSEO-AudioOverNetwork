@@ -159,13 +159,14 @@
 </section>
 </section>
 <section id="regiaEvents" class="regia-tab-panel" role="tabpanel" aria-labelledby="tabEvents" hidden>
+<label class="automation-master"><input id="automationToggle" type="checkbox"> Programmazione eventi attiva</label>
+<p id="automationState"></p>
+<p class="hint">Se la casella non è selezionata, nessun evento programmato verrà avviato. Se il player manuale sospende la programmazione, selezionala nuovamente per riprenderla.</p>
+
 <details id="scheduledEventsPanel" class="scheduledPanel" open>
 <summary><span>Eventi programmati</span><span id="scheduledEventsMeta" class="scheduledMeta">caricamento…</span></summary>
 <div class="scheduledBody">
 <h3>Calendario · Europe/Rome</h3>
-<label class="automation-master"><input id="automationToggle" type="checkbox"> Programmazione eventi attiva</label>
-<p id="automationState"></p>
-<p class="hint">Se la casella è disattivata, nessun evento programmato verrà avviato. Un comando manuale del player sospende temporaneamente gli eventi finché la programmazione non viene riattivata.</p>
 <p id="nextEvents"></p>
 <form id="eventForm"><input type="hidden" name="id"><fieldset><legend id="eventLegend">Nuovo evento</legend>
 <label>Titolo <input name="name" required maxlength="100"></label>
@@ -492,8 +493,8 @@ async function update(){
     el('groupState').textContent=s.plan?'Gruppo: traccia '+(s.plan.index+1)+'/'+s.plan.tracks.length+' · passaggio '+s.plan.cycle+'/'+(s.plan.repetitions||'fino a fine fascia')+(s.plan.next_at?' · prossimo passaggio '+new Date(s.plan.next_at*1000).toLocaleTimeString('it-IT',{timeZone:'Europe/Rome'}):''):'';
     el('microphoneState').textContent=bus?(bus.microphone_online?'Microfono collegato':'ATTENZIONE: '+bus.microphone_error)+' · ingresso '+bus.microphone_dbfs+' dBFS · musica '+bus.music_gain_db+' dB'+(bus.ducking_active?' · DUCKING ATTIVO':''):'Ingresso diretto: il bus annunci si avvia con la regia.';
     if(!duckInitialized){var duck=el('duckingForm');duck.elements.namedItem('enabled').checked=s.ducking.enabled;duck.elements.namedItem('threshold_db').value=s.ducking.threshold_db;duck.elements.namedItem('reduction_db').value=s.ducking.reduction_db;duckInitialized=true;}
-    el('automationToggle').checked=!!s.automation_enabled;
-    el('automationState').textContent=(s.automation_enabled?'Programmazione attiva':'Programmazione disattivata')+(s.manual_hold?' · sospesa temporaneamente dal player manuale':'')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');
+    el('automationToggle').checked=!!s.automation_enabled&&!s.manual_hold;
+    el('automationState').textContent=(s.automation_enabled&&!s.manual_hold?'Programmazione attiva':s.manual_hold?'Programmazione sospesa dal player manuale':'Programmazione disattivata')+(s.queue.length?' · in attesa: '+s.queue.join(', '):'');
     el('nextEvents').textContent='Prossimi eventi: '+(s.next_events||[]).map(function(e){return e.name+' · '+new Date(e.at).toLocaleString('it-IT',{timeZone:'Europe/Rome'});}).join(' | ');
     currentEvents=s.events;renderEvents();el('eventHistory').replaceChildren();
     el('scheduledEventsMeta').textContent=currentEvents.length+' '+(currentEvents.length===1?'evento':'eventi')+' · '+(s.automation_enabled?'programma attivo':'programma disabilitato');
