@@ -302,27 +302,30 @@ Non servono librerie Python aggiuntive. Versione minima Python: 3.9.
 
 ### Player
 
-Il lettore è un pannello richiudibile ispirato a VLC, con barra temporale,
-contatori, pausa/ripresa, stop, salto di dieci secondi e traccia precedente/successiva.
-La playlist permette ricerca, selezione e doppio clic per avviare una traccia.
-La chiusura del pannello viene ricordata dal browser e non interrompe l’audio.
-Volume e silenziamento agiscono soltanto sulla musica e vengono salvati sul TX:
-gli annunci della Scarlett rimangono udibili.
+Dalla **v4.34** il Player usa un'interfaccia essenziale, pensata per rendere
+immediatamente distinguibili **riproduzione**, **pausa** e **fermo**. La vista
+principale contiene soltanto selezione traccia, Play/Pausa, Stop, barra temporale,
+volume musica e la casella **Riproduzione continua**. Playlist, salto temporale,
+traccia precedente/successiva e ricerca nella libreria restano disponibili nella
+sezione richiudibile **Funzioni avanzate**.
 
-Selezionare un file dalla libreria e premere **Riproduci selezione**. Sono
-disponibili pausa, ripresa, ricerca a una posizione in secondi, avanzamento e
-ripetizione della singola traccia. Tutti gli RX ricevono lo stesso segnale.
+La casella **Riproduzione continua** corrisponde al loop della singola traccia ed è
+salvata sul TX. Se è disattivata, la fine naturale del brano porta intenzionalmente
+il player allo stato live (solo mixer/microfono). Se è attivata, il brano riparte
+automaticamente. Volume e silenziamento agiscono soltanto sulla musica: gli annunci
+della Scarlett rimangono udibili.
+
 Il browser è soltanto il telecomando: il servizio sul TX continua a funzionare
-anche chiudendo la pagina, e più browser osservano lo stesso stato.
+anche chiudendo la pagina, e più browser osservano lo stesso stato. La riproduzione
+manuale resta persistente rispetto a riavvii del TX o del servizio: il sistema salva
+periodicamente brano, posizione, stato play/pausa e loop. Un comando **Stop**
+esplicito cancella lo stato da ripristinare.
 
-Dalla **v4.10** la riproduzione manuale è persistente rispetto a riavvii del TX
-o del servizio: il sistema salva periodicamente brano, posizione, stato play/pausa
-e loop. Se il TX si riavvia mentre una traccia manuale è in riproduzione, al ritorno
-riprende automaticamente dallo stesso brano e da una posizione prossima a quella
-salvata. Se era in pausa, torna in pausa. Un comando **Stop** esplicito cancella
-lo stato da ripristinare. Le fasce del calendario continuano invece a usare la
-logica già prevista: una fascia ancora valida può ripartire secondo il proprio
-programma, mentre una fascia scaduta non viene riattivata.
+Dalla v4.34 il TX salva inoltre in SQLite **ultima partenza**, **ultimo arresto** e
+**causa dell'arresto** del player. La pagina mostra quindi motivi come fine naturale
+della traccia, stop manuale, fine scaletta, errore FFmpeg, errore del bus audio,
+fine fascia programmata o fallimento del ripristino. Questo permette di distinguere
+un arresto previsto da un guasto anche dopo molte ore.
 
 
 FFmpeg decodifica la musica in PCM stereo. Un bus Python mantiene aperta
@@ -397,12 +400,14 @@ Esempio: inizio 09:00, fine 18:00, gruppo A → B → C, passaggi 0, intervallo 
 riproduce A/B/C, attende 15 secondi e ricomincia fino alle 18:00.
 Un numero di passaggi finito può terminare prima della fine fascia.
 
-Il calendario generale è disabilitato inizialmente. **Abilita / riprendi programma**
-attiva gli eventi. L'abilitazione persiste dopo il riavvio. I comandi manuali
-sospendono il calendario fino a quel pulsante: la fascia ancora attiva riparte
-dall'inizio del gruppo. La sospensione manuale è temporanea, non persiste dopo
-un riavvio. Le fasce attive ripartono dall'inizio anche al riavvio del monitor;
-gli eventi istantanei dei minuti precedenti non vengono recuperati.
+Il calendario generale è disabilitato inizialmente. All'inizio della scheda
+**Eventi** la casella **Programmazione eventi attiva** controlla l'intero motore
+di programmazione. L'abilitazione persiste dopo il riavvio. I comandi manuali del
+player sospendono temporaneamente gli eventi: in quel caso la casella appare
+deselezionata e selezionarla nuovamente riprende il programma. La fascia ancora
+attiva riparte dall'inizio del gruppo. La sospensione manuale è temporanea, non
+persiste dopo un riavvio. Le fasce attive ripartono dall'inizio anche al riavvio
+del monitor; gli eventi istantanei dei minuti precedenti non vengono recuperati.
 
 Se un altro programma è attivo si può scegliere **Salta**, **Attendi** (massimo
 15 minuti e comunque non oltre fine fascia) o **Interrompi**. Il solo microfono
