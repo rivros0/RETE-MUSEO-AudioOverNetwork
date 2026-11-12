@@ -378,6 +378,8 @@ function stopReasonText(stop){
     playlist_advance_failed:'Passaggio traccia fallito',
     startup_audio_error:'Errore audio all’avvio',
     resume_failed:'Ripristino automatico fallito',
+    resume_retry:'Ripristino automatico in attesa di nuovo tentativo',
+    resume_invalid:'Stato di ripristino non valido',
     resume_state_finished:'Stato salvato già a fine traccia',
     automation_resumed:'Programmazione automatica ripresa',
     automation_disabled:'Programmazione automatica disabilitata',
@@ -422,10 +424,21 @@ function renderPlayer(){
   el('playerState').textContent=stateText;
 
   var reason='';
-  if(s&&s.status==='live'&&s.last_stop){
+  var recovery=s&&s.recovery?s.recovery:null;
+  if(s&&s.status==='live'&&s.resume_state&&s.resume_state.status==='playing'){
+    reason='AUTORIPRISTINO ATTIVO';
+    if(recovery&&recovery.failures){
+      reason+=' · tentativi falliti '+recovery.failures;
+      reason+=' · prossimo tentativo tra '+Math.ceil(recovery.next_retry_seconds||0)+' s';
+    }else{
+      reason+=' · ripartenza in corso';
+    }
+    if(recovery&&recovery.last_error)reason+=' · '+recovery.last_error;
+  }else if(s&&s.status==='live'&&s.last_stop){
     reason='Ultimo arresto: '+stopReasonText(s.last_stop);
   }else if(s&&s.status==='playing'){
     reason='Riproduzione continua: '+(s.track_loop?'ATTIVA':'DISATTIVA')+' · ripristino automatico '+(s.resume_state?'salvato':'non salvato');
+    if(recovery&&recovery.last_success)reason+=' · ultimo ripristino riuscito '+new Date(recovery.last_success*1000).toLocaleString('it-IT',{timeZone:'Europe/Rome'});
   }else if(s&&s.status==='paused'){
     reason='Player in pausa · stato salvato per il ripristino automatico';
   }
