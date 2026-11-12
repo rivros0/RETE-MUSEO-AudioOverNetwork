@@ -333,6 +333,14 @@ class PackagingTests(unittest.TestCase):
             embedded=setup.split("<<'"+marker+"'\n",1)[1].split('\n'+marker,1)[0]
             self.assertEqual(embedded.rstrip(),(ROOT/name).read_text().rstrip())
 
+    def test_always_on_services_have_no_restart_rate_limit(self):
+        setup=(ROOT/'setup_roc_museum.sh').read_text()
+        audio=setup.split("<<'EOF_AUDIO'\n",1)[1].split('\nEOF_AUDIO',1)[0]
+        monitor=setup.split("<<'EOF_MONITOR'\n",1)[1].split('\nEOF_MONITOR',1)[0]
+        for unit in (audio,monitor):
+            self.assertIn('Restart=always',unit)
+            self.assertIn('StartLimitIntervalSec=0',unit)
+
 
 @unittest.skipUnless(os.environ.get('ROC_SEND_BINARY') and shutil.which('ffmpeg'),'set ROC_SEND_BINARY for real Roc integration')
 class RocIntegration(StudioCase):
