@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.34
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.35
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.34"
+VERSION="4.35"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.34"
+MONITOR_BUILD="4.35"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -3277,6 +3277,14 @@ class Studio:
         self.bus=None;self.audio_factory=audio_factory;self.plan=None;self.bus_marker=Path(bus_marker)
         self.resume_saved=0.;self.restore_thread=None;self.playlist_active=False
 
+        # Autoripristino player: un errore tecnico non deve trasformarsi in uno
+        # stop permanente. Lo stato desiderato resta persistente in SQLite e
+        # viene ritentato con backoff fino a successo o Stop esplicito.
+        self.recovery_next=0.
+        self.recovery_failures=0
+        self.recovery_last_error=''
+        self.recovery_last_success=None
+
     def start(self):
         try:
             self._ensure_audio()
@@ -3387,15 +3395,18 @@ class Studio:
         state=self._setting('resume_playback','null')
         if not isinstance(state,dict):
             return False
+
         try:
             status=state.get('status')
             track=audio_name(state.get('track'))
             position=state.get('position')
             loop=state.get('loop')
+
             if status not in ('playing','paused') or type(loop) is not bool:
                 raise ValueError('Stato player salvato non valido')
             if type(position) not in (int,float) or isinstance(position,bool) or not math.isfinite(position) or position<0:
                 raise ValueError('Posizione player salvata non valida')
+
             info=self.info(track)
             if position>=info['duration']:
                 if loop:
@@ -3404,18 +3415,67 @@ class Studio:
                     self._record_player_stop('resume_state_finished','Stato salvato già alla fine della traccia')
                     self._clear_playback_resume()
                     return False
+
+        except ValueError as error:
+            # Uno stato strutturalmente impossibile non può guarire con un retry.
+            self.error='Stato di ripristino non valido: '+str(error)
+            self._record_player_stop('resume_invalid',str(error))
+            self._clear_playback_resume()
+            self.recovery_last_error=str(error)
+            return False
+        except (OSError,subprocess.SubprocessError) as error:
+            # Accesso file/ffprobe possono fallire transitoriamente: conservare
+            # l'intenzione e lasciare che il watchdog ritenti.
+            self.error='Ripristino player temporaneamente non riuscito: '+str(error)
+            self._record_player_stop('resume_retry',str(error))
+            self.recovery_last_error=str(error)
+            return False
+
+        try:
             self.playlist_active=bool(state.get('playlist_active',False))
             self._play(track,position,origin='manual',loop=loop,persist=False)
             self.manual_hold=bool(state.get('manual_hold',True))
+
             if status=='paused':
-                self.bus.pause(True);self.status='paused';self.position=position
+                self.bus.pause(True)
+                self.status='paused'
+                self.position=position
+
             self._save_playback_resume(force=True)
+            self.recovery_failures=0
+            self.recovery_next=0.
+            self.recovery_last_error=''
+            self.recovery_last_success=time.time()
             return True
-        except (OSError,ValueError,subprocess.SubprocessError) as error:
-            self.error='Ripristino player non riuscito: '+str(error)
-            self._record_player_stop('resume_failed',str(error))
-            self._clear_playback_resume()
+        except Exception as error:
+            # Non cancellare resume_playback: bus, ALSA, Roc o FFmpeg possono
+            # tornare disponibili dopo il boot o dopo un riavvio di servizio.
+            self.error='Ripristino player temporaneamente non riuscito: '+str(error)
+            self._record_player_stop('resume_retry',str(error))
+            self.recovery_last_error=str(error)
             return False
+
+    def _recover_playback_if_needed(self):
+        """Retry a persisted manual player state after transient failures."""
+        if self.shutdown.is_set() or self.status!='live' or self.plan is not None:
+            return False
+
+        state=self._setting('resume_playback','null')
+        if not isinstance(state,dict) or state.get('status') not in ('playing','paused'):
+            return False
+
+        now=time.monotonic()
+        if now<self.recovery_next:
+            return False
+
+        if self._restore_playback_resume():
+            return True
+
+        # Retry quickly at first, then back off to one attempt per minute.
+        self.recovery_failures+=1
+        delay=min(60,2**min(self.recovery_failures,6))
+        self.recovery_next=now+delay
+        return False
 
     def _terminate(self):
         if self.bus: self.bus.detach()
@@ -3484,7 +3544,7 @@ class Studio:
             self.encoder=subprocess.Popen(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-protocol_whitelist','file,pipe','-format_whitelist','wav,mp3,flac,ogg,mov,aac','-ss',str(position),'-i',str(self.media/name),'-map','0:a:0','-threads','1','-vn','-ac','2','-ar',self.config.get('SAMPLE_RATE','44100'),'-c:a','pcm_s16le','-f','s16le','pipe:1'],stdout=subprocess.PIPE,stderr=self.error_log,bufsize=0)
             self.bus.attach(self.encoder.stdout,position,deadline)
         except Exception:
-            self._live(reason='play_start_failed');raise
+            self._live(clear_resume=False,reason='play_start_failed');raise
         self.track=name;self.duration=info['duration'];self.position=position;self.started=time.monotonic()
         self.status='playing';self.origin=origin;self.loop=loop;self.error=''
         self._record_player_start()
@@ -3609,7 +3669,7 @@ class Studio:
     def snapshot(self):
         with self.lock:
             rows=self.db.execute('SELECT event,occurrence,time,state,message FROM runs ORDER BY time DESC LIMIT 30').fetchall()
-            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'last_stop':self._setting('player_last_stop','null'),'last_start':self._setting('player_last_start','null'),'resume_state':self._setting('resume_playback','null'),'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
+            return {'playlist_tracks':self.playlist(),'playlist_active':self.playlist_active,'playlist_loop':self._setting('playlist_loop'),'track_loop':self._setting('track_loop'),'status':self.status,'track':self.track,'position':round(self._position(),2),'duration':self.duration,'loop':self.loop,'origin':self.origin,'error':self.error,'automation_enabled':self._setting('enabled'),'manual_hold':self.manual_hold,'queue':[e['name'] for e in self.queue],'timezone':'Europe/Rome','events':self.events(),'next_events':self.next_events(),'sender_running':bool(self.sender and self.sender.poll() is None),'audio_bus':self.bus.snapshot() if self.bus else None,'ducking':self.ducking(),'music_volume':self._setting('music_volume','100'),'music_muted':self._setting('music_muted'),'last_stop':self._setting('player_last_stop','null'),'last_start':self._setting('player_last_start','null'),'resume_state':self._setting('resume_playback','null'),'recovery':{'failures':self.recovery_failures,'next_retry_seconds':round(max(0.,self.recovery_next-time.monotonic()),1) if self.recovery_next else 0.,'last_error':self.recovery_last_error,'last_success':self.recovery_last_success},'system_time':dt.datetime.now(ZoneInfo('Europe/Rome')).isoformat(),'plan':{k:v for k,v in self.plan.items() if k!='event'} if self.plan else None,'history':[dict(zip(('event','occurrence','time','state','message'),r)) for r in rows]}
 
     def events(self):
         with self.lock:
@@ -3747,7 +3807,7 @@ class Studio:
             now=now or dt.datetime.now(dt.timezone.utc)
             if self.bus and not self.bus.snapshot()['active']:
                 self.error=self.bus.snapshot()['error'] or 'Bus audio non disponibile'
-                self._cancel_plan('failed');self._live(reason='audio_bus_error',detail=self.error)
+                self._cancel_plan('failed');self._live(clear_resume=False,reason='audio_bus_error',detail=self.error)
             if self.plan and self.plan['end_at'] is not None and now.timestamp()>=self.plan['end_at']:
                 self._record(self.plan['event'],self.plan['occurrence'],'completed','Fine fascia');self._live(reason='scheduled_window_end',detail='Fine fascia programmata')
             if self.plan and self.plan['next_at'] is not None and now.timestamp()>=self.plan['next_at']:
@@ -3757,7 +3817,7 @@ class Studio:
                     self.error=str(error);self._cancel_plan('failed');self._live(reason='scheduled_start_failed',detail=str(error))
             if self.status=='playing' and self.bus and self.bus.snapshot()['music_eof'] and self.encoder and self.encoder.poll() is not None:
                 if self.encoder.returncode!=0:
-                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live(reason='decoder_error',detail='FFmpeg ha terminato con errore')
+                    self.error='Decodifica audio fallita';self._cancel_plan('failed');self._live(clear_resume=False,reason='decoder_error',detail='FFmpeg ha terminato con errore')
                 elif self.plan:
                     try: self._next_track(now)
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
@@ -3765,10 +3825,16 @@ class Studio:
                 elif self.playlist_active:
                     try: self._advance_playlist()
                     except (OSError,ValueError,subprocess.SubprocessError) as error:
-                        self.error=str(error);self._live(reason='playlist_advance_failed',detail=str(error))
+                        self.error=str(error);self._live(clear_resume=False,reason='playlist_advance_failed',detail=str(error))
                 elif self.loop: self._play(self.track,origin=self.origin,loop=True)
                 else: self._live(reason='track_finished',detail='Fine naturale della traccia con riproduzione continua disattivata')
             self._save_playback_resume()
+
+            # A reboot/crash/transient audio failure must not leave manual
+            # playback permanently stopped. Explicit Stop clears resume state;
+            # every other technical stop is retried automatically.
+            self._recover_playback_if_needed()
+
             if not self._setting('enabled'): return
             for event in sorted(self.events(),key=lambda e:(e['start'],e['id'])):
                 if not event['enabled']: continue
@@ -4463,6 +4529,8 @@ function stopReasonText(stop){
     playlist_advance_failed:'Passaggio traccia fallito',
     startup_audio_error:'Errore audio all’avvio',
     resume_failed:'Ripristino automatico fallito',
+    resume_retry:'Ripristino automatico in attesa di nuovo tentativo',
+    resume_invalid:'Stato di ripristino non valido',
     resume_state_finished:'Stato salvato già a fine traccia',
     automation_resumed:'Programmazione automatica ripresa',
     automation_disabled:'Programmazione automatica disabilitata',
@@ -4507,10 +4575,21 @@ function renderPlayer(){
   el('playerState').textContent=stateText;
 
   var reason='';
-  if(s&&s.status==='live'&&s.last_stop){
+  var recovery=s&&s.recovery?s.recovery:null;
+  if(s&&s.status==='live'&&s.resume_state&&s.resume_state.status==='playing'){
+    reason='AUTORIPRISTINO ATTIVO';
+    if(recovery&&recovery.failures){
+      reason+=' · tentativi falliti '+recovery.failures;
+      reason+=' · prossimo tentativo tra '+Math.ceil(recovery.next_retry_seconds||0)+' s';
+    }else{
+      reason+=' · ripartenza in corso';
+    }
+    if(recovery&&recovery.last_error)reason+=' · '+recovery.last_error;
+  }else if(s&&s.status==='live'&&s.last_stop){
     reason='Ultimo arresto: '+stopReasonText(s.last_stop);
   }else if(s&&s.status==='playing'){
     reason='Riproduzione continua: '+(s.track_loop?'ATTIVA':'DISATTIVA')+' · ripristino automatico '+(s.resume_state?'salvato':'non salvato');
+    if(recovery&&recovery.last_success)reason+=' · ultimo ripristino riuscito '+new Date(recovery.last_success*1000).toLocaleString('it-IT',{timeZone:'Europe/Rome'});
   }else if(s&&s.status==='paused'){
     reason='Player in pausa · stato salvato per il ripristino automatico';
   }
@@ -5573,6 +5652,7 @@ write_systemd_services() {
 Description=RETE MUSEO Roc Audio node
 After=network-online.target sound.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/roc-museum-run
@@ -5586,6 +5666,7 @@ EOF_AUDIO
 Description=RETE MUSEO Audio monitor agent
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=/usr/local/sbin/roc-museum-monitor
