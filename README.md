@@ -327,6 +327,18 @@ della traccia, stop manuale, fine scaletta, errore FFmpeg, errore del bus audio,
 fine fascia programmata o fallimento del ripristino. Questo permette di distinguere
 un arresto previsto da un guasto anche dopo molte ore.
 
+Dalla **v4.35** il ripristino manuale è anche **self-healing**: un errore tecnico
+temporaneo (decoder FFmpeg, bus audio, ALSA/Roc non ancora pronti dopo il boot o
+riavvio del monitor) non cancella più lo stato persistente. Se prima del guasto il
+player era in riproduzione, il TX ritenta automaticamente il ripristino con backoff
+fino a 60 secondi tra i tentativi. Solo uno **Stop** esplicito, la fine naturale di
+una traccia non in loop o la conclusione intenzionale di una scaletta senza loop
+annullano il ripristino automatico. La regia mostra numero dei tentativi, prossimo
+retry ed eventuale ultimo errore. Le unità `roc-museum.service` e
+`roc-museum-monitor.service` mantengono `Restart=always` e dalla v4.35 disattivano
+anche il rate limit di systemd (`StartLimitIntervalSec=0`), così una serie di crash
+ravvicinati non lascia il servizio permanentemente fermo.
+
 
 FFmpeg decodifica la musica in PCM stereo. Un bus Python mantiene aperta
 l'acquisizione `arecord` della Scarlett e un solo sender Roc, miscelando microfono
