@@ -249,6 +249,61 @@ class PlayerTests(StudioCase):
         self.assertTrue(snapshot['last_stop']['loop'])
         self.assertIsNone(snapshot['resume_state'])
 
+    def test_technical_decoder_failure_preserves_resume_state(self):
+        encoder=self.process()
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio.subprocess,'Popen',return_value=encoder):
+            self.engine.command({'command':'play','name':'test.wav','loop':True})
+
+        self.assertIsNotNone(self.engine.snapshot()['resume_state'])
+        self.engine.encoder=self.process(1)
+        self.engine.bus.eof=True
+
+        # Isolate the error transition from the automatic retry itself.
+        with patch.object(self.engine,'_recover_playback_if_needed'):
+            self.engine.tick()
+
+        snapshot=self.engine.snapshot()
+        self.assertEqual(snapshot['status'],'live')
+        self.assertEqual(snapshot['last_stop']['reason'],'decoder_error')
+        self.assertIsNotNone(snapshot['resume_state'])
+        self.assertEqual(snapshot['resume_state']['track'],'test.wav')
+
+    def test_restore_transient_failure_keeps_resume_for_retry(self):
+        self.engine._store_setting('resume_playback',{
+            'status':'playing','track':'test.wav','position':0,
+            'playlist_active':False,'loop':True,'manual_hold':True,'saved_at':time.time()
+        })
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(self.engine,'_play',side_effect=OSError('audio temporarily unavailable')):
+            self.assertFalse(self.engine._restore_playback_resume())
+
+        snapshot=self.engine.snapshot()
+        self.assertIsNotNone(snapshot['resume_state'])
+        self.assertEqual(snapshot['last_stop']['reason'],'resume_retry')
+        self.assertIn('temporarily unavailable',snapshot['recovery']['last_error'])
+
+    def test_watchdog_retries_saved_playback_with_backoff(self):
+        self.engine._store_setting('resume_playback',{
+            'status':'playing','track':'test.wav','position':0,
+            'playlist_active':False,'loop':True,'manual_hold':True,'saved_at':time.time()
+        })
+        self.engine.status='live'
+        with patch.object(self.engine,'_restore_playback_resume',return_value=False) as restore,patch.object(studio.time,'monotonic',return_value=100.0):
+            self.assertFalse(self.engine._recover_playback_if_needed())
+        restore.assert_called_once_with()
+        self.assertEqual(self.engine.recovery_failures,1)
+        self.assertEqual(self.engine.recovery_next,102.0)
+
+    def test_watchdog_stops_retrying_after_explicit_stop(self):
+        encoder=self.process()
+        with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio.subprocess,'Popen',return_value=encoder):
+            self.engine.command({'command':'play','name':'test.wav','loop':True})
+            self.engine.command({'command':'stop'})
+
+        with patch.object(self.engine,'_restore_playback_resume') as restore:
+            self.assertFalse(self.engine._recover_playback_if_needed())
+        restore.assert_not_called()
+        self.assertIsNone(self.engine.snapshot()['resume_state'])
+
     def test_snapshot_exposes_resume_diagnostics(self):
         encoder=self.process()
         with patch.object(self.engine,'info',return_value={'duration':20}),patch.object(studio.subprocess,'Popen',return_value=encoder):
