@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.35
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.36
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.35"
+VERSION="4.36"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.35"
+MONITOR_BUILD="4.36"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -2653,9 +2653,9 @@ def dropout_evidence(run, expected, actual, raw, raw_rate, correlation):
         power = float(np.linalg.norm(x)*np.linalg.norm(y))
         score = float(np.dot(x,y))/power if power else 0
         scores.append(round(score if correlation >= 0 else -score, 3))
-        samples = raw[left*raw_rate//1000:right*raw_rate//1000]
+        samples = raw[int(left*raw_rate/1000):int(right*raw_rate/1000)]
         levels.append(float(np.mean(samples**2)))
-    gap = raw[start*raw_rate//1000:end*raw_rate//1000]
+    gap = raw[int(start*raw_rate/1000):int(end*raw_rate/1000)]
     contrast = None
     if len(levels) == 2 and min(levels) > 0:
         contrast = round(10*float(np.log10(max(float(np.mean(gap**2)), 1e-12)/min(levels))), 1)

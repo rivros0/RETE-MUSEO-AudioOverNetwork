@@ -981,3 +981,44 @@ previsti. Gli RX senza scheda opzionale conservano l'avvio leggero: nessun nuovo
 worker o import NumPy; nessun polling ALSA aggiuntivo quando la scheda è assente.
 La latenza Roc comune e i controlli di volume/mute della v4.30 restano gestiti
 come prima. Non viene eseguito alcun aggiornamento automatico dei Raspberry.
+
+## Confronto RTP tra TX e ricevitore
+
+Per diagnosticare lo svuotamento della coda Roc, acquisire almeno un minuto in
+contemporanea su TX e RX, usando l'interfaccia Ethernet del multicast. Esempio
+per la configurazione di default, da eseguire sui due nodi sostituendo `NODO`
+con `TX` e `RX` rispettivamente:
+
+```sh
+sudo timeout -s INT 90 tcpdump -i eth0 -s 128 -B 4096 -w NODO.pcap \
+  'udp dst port 10001 and dst host 239.30.0.1'
+```
+
+Annotare eventuali pacchetti scartati dal kernel nel riepilogo di ciascuna
+cattura. Copiare i file su una macchina con Python 3 e TShark e usare l'SSRC
+riportato dalla regia o rilevato nella cattura:
+
+```sh
+python3 tools/compare_rtp.py TX.pcap RX.pcap --ssrc 1801186529
+```
+
+Lo script delimita la finestra con gli stessi pacchetti RTP, identificati da
+sequenza e timestamp, e misura il tempo trascorso localmente su ciascun nodo.
+Non serve sincronizzare gli orologi tra loro per questo confronto. Con un
+flusso continuo, `rtp_ms_per_wall_second` dovrebbe essere vicino a 1000.
+Valori inferiori già sul TX orientano verso il ritmo di invio. Un aumento
+del massimo intervallo tra pacchetti sul solo RX indica pause aggiunte sul
+percorso o durante la cattura. `observed_only_at_tx` conta i pacchetti visti
+sul TX ma assenti dalla finestra RX, inclusi quelli che potrebbero essere
+arrivati dopo il pacchetto usato come confine. Ripetere la prova se la cattura
+ha perso pacchetti o lo stream ha cambiato SSRC. Il clock predefinito è 44100 Hz
+per RTP L16 statico. Conservare un journal ROC della stessa finestra per
+confrontare i risultati con le chiusure della sessione.
+
+Per verificare una tratta fisica, rilevare prima e dopo la prova gli incrementi
+dei contatori CRC/FCS, errori di ricezione, scarti e cambi di link sulle porte
+dello switch e sui nodi (per esempio con `ethtool -S eth0`, se disponibile).
+CRC/FCS in aumento sulla porta ricevente orientano verso il relativo segmento
+fisico. Gli scarti di coda possono indicare anche congestione. Se emerge una
+porta sospetta, ripetere la cattura cambiando un solo cavo o una sola porta
+alla volta.

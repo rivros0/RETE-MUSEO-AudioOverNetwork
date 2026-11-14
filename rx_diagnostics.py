@@ -190,9 +190,9 @@ def dropout_evidence(run, expected, actual, raw, raw_rate, correlation):
         power = float(np.linalg.norm(x)*np.linalg.norm(y))
         score = float(np.dot(x,y))/power if power else 0
         scores.append(round(score if correlation >= 0 else -score, 3))
-        samples = raw[left*raw_rate//1000:right*raw_rate//1000]
+        samples = raw[int(left*raw_rate/1000):int(right*raw_rate/1000)]
         levels.append(float(np.mean(samples**2)))
-    gap = raw[start*raw_rate//1000:end*raw_rate//1000]
+    gap = raw[int(start*raw_rate/1000):int(end*raw_rate/1000)]
     contrast = None
     if len(levels) == 2 and min(levels) > 0:
         contrast = round(10*float(np.log10(max(float(np.mean(gap**2)), 1e-12)/min(levels))), 1)

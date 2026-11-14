@@ -30,7 +30,7 @@ class WaveformTests(unittest.TestCase):
 
     def test_dropouts(self):
         self.heard[6400:8000]=0
-        result=d.compare(self.ref,self.heard)
+        result=d.compare(self.ref,self.heard,capture_rate=16000.4)
         self.assertEqual(result['status'],'dropout',result)
         self.assertTrue(any(x['duration_ms']>=80 for x in result['channels'][0]['dropouts']))
 
