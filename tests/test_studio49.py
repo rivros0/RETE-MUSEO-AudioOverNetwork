@@ -44,6 +44,13 @@ class DuckingTests(unittest.TestCase):
         d=audio.Ducker();d.enabled=False
         self.assertAlmostEqual(average(d.mix(pcm(3000),pcm(4000))),7000,delta=1)
 
+    def test_mono_mix_duplicates_average_of_both_channels(self):
+        d = audio.Ducker()
+        d.enabled = False
+        music = struct.pack('<hhhh', 6000, -2000, -3000, 1000)
+        microphone = struct.pack('<hhhh', -2000, 6000, 1000, 1000)
+        self.assertEqual(struct.unpack('<hhhh', d.mix(music, microphone)), (4000, 4000, 0, 0))
+
     def test_limiter_avoids_wraparound(self):
         d=audio.Ducker();data=d.mix(pcm(32000),pcm(32000))
         samples=audio.pcm_samples(data)

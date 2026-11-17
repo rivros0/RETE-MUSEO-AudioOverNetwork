@@ -3,7 +3,7 @@ set -euo pipefail
 
 # =============================================================================
 # RETE MUSEO - AudioOverNetwork
-# Setup unico e guidato per Raspberry Pi TX/RX - v4.36
+# Setup unico e guidato per Raspberry Pi TX/RX - v4.37
 #
 # Uso normale:
 #   sudo ./setup_roc_museum.sh
@@ -12,7 +12,7 @@ set -euo pipefail
 #   --role tx|rx   --tx-ip A.B.C.D   --name NOME
 # =============================================================================
 
-VERSION="4.36"
+VERSION="4.37"
 MULTICAST_ADDR="239.30.0.1"
 RTP_PORT="10001"
 SAMPLE_RATE="44100"
@@ -410,7 +410,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CONFIG_FILE="/etc/roc-museum.conf"
-MONITOR_BUILD="4.36"
+MONITOR_BUILD="4.37"
 VOLUME_STATE_FILE="/var/lib/roc-museum/volume"
 HEARTBEAT_INTERVAL=5
 OFFLINE_AFTER=15
@@ -3963,7 +3963,7 @@ def re_id(value):
 PY_STUDIO
     cat > /usr/local/lib/roc-museum/audio_bus.py <<'PY_AUDIO_BUS'
 #!/usr/bin/env python3
-"""Continuous stereo PCM bus: microphone always on, music-only ducking, one RTP sender."""
+"""Continuous mono mix with duplicated stereo PCM for the RTP sender."""
 from array import array
 from collections import deque
 import math
@@ -3983,6 +3983,11 @@ def pcm_samples(data):
     return samples
 
 
+def mono_samples(data):
+    stereo = pcm_samples(data)
+    return [(left + right) // 2 for left, right in zip(stereo[::2], stereo[1::2])]
+
+
 class Ducker:
     def __init__(self,rate=44100):
         self.rate=rate;self.gain=1.;self.limiter=1.;self.hold=0.
@@ -3990,8 +3995,9 @@ class Ducker:
         self.input_db=-96.;self.active=False;self.volume=1.;self.volume_target=1.
 
     def mix(self,music,microphone):
-        mic=pcm_samples(microphone);song=pcm_samples(music)
-        duration=len(mic)/(2*self.rate)
+        mic = mono_samples(microphone)
+        song = mono_samples(music)
+        duration = len(mic) / self.rate
         rms=math.sqrt(sum(x*x for x in mic)/max(1,len(mic)))/32768
         self.input_db=max(-96.,20*math.log10(max(rms,1e-12)))
         if self.enabled and self.input_db>=self.threshold_db: self.hold=.5
@@ -4003,12 +4009,20 @@ class Ducker:
         previous=self.gain
         tau=.03 if target<previous else .8
         self.gain=target+(previous-target)*math.exp(-duration/tau)
-        # Gain ramp avoids discontinuities; the mic is never multiplied by the duck gain.
-        raw=[int(m+(song[i] if i<len(song) else 0)*(previous+(self.gain-previous)*i/max(1,len(mic)-1))*(old_volume+(self.volume-old_volume)*i/max(1,len(mic)-1))) for i,m in enumerate(mic)]
-        peak=max((abs(v) for v in raw),default=0)
-        limit=min(1.,32760/max(1,peak))
-        self.limiter=min(limit,self.limiter+(1-self.limiter)*duration/.2)
-        out=array('h',(max(-32768,min(32767,int(v*self.limiter))) for v in raw))
+        # One gain step per frame; duplicate the limited sample on both channels.
+        ramp_length = max(1, len(mic) - 1)
+        duck_step = (self.gain - previous) / ramp_length
+        volume_step = (self.volume - old_volume) / ramp_length
+        song.extend([0] * max(0, len(mic) - len(song)))
+        raw = [int(voice + music_sample * (previous + duck_step * i) *
+                   (old_volume + volume_step * i))
+               for i, (voice, music_sample) in enumerate(zip(mic, song))]
+        peak = max((abs(sample) for sample in raw), default=0)
+        limit = min(1., 32760 / max(1, peak))
+        self.limiter = min(limit, self.limiter + (1 - self.limiter) * duration / .2)
+        mono = array('h', (int(sample * self.limiter) for sample in raw))
+        out = array('h', [0]) * (2 * len(mono))
+        out[::2] = out[1::2] = mono
         if sys.byteorder!='little': out.byteswap()
         return out.tobytes()
 
